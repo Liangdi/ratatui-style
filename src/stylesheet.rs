@@ -161,70 +161,27 @@ pub fn apply_decl(style: &mut CssStyle, prop: &str, value: &str) -> Result<()> {
     match prop.as_str() {
         "color" => style.color = Some(Color::parse(value)?),
         "background" | "background-color" => style.background = Some(Color::parse(value)?),
-        "font-weight" => style.weight = Some(parse_weight(value)?),
-        "font-style" => style.font_style = Some(parse_font_style(value)?),
-        "text-decoration" => style.decoration = Some(parse_decoration(value)?),
+        "font-weight" => style.weight = Some(Weight::parse(value)?),
+        "font-style" => style.font_style = Some(FontStyle::parse(value)?),
+        "text-decoration" => style.decoration = Some(TextDecoration::parse(value)?),
         "underline-color" => style.underline_color = Some(Color::parse(value)?),
         "padding" => style.padding = Some(crate::box_model::BoxEdges::parse(value)?),
         "margin" => style.margin = Some(crate::box_model::BoxEdges::parse(value)?),
         "border" => style.border = Some(crate::box_model::BorderSpec::parse_shorthand(value)?),
         "border-style" => {
-            let mut spec = style.border.clone().unwrap_or_default();
-            spec.style = crate::box_model::BorderStyle::parse_keyword(value)
+            let parsed = crate::box_model::BorderStyle::parse_keyword(value)
                 .ok_or_else(|| CssError::InvalidLength(format!("border-style: {value}")))?;
-            style.border = Some(spec);
+            style.border_mut().style = parsed;
         }
         "border-color" => {
-            let mut spec = style.border.clone().unwrap_or_default();
-            spec.color = Some(Color::parse(value)?);
-            style.border = Some(spec);
+            style.border_mut().color = Some(Color::parse(value)?);
         }
-        "text-align" => style.text_align = Some(parse_align(value)?),
+        "text-align" => style.text_align = Some(Align::parse(value)?),
         "width" => style.width = Some(crate::box_model::Length::parse(value)?),
         "height" => style.height = Some(crate::box_model::Length::parse(value)?),
         _ => { /* unknown property → ignored (forward-compat) */ }
     }
     Ok(())
-}
-
-fn parse_weight(v: &str) -> Result<Weight> {
-    match v.trim().to_ascii_lowercase().as_str() {
-        "bold" | "bolder" => Ok(Weight::Bold),
-        "normal" | "lighter" | "" => Ok(Weight::Normal),
-        other => other
-            .parse::<u32>()
-            .map(|n| if n >= 600 { Weight::Bold } else { Weight::Normal })
-            .map_err(|_| CssError::InvalidLength(format!("font-weight: {v}"))),
-    }
-}
-
-fn parse_font_style(v: &str) -> Result<FontStyle> {
-    match v.trim().to_ascii_lowercase().as_str() {
-        "italic" | "oblique" => Ok(FontStyle::Italic),
-        "normal" | "" => Ok(FontStyle::Normal),
-        other => Err(CssError::InvalidSelector(format!("font-style: {other}"))),
-    }
-}
-
-fn parse_decoration(v: &str) -> Result<TextDecoration> {
-    let lower = v.trim().to_ascii_lowercase();
-    let u = lower.split_whitespace().any(|t| t == "underline");
-    let l = lower.split_whitespace().any(|t| t == "line-through" || t == "strikethrough");
-    Ok(match (u, l) {
-        (false, false) => TextDecoration::None,
-        (true, false) => TextDecoration::Underline,
-        (false, true) => TextDecoration::LineThrough,
-        (true, true) => TextDecoration::UnderlineLineThrough,
-    })
-}
-
-fn parse_align(v: &str) -> Result<Align> {
-    match v.trim().to_ascii_lowercase().as_str() {
-        "left" | "justify" => Ok(Align::Left),
-        "center" => Ok(Align::Center),
-        "right" => Ok(Align::Right),
-        other => Err(CssError::InvalidSelector(format!("text-align: {other}"))),
-    }
 }
 
 fn strip_comments(css: &str) -> String {

@@ -16,6 +16,7 @@ use ratatui::{
 
 use crate::box_model::{BorderStyle, BorderSpec, BoxEdges, Length};
 use crate::color::Color;
+use crate::error::{CssError, Result};
 
 // ---------------------------------------------------------------------------
 // Property enums
@@ -29,12 +30,53 @@ pub enum Weight {
     Bold,
 }
 
+impl Weight {
+    /// Parse a `font-weight` value: `bold`/`bolder`, `normal`/`lighter`, or a
+    /// numeric weight (≥600 → bold). Shared by the text parser and serde.
+    pub fn parse(s: &str) -> Result<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "bold" | "bolder" => Ok(Self::Bold),
+            "normal" | "lighter" | "" => Ok(Self::Normal),
+            other => other
+                .parse::<u32>()
+                .map(|n| if n >= 600 { Self::Bold } else { Self::Normal })
+                .map_err(|_| CssError::InvalidLength(format!("font-weight: {s}"))),
+        }
+    }
+
+    /// The CSS keyword for this weight.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Normal => "normal",
+            Self::Bold => "bold",
+        }
+    }
+}
+
 /// `font-style`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum FontStyle {
     #[default]
     Normal,
     Italic,
+}
+
+impl FontStyle {
+    /// Parse a `font-style` value. Shared by the text parser and serde.
+    pub fn parse(s: &str) -> Result<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "italic" | "oblique" => Ok(Self::Italic),
+            "normal" | "" => Ok(Self::Normal),
+            other => Err(CssError::InvalidSelector(format!("font-style: {other}"))),
+        }
+    }
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Normal => "normal",
+            Self::Italic => "italic",
+        }
+    }
 }
 
 /// `text-decoration`.
@@ -56,6 +98,30 @@ impl TextDecoration {
             Self::UnderlineLineThrough => Some(Modifier::UNDERLINED.union(Modifier::CROSSED_OUT)),
         }
     }
+
+    /// Parse `text-decoration`: any whitespace-separated combo of `underline`
+    /// and `line-through`/`strikethrough`. Never fails. Shared by the text
+    /// parser and serde.
+    pub fn parse(s: &str) -> Result<Self> {
+        let lower = s.trim().to_ascii_lowercase();
+        let u = lower.split_whitespace().any(|t| t == "underline");
+        let l = lower.split_whitespace().any(|t| t == "line-through" || t == "strikethrough");
+        Ok(match (u, l) {
+            (false, false) => Self::None,
+            (true, false) => Self::Underline,
+            (false, true) => Self::LineThrough,
+            (true, true) => Self::UnderlineLineThrough,
+        })
+    }
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Underline => "underline",
+            Self::LineThrough => "line-through",
+            Self::UnderlineLineThrough => "underline line-through",
+        }
+    }
 }
 
 /// `text-align`.
@@ -73,6 +139,24 @@ impl Align {
             Self::Left => Alignment::Left,
             Self::Center => Alignment::Center,
             Self::Right => Alignment::Right,
+        }
+    }
+
+    /// Parse a `text-align` value. Shared by the text parser and serde.
+    pub fn parse(s: &str) -> Result<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "left" | "justify" => Ok(Self::Left),
+            "center" => Ok(Self::Center),
+            "right" => Ok(Self::Right),
+            other => Err(CssError::InvalidSelector(format!("text-align: {other}"))),
+        }
+    }
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Left => "left",
+            Self::Center => "center",
+            Self::Right => "right",
         }
     }
 }
@@ -170,6 +254,16 @@ impl CssStyle {
         self
     }
 
+    /// Borrow the border spec mutably, defaulting it if absent.
+    ///
+    /// Shared spine for every "apply a `border-*` sub-declaration" path — the
+    /// text parser ([`crate::stylesheet::apply_decl`]), the serde
+    /// deserializer, and the cascade overlay all funnel through here instead
+    /// of repeating `border.clone().unwrap_or_default() → set → Some(…)`.
+    pub(crate) fn border_mut(&mut self) -> &mut crate::box_model::BorderSpec {
+        self.border.get_or_insert_default()
+    }
+
     // --- cascade -----------------------------------------------------------
 
     /// Overlay `other` onto `self`: every field that is `Some` in `other`
@@ -191,20 +285,13 @@ impl CssStyle {
         over!(underline_color);
         over!(padding);
         over!(margin);
-        // `border` cascades at the sub-field level: a rule declaring only
-        // `border-style` (e.g. `.rounded`) and another declaring only
-        // `border-color` (e.g. `.border-slate-700`) merge into one spec instead
-        // of one clobbering the other. A `None` style is "not declared" and
-        // does not override; an explicit `BorderStyle::None` is preserved.
+        // `border` cascades at the sub-field level via [`BorderSpec::merge`]:
+        // `.rounded` (style) and `.border-slate-700` (color) compose into one
+        // spec instead of one clobbering the other. A `None` style is "not
+        // declared" and does not override; an explicit `BorderStyle::None` is
+        // preserved.
         if let Some(other_border) = &other.border {
-            let mut merged = self.border.clone().unwrap_or_default();
-            if other_border.style != BorderStyle::None {
-                merged.style = other_border.style;
-            }
-            if let Some(c) = &other_border.color {
-                merged.color = Some(c.clone());
-            }
-            self.border = Some(merged);
+            self.border_mut().merge(other_border);
         }
         over!(text_align);
         over!(width);
@@ -346,95 +433,55 @@ mod serde_impl {
 
     impl<'de> Deserialize<'de> for Align {
         fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-            let s = String::deserialize(d)?.to_ascii_lowercase();
-            match s.as_str() {
-                "left" | "justify" => Ok(Align::Left),
-                "center" => Ok(Align::Center),
-                "right" => Ok(Align::Right),
-                _ => Err(DeError::custom(format!("invalid text-align: {s}"))),
-            }
+            Align::parse(&String::deserialize(d)?).map_err(DeError::custom)
         }
     }
     impl Serialize for Align {
         fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
-            s.serialize_str(match self {
-                Align::Left => "left",
-                Align::Center => "center",
-                Align::Right => "right",
-            })
+            s.serialize_str(self.as_str())
         }
     }
 
     impl<'de> Deserialize<'de> for FontStyle {
         fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-            match String::deserialize(d)?.to_ascii_lowercase().as_str() {
-                "normal" => Ok(FontStyle::Normal),
-                "italic" | "oblique" => Ok(FontStyle::Italic),
-                other => Err(DeError::custom(format!("invalid font-style: {other}"))),
-            }
+            FontStyle::parse(&String::deserialize(d)?).map_err(DeError::custom)
         }
     }
     impl Serialize for FontStyle {
         fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
-            s.serialize_str(match self {
-                FontStyle::Normal => "normal",
-                FontStyle::Italic => "italic",
-            })
+            s.serialize_str(self.as_str())
         }
     }
 
     impl<'de> Deserialize<'de> for Weight {
         fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
             match Value::deserialize(d)? {
-                Value::String(s) => match s.to_ascii_lowercase().as_str() {
-                    "bold" | "bolder" => Ok(Weight::Bold),
-                    "normal" | "lighter" => Ok(Weight::Normal),
-                    other => other
-                        .parse::<u32>()
-                        .map(|n| if n >= 600 { Weight::Bold } else { Weight::Normal })
-                        .map_err(|_| DeError::custom(format!("invalid font-weight: {s}"))),
-                },
+                // JSON may carry a bare number (≥600 → bold); everything else
+                // funnels through the shared string parser.
                 Value::Number(n) => Ok(if n.as_i64().map(|i| i >= 600).unwrap_or(false) {
                     Weight::Bold
                 } else {
                     Weight::Normal
                 }),
+                Value::String(s) => Weight::parse(&s).map_err(DeError::custom),
                 other => Err(DeError::custom(format!("invalid font-weight: {other}"))),
             }
         }
     }
     impl Serialize for Weight {
         fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
-            s.serialize_str(match self {
-                Weight::Normal => "normal",
-                Weight::Bold => "bold",
-            })
+            s.serialize_str(self.as_str())
         }
     }
 
     impl<'de> Deserialize<'de> for TextDecoration {
         fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-            let s = String::deserialize(d)?;
-            let lower = s.to_ascii_lowercase();
-            let has_u = lower.split_whitespace().any(|t| t == "underline");
-            let has_l =
-                lower.split_whitespace().any(|t| t == "line-through" || t == "strikethrough");
-            Ok(match (has_u, has_l) {
-                (false, false) => TextDecoration::None,
-                (true, false) => TextDecoration::Underline,
-                (false, true) => TextDecoration::LineThrough,
-                (true, true) => TextDecoration::UnderlineLineThrough,
-            })
+            TextDecoration::parse(&String::deserialize(d)?).map_err(DeError::custom)
         }
     }
     impl Serialize for TextDecoration {
         fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
-            s.serialize_str(match self {
-                TextDecoration::None => "none",
-                TextDecoration::Underline => "underline",
-                TextDecoration::LineThrough => "line-through",
-                TextDecoration::UnderlineLineThrough => "underline line-through",
-            })
+            s.serialize_str(self.as_str())
         }
     }
 
@@ -469,18 +516,10 @@ mod serde_impl {
                     "margin" => parse_opt(val).map(|v| s.margin = v).map_err(|_| "margin"),
                     "border" => parse_opt(val).map(|v| s.border = v).map_err(|_| "border"),
                     "border-style" => parse_opt::<BorderStyle>(val)
-                        .map(|v| {
-                            let mut spec = s.border.clone().unwrap_or_default();
-                            spec.style = v.unwrap_or_default();
-                            s.border = Some(spec);
-                        })
+                        .map(|v| s.border_mut().style = v.unwrap_or_default())
                         .map_err(|_| "border-style"),
                     "border-color" => parse_opt(val)
-                        .map(|v| {
-                            let mut spec = s.border.clone().unwrap_or_default();
-                            spec.color = v;
-                            s.border = Some(spec);
-                        })
+                        .map(|v| s.border_mut().color = v)
                         .map_err(|_| "border-color"),
                     "text-align" => parse_opt(val).map(|v| s.text_align = v).map_err(|_| "text-align"),
                     "width" => parse_opt(val).map(|v| s.width = v).map_err(|_| "width"),
@@ -578,5 +617,21 @@ mod tests {
         let border = a.border.as_ref().expect("border present");
         assert_eq!(border.style, BorderStyle::Single);
         assert_eq!(border.color, Some(Color::literal(RC::Red)));
+    }
+
+    #[test]
+    #[cfg(feature = "serde")]
+    fn serde_border_style_and_color_compose() {
+        // Two atomic border declarations deserialize into one merged spec —
+        // the same Tailwind idiom the cascade exercises, but via the serde
+        // path (which now funnels through `border_mut`).
+        let json = r##"{ "border-style": "rounded", "border-color": "#334155" }"##;
+        let s: CssStyle = serde_json::from_str(json).unwrap();
+        let border = s.border.expect("border present");
+        assert_eq!(border.style, BorderStyle::Rounded);
+        assert_eq!(
+            border.color,
+            Some(Color::literal(ratatui::style::Color::Rgb(0x33, 0x41, 0x55)))
+        );
     }
 }

@@ -156,6 +156,23 @@ impl BorderSpec {
         };
         Ok(Self { style, color })
     }
+
+    /// Merge another spec's *declared* sub-fields into this one in place.
+    ///
+    /// A sub-field counts as declared when its style is not
+    /// [`BorderStyle::None`] (the default, reused as a "not declared"
+    /// sentinel) or its color is `Some`. This is the per-declaration step of
+    /// the cascade that lets two atomic rules — e.g. `.rounded` (style only)
+    /// and `.border-slate-700` (color only) — compose into one border instead
+    /// of one clobbering the other.
+    pub fn merge(&mut self, other: &BorderSpec) {
+        if other.style != BorderStyle::None {
+            self.style = other.style;
+        }
+        if other.color.is_some() {
+            self.color = other.color.clone();
+        }
+    }
 }
 
 impl BorderStyle {
@@ -240,6 +257,24 @@ fn parse_cells(s: &str) -> Result<u16> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn border_spec_merge_keeps_declared_subfields() {
+        use ratatui::style::Color as RC;
+        // `.rounded` (style only) + `.border-blue` (color only) compose into
+        // one spec rather than one clobbering the other.
+        let mut a = BorderSpec { style: BorderStyle::Rounded, color: None };
+        let b = BorderSpec { style: BorderStyle::None, color: Some(Color::literal(RC::Blue)) };
+        a.merge(&b);
+        assert_eq!(a.style, BorderStyle::Rounded); // survived
+        assert_eq!(a.color, Some(Color::literal(RC::Blue))); // applied
+
+        // An all-default other (style=None, no color) declares nothing → merge
+        // leaves the existing spec untouched.
+        let mut c = BorderSpec { style: BorderStyle::Double, color: None };
+        c.merge(&BorderSpec::default());
+        assert_eq!(c.style, BorderStyle::Double);
+    }
 
     #[test]
     fn edges_shorthand() {
