@@ -24,7 +24,7 @@ use ratatui::{
     widgets::{Block, Paragraph},
 };
 
-use ratatui_style::{OwnedNode, scss, State, Stylesheet};
+use ratatui_style::{ComputeScratch, NodeRef, scss, State, Stylesheet};
 
 type Term = Terminal<CrosstermBackend<Stdout>>;
 
@@ -33,8 +33,9 @@ static THEME: LazyLock<Stylesheet> = scss!("scss_embed.scss");
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut terminal = setup()?;
+    let mut scratch = ComputeScratch::new();
     loop {
-        terminal.draw(|f| draw(f, &THEME))?;
+        terminal.draw(|f| draw(f, &THEME, &mut scratch))?;
         if event::poll(Duration::from_millis(120))?
             && let Event::Key(key) = event::read()?
             && matches!(key.code, KeyCode::Char('q') | KeyCode::Esc)
@@ -46,9 +47,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn draw(frame: &mut ratatui::Frame<'_>, sheet: &Stylesheet) {
+fn draw(frame: &mut ratatui::Frame<'_>, sheet: &Stylesheet, scratch: &mut ComputeScratch) {
     let area = frame.area();
-    let root = sheet.compute(&OwnedNode::new("Root"), None);
+    let root = sheet.compute_with(&NodeRef::new("Root"), None, scratch);
     frame.render_widget(Block::default().style(root.to_style()), area);
 
     let chunks = Layout::default()
@@ -62,7 +63,7 @@ fn draw(frame: &mut ratatui::Frame<'_>, sheet: &Stylesheet) {
         .split(area);
 
     // Header.
-    let header = sheet.compute(&OwnedNode::new("Header"), None);
+    let header = sheet.compute_with(&NodeRef::new("Header"), None, scratch);
     frame.render_widget(
         Paragraph::new(Line::from(" ◆ scss! — compiled by grass"))
             .style(header.to_style()),
@@ -81,14 +82,11 @@ fn draw(frame: &mut ratatui::Frame<'_>, sheet: &Stylesheet) {
         (true, true, "primary + focus"),
     ];
     for (rect, (primary, focus, label)) in btn_rects.iter().zip(buttons.iter()) {
-        let mut node = OwnedNode::new("Button");
-        if *primary {
-            node = node.with_classes(["primary"]);
-        }
-        if *focus {
-            node = node.with_state(State::focus());
-        }
-        let computed = sheet.compute(&node, None);
+        let classes: &[&str] = if *primary { &["primary"] } else { &[] };
+        let node = NodeRef::new("Button")
+            .classes(classes)
+            .state(if *focus { State::focus() } else { State::empty() });
+        let computed = sheet.compute_with(&node, None, scratch);
         let para = Paragraph::new(Line::from(format!(" {label} ")))
             .style(computed.to_style())
             .alignment(Alignment::Center);
@@ -96,7 +94,7 @@ fn draw(frame: &mut ratatui::Frame<'_>, sheet: &Stylesheet) {
     }
 
     // Text showcase.
-    let text = sheet.compute(&OwnedNode::new("Text"), None);
+    let text = sheet.compute_with(&NodeRef::new("Text"), None, scratch);
     let lines = [
         "SCSS $variables resolve at compile time (grass)",
         "Nesting (&.primary, &:focus) flattens to plain CSS",

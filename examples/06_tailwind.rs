@@ -38,7 +38,7 @@ use ratatui::{
     widgets::{Block, Paragraph},
 };
 
-use ratatui_style::{OwnedNode, State, Stylesheet};
+use ratatui_style::{ComputeScratch, NodeRef, State, Stylesheet};
 
 type Term = Terminal<CrosstermBackend<Stdout>>;
 
@@ -55,8 +55,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut disabled = false;
 
     let mut terminal = setup()?;
+    let mut scratch = ComputeScratch::new();
     loop {
-        terminal.draw(|f| draw(f, &sheet, &buttons, focus, disabled))?;
+        terminal.draw(|f| draw(f, &sheet, &mut scratch, &buttons, focus, disabled))?;
 
         if !event::poll(Duration::from_millis(100))? {
             continue;
@@ -170,11 +171,11 @@ const TAILWIND: &str = r##"
 
 // --- rendering ---------------------------------------------------------------------
 
-fn draw(frame: &mut ratatui::Frame<'_>, sheet: &Stylesheet, buttons: &[Button], focus: usize, disabled: bool) {
+fn draw(frame: &mut ratatui::Frame<'_>, sheet: &Stylesheet, scratch: &mut ComputeScratch, buttons: &[Button], focus: usize, disabled: bool) {
     let area = frame.area();
 
     // Root fill: a single utility class.
-    let root = sheet.compute(&div(&["bg-slate-900"]), None);
+    let root = sheet.compute_with(&NodeRef::new("Root").classes(&["bg-slate-900"]), None, scratch);
     frame.render_widget(Block::default().style(root.to_style()), area);
 
     let outer = Layout::default()
@@ -187,15 +188,15 @@ fn draw(frame: &mut ratatui::Frame<'_>, sheet: &Stylesheet, buttons: &[Button], 
         ])
         .split(area);
 
-    header(frame, sheet, outer[0]);
-    gallery(frame, sheet, outer[1]);
-    button_row(frame, sheet, outer[2], buttons, focus, disabled);
-    footer(frame, sheet, outer[3]);
+    header(frame, sheet, scratch, outer[0]);
+    gallery(frame, sheet, scratch, outer[1]);
+    button_row(frame, sheet, scratch, outer[2], buttons, focus, disabled);
+    footer(frame, sheet, scratch, outer[3]);
 }
 
-fn header(frame: &mut ratatui::Frame<'_>, sheet: &Stylesheet, area: Rect) {
+fn header(frame: &mut ratatui::Frame<'_>, sheet: &Stylesheet, scratch: &mut ComputeScratch, area: Rect) {
     // Utilities composed straight onto a header "element".
-    let st = sheet.compute(&div(&["bg-slate-800", "text-slate-100", "font-bold", "text-center"]), None);
+    let st = sheet.compute_with(&NodeRef::new("Div").classes(&["bg-slate-800", "text-slate-100", "font-bold", "text-center"]), None, scratch);
     frame.render_widget(
         Paragraph::new(Line::from(" tailwind-style · utility-first cascade"))
             .style(st.to_style()),
@@ -203,7 +204,7 @@ fn header(frame: &mut ratatui::Frame<'_>, sheet: &Stylesheet, area: Rect) {
     );
 }
 
-fn gallery(frame: &mut ratatui::Frame<'_>, sheet: &Stylesheet, area: Rect) {
+fn gallery(frame: &mut ratatui::Frame<'_>, sheet: &Stylesheet, scratch: &mut ComputeScratch, area: Rect) {
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -221,34 +222,42 @@ fn gallery(frame: &mut ratatui::Frame<'_>, sheet: &Stylesheet, area: Rect) {
         .horizontal_margin(1)
         .split(rows[0]);
 
+    // First card lines - pre-compute spans to avoid double borrow of scratch
+    let card1_lines = [
+        Line::from(span(sheet, scratch, &["text-slate-100", "font-bold"], " Utility card")),
+        Line::from(span(sheet, scratch, &["text-slate-400"], " Four atomic utilities, one element.")),
+        Line::from(""),
+        Line::from(span(
+            sheet,
+            scratch,
+            &["text-slate-500"],
+            " bg-slate-800 · rounded · border-slate-700 · p-1",
+        )),
+    ];
+
+    let card2_lines = [
+        Line::from(span(sheet, scratch, &["text-slate-900", "font-bold"], " Brand card")),
+        Line::from(span(sheet, scratch, &["text-slate-900"], " Same cascade, swapped tokens.")),
+        Line::from(""),
+        Line::from(span(sheet, scratch, &["text-slate-900"], " bg-blue-500 · rounded · p-1")),
+    ];
+
     card(
         frame,
         sheet,
+        scratch,
         card_cols[0],
         &["bg-slate-800", "rounded", "border-slate-700", "p-1"],
-        &[
-            Line::from(span(sheet, &["text-slate-100", "font-bold"], " Utility card")),
-            Line::from(span(sheet, &["text-slate-400"], " Four atomic utilities, one element.")),
-            Line::from(""),
-            Line::from(span(
-                sheet,
-                &["text-slate-500"],
-                " bg-slate-800 · rounded · border-slate-700 · p-1",
-            )),
-        ],
+        &card1_lines,
     );
 
     card(
         frame,
         sheet,
+        scratch,
         card_cols[1],
         &["bg-blue-500", "rounded", "p-1"],
-        &[
-            Line::from(span(sheet, &["text-slate-900", "font-bold"], " Brand card")),
-            Line::from(span(sheet, &["text-slate-900"], " Same cascade, swapped tokens.")),
-            Line::from(""),
-            Line::from(span(sheet, &["text-slate-900"], " bg-blue-500 · rounded · p-1")),
-        ],
+        &card2_lines,
     );
 
     // --- Badges: each a different color utility (filled) or border utility (outline).
@@ -264,15 +273,16 @@ fn gallery(frame: &mut ratatui::Frame<'_>, sheet: &Stylesheet, area: Rect) {
         .horizontal_margin(1)
         .split(rows[1]);
 
-    let st = sheet.compute(&div(&["text-slate-400"]), None);
+    let st = sheet.compute_with(&NodeRef::new("Div").classes(&["text-slate-400"]), None, scratch);
     frame.render_widget(Paragraph::new(Line::from(" CI:")).style(st.to_style()), badge_cols[0]);
 
-    badge(frame, sheet, badge_cols[1], &["bg-green-500", "text-slate-900", "font-bold"], "build");
-    badge(frame, sheet, badge_cols[2], &["bg-amber-500", "text-slate-900", "font-bold"], "lint");
-    badge(frame, sheet, badge_cols[3], &["bg-red-500", "text-slate-900", "font-bold"], "tests");
+    badge(frame, sheet, scratch, badge_cols[1], &["bg-green-500", "text-slate-900", "font-bold"], "build");
+    badge(frame, sheet, scratch, badge_cols[2], &["bg-amber-500", "text-slate-900", "font-bold"], "lint");
+    badge(frame, sheet, scratch, badge_cols[3], &["bg-red-500", "text-slate-900", "font-bold"], "tests");
     badge(
         frame,
         sheet,
+        scratch,
         badge_cols[4],
         &["bg-slate-700", "text-slate-300", "font-bold"],
         "docs",
@@ -291,7 +301,7 @@ fn gallery(frame: &mut ratatui::Frame<'_>, sheet: &Stylesheet, area: Rect) {
         (&["text-blue-300", "underline"], "and an underlined finish line"),
     ];
     for (rect, (cls, txt)) in typo.iter().zip(lines.iter()) {
-        let st = sheet.compute(&div(cls), None);
+        let st = sheet.compute_with(&NodeRef::new("Div").classes(cls), None, scratch);
         frame.render_widget(Paragraph::new(Line::from(format!(" {txt}"))).style(st.to_style()), *rect);
     }
 }
@@ -300,11 +310,12 @@ fn gallery(frame: &mut ratatui::Frame<'_>, sheet: &Stylesheet, area: Rect) {
 fn card(
     frame: &mut ratatui::Frame<'_>,
     sheet: &Stylesheet,
+    scratch: &mut ComputeScratch,
     area: Rect,
     classes: &[&'static str],
     lines: &[Line<'_>],
 ) {
-    let computed = sheet.compute(&div(classes), None);
+    let computed = sheet.compute_with(&NodeRef::new("Div").classes(classes), None, scratch);
     let block = computed.to_block();
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -315,11 +326,12 @@ fn card(
 fn badge(
     frame: &mut ratatui::Frame<'_>,
     sheet: &Stylesheet,
+    scratch: &mut ComputeScratch,
     area: Rect,
     classes: &[&'static str],
     text: &str,
 ) {
-    let computed = sheet.compute(&div(classes), None);
+    let computed = sheet.compute_with(&NodeRef::new("Div").classes(classes), None, scratch);
     frame.render_widget(
         Paragraph::new(Line::from(format!(" {text} ")))
             .style(computed.to_style())
@@ -331,6 +343,7 @@ fn badge(
 fn button_row(
     frame: &mut ratatui::Frame<'_>,
     sheet: &Stylesheet,
+    scratch: &mut ComputeScratch,
     area: Rect,
     buttons: &[Button],
     focus: usize,
@@ -343,20 +356,22 @@ fn button_row(
         .split(area);
 
     for (i, b) in buttons.iter().enumerate() {
-        let node = div(b.classes).with_state(State {
-            focus: i == focus && !disabled,
-            disabled,
-            ..State::empty()
-        });
-        let computed = sheet.compute(&node, None);
+        let node = NodeRef::new("Div")
+            .classes(b.classes)
+            .state(State {
+                focus: i == focus && !disabled,
+                disabled,
+                ..State::empty()
+            });
+        let computed = sheet.compute_with(&node, None, scratch);
         let para = Paragraph::new(Line::from(format!(" {} ", b.label)))
             .alignment(Alignment::Center);
         frame.render_widget(para.block(computed.to_block()), rects[i]);
     }
 }
 
-fn footer(frame: &mut ratatui::Frame<'_>, sheet: &Stylesheet, area: Rect) {
-    let st = sheet.compute(&div(&["text-slate-500"]), None);
+fn footer(frame: &mut ratatui::Frame<'_>, sheet: &Stylesheet, scratch: &mut ComputeScratch, area: Rect) {
+    let st = sheet.compute_with(&NodeRef::new("Div").classes(&["text-slate-500"]), None, scratch);
     frame.render_widget(
         Paragraph::new(Line::from(format!(
             " {:<-10} focus · {:<-10} toggle disabled · q to quit",
@@ -369,15 +384,9 @@ fn footer(frame: &mut ratatui::Frame<'_>, sheet: &Stylesheet, area: Rect) {
 
 // --- helpers -----------------------------------------------------------------------
 
-/// A generic element carrying only utility classes. Utility selectors are
-/// class-only (no type), so the type name is irrelevant — `"Div"` is a placeholder.
-fn div(classes: &[&'static str]) -> OwnedNode {
-    OwnedNode::new("Div").with_classes(classes.iter().copied())
-}
-
 /// Resolve one utility list to a styled `Span` for inline text (titles, captions).
-fn span<'a>(sheet: &Stylesheet, classes: &[&'static str], text: &'a str) -> Span<'a> {
-    Span::styled(text, sheet.compute(&div(classes), None).to_style())
+fn span<'a>(sheet: &Stylesheet, scratch: &mut ComputeScratch, classes: &[&'static str], text: &'a str) -> Span<'a> {
+    Span::styled(text, sheet.compute_with(&NodeRef::new("Div").classes(classes), None, scratch).to_style())
 }
 
 fn setup() -> io::Result<Term> {

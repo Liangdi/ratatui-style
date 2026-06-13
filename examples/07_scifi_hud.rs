@@ -24,7 +24,7 @@ use ratatui::{
     widgets::{Block, List, ListItem, Paragraph},
 };
 
-use ratatui_style::{OwnedNode, Stylesheet};
+use ratatui_style::{ComputeScratch, NodeRef, Stylesheet};
 
 type Term = Terminal<CrosstermBackend<Stdout>>;
 
@@ -65,9 +65,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     )?;
 
     let mut terminal = setup()?;
+    let mut scratch = ComputeScratch::new();
     let mut tick: u32 = 0;
     loop {
-        terminal.draw(|f| draw(f, &sheet, tick))?;
+        terminal.draw(|f| draw(f, &sheet, &mut scratch, tick))?;
         tick = tick.wrapping_add(1);
 
         if event::poll(Duration::from_millis(80))?
@@ -81,11 +82,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn draw(frame: &mut ratatui::Frame<'_>, sheet: &Stylesheet, tick: u32) {
+fn draw(frame: &mut ratatui::Frame<'_>, sheet: &Stylesheet, scratch: &mut ComputeScratch, tick: u32) {
     let area = frame.area();
 
     // Root background.
-    let root = sheet.compute(&OwnedNode::new("Root"), None);
+    let root = sheet.compute_with(&NodeRef::new("Root"), None, scratch);
     frame.render_widget(Block::default().style(root.to_style()), area);
 
     let outer = Layout::default()
@@ -94,7 +95,7 @@ fn draw(frame: &mut ratatui::Frame<'_>, sheet: &Stylesheet, tick: u32) {
         .split(area);
 
     // --- Header: title + animated status ---
-    let header = sheet.compute(&OwnedNode::new("Header"), None);
+    let header = sheet.compute_with(&NodeRef::new("Header"), None, scratch);
     let spinner = ['|', '/', '—', '\\'][((tick / 3) as usize) % 4];
     frame.render_widget(
         Paragraph::new(Line::from(vec![
@@ -115,20 +116,21 @@ fn draw(frame: &mut ratatui::Frame<'_>, sheet: &Stylesheet, tick: u32) {
         .constraints([Constraint::Length(28), Constraint::Min(20), Constraint::Length(30)])
         .split(outer[1]);
 
-    telemetry_panel(frame, sheet, body[0], tick);
-    scanner_panel(frame, sheet, body[1], tick);
-    events_panel(frame, sheet, body[2], tick);
+    telemetry_panel(frame, sheet, scratch, body[0], tick);
+    scanner_panel(frame, sheet, scratch, body[1], tick);
+    events_panel(frame, sheet, scratch, body[2], tick);
 
     // --- Footer ---
-    let footer = sheet.compute(&OwnedNode::new("Footer"), None);
+    let footer = sheet.compute_with(&NodeRef::new("Footer"), None, scratch);
     frame.render_widget(
         Paragraph::new(" [q] exit").style(footer.to_style()),
         outer[2],
     );
 }
 
-fn telemetry_panel(frame: &mut ratatui::Frame<'_>, sheet: &Stylesheet, area: Rect, tick: u32) {
-    let panel = sheet.compute(&OwnedNode::new("Frame").with_classes(["main"]), None);
+fn telemetry_panel(frame: &mut ratatui::Frame<'_>, sheet: &Stylesheet, scratch: &mut ComputeScratch, area: Rect, tick: u32) {
+    let panel_cls = ["main"];
+    let panel = sheet.compute_with(&NodeRef::new("Frame").classes(&panel_cls), None, scratch);
     let inner = render_block(frame, panel.to_block().title(" ◈ TELEMETRY "), area);
 
     let gauges = [
@@ -142,11 +144,12 @@ fn telemetry_panel(frame: &mut ratatui::Frame<'_>, sheet: &Stylesheet, area: Rec
     for (label, value, _) in &gauges {
         let pct = value.clamp(0.0, 100.0);
         let cls = if pct < 30.0 { "alert" } else if pct < 60.0 { "warn" } else { "" };
+        let cls_arr = [cls];
         let bar_style = sheet
-            .compute(&OwnedNode::new("Bar").with_classes([cls]), None)
+            .compute_with(&NodeRef::new("Bar").classes(&cls_arr), None, scratch)
             .to_style();
-        let label_style = sheet.compute(&OwnedNode::new("Label"), None).to_style();
-        let val_style = sheet.compute(&OwnedNode::new("Value").with_classes([cls]), None).to_style();
+        let label_style = sheet.compute_with(&NodeRef::new("Label"), None, scratch).to_style();
+        let val_style = sheet.compute_with(&NodeRef::new("Value").classes(&cls_arr), None, scratch).to_style();
 
         let filled = ((pct / 100.0) * 14.0).round() as usize;
         let bar = format!("{}{}", "▰".repeat(filled), "▱".repeat(14 - filled));
@@ -159,8 +162,9 @@ fn telemetry_panel(frame: &mut ratatui::Frame<'_>, sheet: &Stylesheet, area: Rec
     frame.render_widget(List::new(lines), inner);
 }
 
-fn scanner_panel(frame: &mut ratatui::Frame<'_>, sheet: &Stylesheet, area: Rect, tick: u32) {
-    let panel = sheet.compute(&OwnedNode::new("Frame").with_classes(["main"]), None);
+fn scanner_panel(frame: &mut ratatui::Frame<'_>, sheet: &Stylesheet, scratch: &mut ComputeScratch, area: Rect, tick: u32) {
+    let panel_cls = ["main"];
+    let panel = sheet.compute_with(&NodeRef::new("Frame").classes(&panel_cls), None, scratch);
     let inner = render_block(frame, panel.to_block().title(" ◎ SCANNER "), area);
 
     let scan = Layout::default()
@@ -169,8 +173,8 @@ fn scanner_panel(frame: &mut ratatui::Frame<'_>, sheet: &Stylesheet, area: Rect,
         .split(inner);
 
     // Radar grid.
-    let grid_style = sheet.compute(&OwnedNode::new("Scan"), None).to_style();
-    let target_style = sheet.compute(&OwnedNode::new("Target"), None).to_style();
+    let grid_style = sheet.compute_with(&NodeRef::new("Scan"), None, scratch).to_style();
+    let target_style = sheet.compute_with(&NodeRef::new("Target"), None, scratch).to_style();
     let width = scan[0].width.max(2) as usize;
     let height = scan[0].height as usize;
     let (cx, cy) = ((width as i32) / 2, (height as i32) / 2);
@@ -205,8 +209,8 @@ fn scanner_panel(frame: &mut ratatui::Frame<'_>, sheet: &Stylesheet, area: Rect,
     // Target lock readout.
     let lock_angle = (sweep_angle * 57.2958) % 360.0;
     let dist = (radius * 1.7) as u32;
-    let value = sheet.compute(&OwnedNode::new("Value"), None).to_style();
-    let label = sheet.compute(&OwnedNode::new("Label"), None).to_style();
+    let value = sheet.compute_with(&NodeRef::new("Value"), None, scratch).to_style();
+    let label = sheet.compute_with(&NodeRef::new("Label"), None, scratch).to_style();
     frame.render_widget(
         Paragraph::new(Line::from(vec![
             Span::raw(" BEARING ").style(label),
@@ -219,8 +223,8 @@ fn scanner_panel(frame: &mut ratatui::Frame<'_>, sheet: &Stylesheet, area: Rect,
     );
 }
 
-fn events_panel(frame: &mut ratatui::Frame<'_>, sheet: &Stylesheet, area: Rect, tick: u32) {
-    let panel = sheet.compute(&OwnedNode::new("Frame"), None);
+fn events_panel(frame: &mut ratatui::Frame<'_>, sheet: &Stylesheet, scratch: &mut ComputeScratch, area: Rect, tick: u32) {
+    let panel = sheet.compute_with(&NodeRef::new("Frame"), None, scratch);
     let inner = render_block(frame, panel.to_block().title(" ▤ EVENT LOG "), area);
 
     let fresh = (tick % 12) < 4;
@@ -237,8 +241,9 @@ fn events_panel(frame: &mut ratatui::Frame<'_>, sheet: &Stylesheet, area: Rect, 
         .enumerate()
         .map(|(i, (msg, cls))| {
             let class = if i == 0 && fresh { "new" } else { *cls };
+            let class_arr = [class];
             let st = sheet
-                .compute(&OwnedNode::new("Event").with_classes([class]), None)
+                .compute_with(&NodeRef::new("Event").classes(&class_arr), None, scratch)
                 .to_style();
             ListItem::new(Line::from(format!(" › {msg}")).style(st))
         })
