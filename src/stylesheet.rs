@@ -222,11 +222,12 @@ impl Stylesheet {
                         }
                     }
                 }
-                // … and its declared lengths (width/height Length::Var). Length
-                // vars do not carry a fallback yet, so any name not in the
-                // table is undefined.
+                // … and its declared lengths (width/height Length::Var). A var
+                // WITH a fallback is fine even if undefined; only a var with no
+                // fallback and an unknown name is flagged — mirroring the color
+                // strict check above.
                 for length in length_refs(&rule.style) {
-                    if let Some(Length::Var { name }) = length {
+                    if let Some(Length::Var { name, fallback: None }) = length {
                         if sheet.tokens.get(name).is_none() {
                             return Err(CssError::undefined_variable(name.as_str()));
                         }

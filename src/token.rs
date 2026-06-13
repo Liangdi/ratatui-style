@@ -201,9 +201,12 @@ fn resolve_length_inner(length: &Length, tokens: &ThemeTokens, depth: u8) -> Res
         Length::Auto | Length::Cells(_) | Length::Percent(_) | Length::Min(_) | Length::Max(_) => {
             Ok(length.clone())
         }
-        Length::Var { name } => match tokens.get_length(name) {
+        Length::Var { name, fallback } => match tokens.get_length(name) {
             Some(referent) => resolve_length_inner(referent, tokens, depth + 1),
-            None => Err(CssError::undefined_variable(name.clone())),
+            None => match fallback {
+                Some(fb) => resolve_length_inner(fb, tokens, depth + 1),
+                None => Err(CssError::undefined_variable(name.clone())),
+            },
         },
     }
 }
@@ -257,7 +260,7 @@ mod tests {
     fn length_var_resolves_strict() {
         let tokens = ThemeTokens::new().set("w", Length::Cells(22));
         assert_eq!(
-            resolve_length_strict(&Length::Var { name: "w".into() }, &tokens).unwrap(),
+            resolve_length_strict(&Length::Var { name: "w".into(), fallback: None }, &tokens).unwrap(),
             Length::Cells(22)
         );
     }
@@ -265,10 +268,10 @@ mod tests {
     #[test]
     fn length_var_chain() {
         let tokens = ThemeTokens::new()
-            .set("w", Length::Var { name: "w2".into() })
+            .set("w", Length::Var { name: "w2".into(), fallback: None })
             .set("w2", Length::Cells(10));
         assert_eq!(
-            resolve_length_strict(&Length::Var { name: "w".into() }, &tokens).unwrap(),
+            resolve_length_strict(&Length::Var { name: "w".into(), fallback: None }, &tokens).unwrap(),
             Length::Cells(10)
         );
     }
@@ -276,9 +279,9 @@ mod tests {
     #[test]
     fn length_var_undefined_degrades_to_auto_lenient() {
         let tokens = ThemeTokens::new();
-        assert!(resolve_length_strict(&Length::Var { name: "nope".into() }, &tokens).is_err());
+        assert!(resolve_length_strict(&Length::Var { name: "nope".into(), fallback: None }, &tokens).is_err());
         assert_eq!(
-            resolve_length(&Length::Var { name: "nope".into() }, &tokens),
+            resolve_length(&Length::Var { name: "nope".into(), fallback: None }, &tokens),
             Length::Auto
         );
     }
@@ -288,8 +291,21 @@ mod tests {
         // A name bound to a Color is a type mismatch on the length path.
         let tokens = ThemeTokens::new().set("c", Color::literal(RColor::Blue));
         assert_eq!(
-            resolve_length(&Length::Var { name: "c".into() }, &tokens),
+            resolve_length(&Length::Var { name: "c".into(), fallback: None }, &tokens),
             Length::Auto
         );
+    }
+
+    #[test]
+    fn length_var_undefined_uses_fallback() {
+        // An undefined name WITH a fallback resolves to the fallback
+        // (recursively), mirroring the color var() path.
+        let tokens = ThemeTokens::new();
+        let l = Length::Var {
+            name: "missing".into(),
+            fallback: Some(Box::new(Length::Cells(7))),
+        };
+        assert_eq!(resolve_length_strict(&l, &tokens).unwrap(), Length::Cells(7));
+        assert_eq!(resolve_length(&l, &tokens), Length::Cells(7));
     }
 }

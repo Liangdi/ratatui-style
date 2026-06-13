@@ -319,27 +319,35 @@ pub enum Length {
     ///
     /// Fallback (`var(--x, 10)`) is not yet supported: if a fallback is present
     /// it is currently ignored and only the name is captured.
-    Var { name: String },
+    Var {
+        name: String,
+        fallback: Option<Box<Length>>,
+    },
 }
 
 impl Length {
     pub fn parse(s: &str) -> Result<Self> {
         let s = s.trim();
         // var(--name) — recognized first, before any numeric/keyword logic.
-        // A trailing fallback (e.g. `var(--x, 10)`) is tolerated by taking only
-        // the name part; the fallback itself is not yet honored.
+        // A fallback (e.g. `var(--x, 10)`) is split on the FIRST top-level comma
+        // (honoring nested parens) and parsed as a Length — mirroring how
+        // `Color::parse_var` handles the color var() fallback.
         if let Some(inner) = s
             .strip_prefix("var(")
             .or_else(|| s.strip_prefix("VAR("))
             .or_else(|| s.strip_prefix("Var("))
         {
             let inner = inner.strip_suffix(')').unwrap_or(inner);
-            let name_part = inner.split(',').next().unwrap_or(inner);
+            let (name_part, fallback_part) = split_top_comma(inner);
             let name = name_part.trim().trim_start_matches('-').trim().to_string();
             if name.is_empty() {
                 return Err(CssError::invalid_length(format!("var(): empty name in {s}")));
             }
-            return Ok(Self::Var { name });
+            let fallback = match fallback_part.trim() {
+                "" => None,
+                expr => Some(Box::new(Self::parse(expr)?)),
+            };
+            return Ok(Self::Var { name, fallback });
         }
         if s.eq_ignore_ascii_case("auto") || s.is_empty() {
             return Ok(Self::Auto);
@@ -363,8 +371,10 @@ impl Length {
             Self::Percent(p) => Constraint::Percentage(*p),
             Self::Min(n) => Constraint::Min(*n),
             Self::Max(n) => Constraint::Max(*n),
-            // Should have been resolved during the cascade; degrade like Auto.
-            Self::Var { .. } => Constraint::Min(0),
+            // Should have been resolved during the cascade; if it reaches here,
+            // prefer a fallback's constraint, else degrade like Auto (Min(0)).
+            Self::Var { fallback: Some(fb), .. } => fb.to_constraint(),
+            Self::Var { fallback: None, .. } => Constraint::Min(0),
         }
     }
 }
@@ -374,6 +384,35 @@ fn parse_cells(s: &str) -> Result<u16> {
         .trim()
         .parse::<u16>()
         .map_err(|_| CssError::invalid_length(s))
+}
+
+/// Split on the first comma that is not nested inside parentheses.
+fn split_top_comma(s: &str) -> (&str, &str) {
+    let mut depth: u32 = 0;
+    for (i, ch) in s.char_indices() {
+        match ch {
+            '(' => depth += 1,
+            ')' => depth = depth.saturating_sub(1),
+            ',' if depth == 0 => return (&s[..i], &s[i + 1..]),
+            _ => {}
+        }
+    }
+    (s, "")
+}
+
+/// Render a [`Length`] to its CSS string form (used by serde Serialize).
+fn length_to_css(length: &Length) -> String {
+    match length {
+        Length::Auto => "auto".to_string(),
+        Length::Cells(n) => format!("{n}px"),
+        Length::Percent(p) => format!("{p}%"),
+        Length::Min(n) => format!("min({n})"),
+        Length::Max(n) => format!("max({n})"),
+        Length::Var { name, fallback: None } => format!("var(--{name})"),
+        Length::Var { name, fallback: Some(fb) } => {
+            format!("var(--{name}, {})", length_to_css(fb))
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -519,15 +558,20 @@ mod tests {
     fn length_var_parse() {
         assert_eq!(
             Length::parse("var(--w)").unwrap(),
-            Length::Var { name: "w".into() }
+            Length::Var { name: "w".into(), fallback: None }
         );
         // Numeric/percent still parse as before.
         assert_eq!(Length::parse("10").unwrap(), Length::Cells(10));
         assert_eq!(Length::parse("50%").unwrap(), Length::Percent(50));
-        // A trailing fallback is tolerated: only the name is captured.
+        // A fallback is now captured and parsed as a Length.
         assert_eq!(
             Length::parse("var(--w, 10)").unwrap(),
-            Length::Var { name: "w".into() }
+            Length::Var { name: "w".into(), fallback: Some(Box::new(Length::Cells(10))) }
+        );
+        // A percent fallback parses to Percent.
+        assert_eq!(
+            Length::parse("var(--w, 50%)").unwrap(),
+            Length::Var { name: "w".into(), fallback: Some(Box::new(Length::Percent(50))) }
         );
         // Empty name is an error.
         assert!(Length::parse("var(--)").is_err());
@@ -535,8 +579,20 @@ mod tests {
 
     #[test]
     fn length_var_degrades_to_min_zero() {
-        // A Var that somehow reaches to_constraint degrades like Auto.
-        assert_eq!(Length::Var { name: "x".into() }.to_constraint(), Constraint::Min(0));
+        // A Var without a fallback that reaches to_constraint degrades like Auto.
+        assert_eq!(
+            Length::Var { name: "x".into(), fallback: None }.to_constraint(),
+            Constraint::Min(0)
+        );
+        // A Var WITH a fallback uses the fallback's constraint.
+        assert_eq!(
+            Length::Var {
+                name: "x".into(),
+                fallback: Some(Box::new(Length::Cells(7)))
+            }
+            .to_constraint(),
+            Constraint::Length(7)
+        );
     }
 
     #[test]
@@ -681,7 +737,7 @@ mod tests {
 
 #[cfg(feature = "serde")]
 mod serde_impl {
-    use super::{BorderStyle, BorderSpec, BoxEdges, Length};
+    use super::{length_to_css, BorderStyle, BorderSpec, BoxEdges, Length};
     use crate::color::Color;
     use ratatui::widgets::Borders;
     use serde::{de::Error, Deserialize, Deserializer, Serialize, Serializer};
@@ -729,7 +785,12 @@ mod serde_impl {
                 Length::Percent(p) => s.serialize_str(&format!("{p}%")),
                 Length::Min(n) => s.serialize_str(&format!("min({n})")),
                 Length::Max(n) => s.serialize_str(&format!("max({n})")),
-                Length::Var { name } => s.serialize_str(&format!("var(--{name})")),
+                Length::Var { name, fallback: None } => {
+                    s.serialize_str(&format!("var(--{name})"))
+                }
+                Length::Var { name, fallback: Some(fb) } => {
+                    s.serialize_str(&format!("var(--{name}, {})", length_to_css(fb)))
+                }
             }
         }
     }

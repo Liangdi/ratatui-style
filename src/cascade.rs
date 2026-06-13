@@ -787,4 +787,14 @@ mod tests {
         let c = sheet.compute(&node, None);
         assert_eq!(c.style.height, Some(crate::box_model::Length::Max(8)));
     }
+
+    #[test]
+    fn width_var_undefined_uses_fallback() {
+        // An undefined width var WITH a fallback resolves to the fallback,
+        // mirroring the color var() path. (Lenient parse; no error.)
+        let sheet = Stylesheet::parse(".x { width: var(--nope, 7); }").unwrap();
+        let node = OwnedNode::new("Div").with_classes(["x"]);
+        let c = sheet.compute(&node, None);
+        assert_eq!(c.style.width, Some(crate::box_model::Length::Cells(7)));
+    }
 }
