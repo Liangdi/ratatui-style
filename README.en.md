@@ -16,6 +16,14 @@ It speaks CSS property names (`color`, `background-color`, `font-weight`,
 (so server-driven UIs can ship style over the wire), and implements a pragmatic
 cascade: **origin × specificity × inheritance × pseudo-states**.
 
+## Screenshots
+
+| [06_tailwind](examples/06_tailwind.rs) · utility-class design system | [07_scifi_hud](examples/07_scifi_hud.rs) · cyberpunk HUD |
+|:---:|:---:|
+| ![tailwind style](screenshot/tailwind-style.png) | ![sci-fi HUD](screenshot/sci-fi-hud.png) |
+
+See [Examples](#examples) below for the full list.
+
 ## Quick start
 
 ```rust
@@ -198,19 +206,25 @@ ratatui-style = { version = "0.1", default-features = false }
 
 ```sh
 # Interactive dashboard — all CSS, single stylesheet
-cargo run --example dashboard
+cargo run --example 05_dashboard
 
 # Cascade demo — inheritance, var(), specificity, pseudo-states
-cargo run --example cascade
+cargo run --example 03_cascade
 
 # CSS text stylesheet parsing
-cargo run --example stylesheet
+cargo run --example 02_stylesheet
 
 # Color & value parsing
-cargo run --example values
+cargo run --example 01_values
+
+# css! macro — compile-time embedding + runtime override
+cargo run --example 09_runtime_override
+
+# scss! macro — compile-time SCSS embedding (requires the scss feature)
+cargo run --example 10_scss_embed --features scss
 
 # themekit bridge (requires the themekit feature)
-cargo run --example themekit_bridge
+cargo run --example 11_themekit_bridge --features themekit
 ```
 
 ## Position in the ecosystem

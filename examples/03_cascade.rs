@@ -5,7 +5,7 @@
 //! parent. Also shows `:disabled` flipping a button's appearance.
 //!
 //! ```sh
-//! cargo run -p ratatui-style --example cascade
+//! cargo run -p ratatui-style --example 03_cascade
 //! ```
 
 use ratatui::style::Style;

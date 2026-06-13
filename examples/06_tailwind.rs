@@ -20,7 +20,7 @@
 //! them live), `d` toggles `:disabled`, `q`/`Esc` quits.
 //!
 //! ```sh
-//! cargo run -p ratatui-style --example tailwind
+//! cargo run -p ratatui-style --example 06_tailwind
 //! ```
 
 use std::io::{self, Stdout};

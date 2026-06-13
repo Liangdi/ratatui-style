@@ -138,6 +138,21 @@ impl Stylesheet {
 
         Ok(sheet)
     }
+
+    /// Parse a CSS text document, tagging every rule with `origin`.
+    ///
+    /// Same parsing as [`parse`](Self::parse), but overrides the default
+    /// [`Origin::User`] on each rule with `origin`. Used by the
+    /// [`css!`](crate::css) macro (origin [`Origin::Theme`]) so that embedded
+    /// rules can be overridden at runtime by [`Origin::User`] rules — see
+    /// [`RuntimeStyle`](crate::RuntimeStyle).
+    pub fn parse_with_origin(css: &str, origin: Origin) -> Result<Self> {
+        let mut sheet = Self::parse(css)?;
+        for rule in &mut sheet.rules {
+            rule.origin = origin;
+        }
+        Ok(sheet)
+    }
 }
 
 /// Apply one `prop: value` declaration to a [`CssStyle`] (text form).
@@ -301,6 +316,12 @@ mod tests {
         let mut sheet = Stylesheet::new();
         sheet.add("Text, .muted, #title", CssStyle::new(), Origin::User).unwrap();
         assert_eq!(sheet.rules().len(), 3);
+    }
+
+    #[test]
+    fn parse_with_origin_sets_theme() {
+        let sheet = Stylesheet::parse_with_origin("Button { color: red; }", Origin::Theme).unwrap();
+        assert_eq!(sheet.rules()[0].origin, Origin::Theme);
     }
 
     #[test]

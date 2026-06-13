@@ -5,7 +5,7 @@
 //! and lets the cascade resolve them through the existing palette.
 //!
 //! ```sh
-//! cargo run -p ratatui-style --example themekit_bridge --features themekit
+//! cargo run -p ratatui-style --example 11_themekit_bridge --features themekit
 //! ```
 
 use ratatui::style::Style;

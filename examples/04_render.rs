@@ -2,7 +2,7 @@
 //! `Buffer` and dump it as text. No TTY needed: fully deterministic.
 //!
 //! ```sh
-//! cargo run -p ratatui-style --example render
+//! cargo run -p ratatui-style --example 04_render
 //! ```
 
 use ratatui::{buffer::Buffer, layout::Rect, widgets::Widget};

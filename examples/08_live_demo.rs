@@ -5,7 +5,7 @@
 //! real time via `:focus` and `:disabled` pseudo-classes. `q`/`Esc` to quit.
 //!
 //! ```sh
-//! cargo run -p ratatui-style --example live_demo
+//! cargo run -p ratatui-style --example 08_live_demo
 //! ```
 
 use std::io::{self, Stdout};

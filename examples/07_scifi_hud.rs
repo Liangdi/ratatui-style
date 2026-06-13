@@ -6,7 +6,7 @@
 //! alive. `q`/`Esc` to quit.
 //!
 //! ```sh
-//! cargo run -p ratatui-style --example scifi_hud
+//! cargo run -p ratatui-style --example 07_scifi_hud
 //! ```
 
 use std::io::{self, Stdout};

@@ -18,6 +18,8 @@ pub enum CssError {
     UndefinedVariable(String),
     /// A `var()` reference chain is too deep or cyclic.
     CircularVariable(String),
+    /// An I/O error occurred (e.g. reading a stylesheet from disk).
+    Io(String),
 }
 
 impl fmt::Display for CssError {
@@ -28,6 +30,7 @@ impl fmt::Display for CssError {
             Self::InvalidLength(v) => write!(f, "invalid length: {v}"),
             Self::UndefinedVariable(v) => write!(f, "undefined variable: {v}"),
             Self::CircularVariable(v) => write!(f, "circular variable reference: {v}"),
+            Self::Io(v) => write!(f, "io error: {v}"),
         }
     }
 }

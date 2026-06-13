@@ -18,6 +18,9 @@ ratatui = "0.30"
 serde = { version = "1", features = ["derive"], optional = true }
 serde_json = { version = "1", optional = true }
 ratatui-themekit = { version = "0.6", optional = true }
+# Pure-Rust Sass/SCSS compiler for the `scss!` macro. Only pulled in by the
+# `scss` feature; never part of a default build.
+grass = { version = "0.13", optional = true }
 
 [features]
 # Data-driven styling (JSON / TOML / YAML via serde + a JSON value reader).
@@ -26,10 +29,18 @@ default = ["serde"]
 serde = ["dep:serde", "dep:serde_json"]
 # Bridge semantic color slots from `ratatui-themekit` into CSS custom properties.
 themekit = ["dep:ratatui-themekit"]
+# Compile-time embedding of `.scss` via the `scss!` macro. The SCSS source is
+# `include_str!`-ed at build time; `grass` compiles it to CSS on first access
+# (lazily, cached in a `LazyLock`). Adds `grass` as a dependency.
+scss = ["dep:grass"]
 
 [dev-dependencies]
 crossterm = "0.29"
 
 [[example]]
-name = "themekit_bridge"
+name = "11_themekit_bridge"
 required-features = ["themekit"]
+
+[[example]]
+name = "10_scss_embed"
+required-features = ["scss"]

@@ -3,7 +3,7 @@
 //! variant paragraphs (inheritance from the panel), a button row, and footer.
 //!
 //! ```sh
-//! cargo run -p ratatui-style --example dashboard
+//! cargo run -p ratatui-style --example 05_dashboard
 //! ```
 
 use std::io::{self, Stdout};

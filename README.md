@@ -13,6 +13,14 @@
 支持 `serde`（服务端驱动的 UI 可通过 JSON 传输样式），实现级联规则：
 **来源层 × 优先级 × 继承 × 伪状态**。
 
+## 截图展示
+
+| [06_tailwind](examples/06_tailwind.rs) · 工具类设计系统 | [07_scifi_hud](examples/07_scifi_hud.rs) · 赛博朋克 HUD |
+|:---:|:---:|
+| ![tailwind 风格](screenshot/tailwind-style.png) | ![sci-fi HUD](screenshot/sci-fi-hud.png) |
+
+更多示例见下文 [示例](#示例) 一节。
+
 ## 快速开始
 
 ```rust
@@ -189,19 +197,25 @@ ratatui-style = { version = "0.1", default-features = false }
 
 ```sh
 # 交互式仪表盘 —— 纯 CSS 驱动，单一样式表
-cargo run --example dashboard
+cargo run --example 05_dashboard
 
 # 级联演示 —— 继承、var()、优先级、伪状态
-cargo run --example cascade
+cargo run --example 03_cascade
 
 # CSS 文本样式表解析
-cargo run --example stylesheet
+cargo run --example 02_stylesheet
 
 # 颜色与值解析
-cargo run --example values
+cargo run --example 01_values
+
+# css! 宏：编译期嵌入 + 运行时覆盖
+cargo run --example 09_runtime_override
+
+# scss! 宏：编译期嵌入 SCSS（需要 scss feature）
+cargo run --example 10_scss_embed --features scss
 
 # themekit 桥接（需要 themekit feature）
-cargo run --example themekit_bridge
+cargo run --example 11_themekit_bridge --features themekit
 ```
 
 ## 生态定位

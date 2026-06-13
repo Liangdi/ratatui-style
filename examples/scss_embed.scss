@@ -1,0 +1,36 @@
+// Embedded at compile time via `scss!("scss_embed.scss")` in scss_embed.rs.
+//
+// Demonstrates SCSS features that `grass` compiles down to CSS the parser can
+// consume: `$variables`, nesting with `&`, and `#{$var}` interpolation into a
+// `:root` token.
+
+$accent: #00d4ff;
+$text-dim: #94a3b8;
+$bg: #0f172a;
+
+:root {
+    // Interpolation drops the SCSS variable into a CSS custom property.
+    --accent: #{$accent};
+}
+
+Root { background: $bg; }
+Header { color: $accent; font-weight: bold; }
+
+Button {
+    color: gray;
+    padding: 0 2;
+
+    // `&.primary` compiles to `Button.primary`.
+    &.primary {
+        border: rounded $accent;
+        color: $accent;
+        font-weight: bold;
+    }
+
+    // `&:focus` compiles to `Button:focus`.
+    &:focus {
+        text-decoration: underline;
+    }
+}
+
+Text { color: $text-dim; }

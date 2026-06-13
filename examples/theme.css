@@ -1,0 +1,20 @@
+/* Embedded at compile time via `css!("theme.css")` in runtime_override.rs.
+ *
+ * Rules here carry Origin::Theme, so a runtime override file (loaded via
+ * RuntimeStyle::load_override) tagged Origin::User beats them at equal
+ * specificity. */
+
+:root {
+    --accent: #00d4ff;
+    --bg: #0f172a;
+    --text: #cbd5e1;
+}
+
+Root { background: var(--bg); }
+Header { color: var(--accent); font-weight: bold; }
+
+Button { color: gray; padding: 0 2; }
+Button.primary { border: rounded #00d4ff; color: var(--accent); font-weight: bold; }
+#save { color: yellow; font-weight: bold; }
+
+Text { color: var(--text); }

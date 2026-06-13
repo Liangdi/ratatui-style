@@ -5,7 +5,7 @@
 //! sample nodes. Demonstrates specificity and `var()` resolution.
 //!
 //! ```sh
-//! cargo run -p ratatui-style --example stylesheet
+//! cargo run -p ratatui-style --example 02_stylesheet
 //! ```
 
 use ratatui::style::Style;

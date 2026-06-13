@@ -5,7 +5,7 @@
 //! blocks.
 //!
 //! ```sh
-//! cargo run -p ratatui-style --example values
+//! cargo run -p ratatui-style --example 01_values
 //! ```
 
 use ratatui::style::Style;
