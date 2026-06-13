@@ -1,25 +1,27 @@
-## [Unreleased]
-
-### 🐛 Bug Fixes
-
-- *(cascade)* Resolve `var()` in border colors. A `border: rounded var(--dim)`
-  or `border-color: var(--rim)` was left as an unresolved `Color::Var` during
-  the cascade, so `paint` silently dropped it and the border drew with no
-  explicit color. The nested `BorderSpec.color` is now resolved against the
-  token table like every other color field.
+## [0.1.2] - 2026-06-13
 
 ### 🚀 Features
 
-- *(presets)* New workspace member `ratatui-style-presets` — ready-to-use CSS
-  themes & utilities built on the engine: default theme + base component
-  classes, Tailwind-style atomic utilities, ratatui widget-type defaults, and
-  Catppuccin/Nord/Dracula palettes. All themes fill one canonical semantic-token
-  vocabulary so swapping the base stylesheet restyles a whole UI. Per-preset
-  feature flags, `&'static Stylesheet` accessors, and a `Preset`/`merge`/
-  `PresetBuilder` composition API. Includes a preset gallery example
-  (`02_gallery`) that browses every preset and can restyle the whole frame with
-  the active palette.
+- *(presets)* Add ratatui-style-presets crate
+- *(examples)* Add sizing, data-driven, and strict-mode demos
+- *(presets)* Add 02_gallery example, replace showcase
 
+### 🐛 Bug Fixes
+
+- *(box-model)* Honor var() fallback for Length, matching Color
+- *(cascade)* Resolve var() in border colors
+
+### 🚜 Refactor
+
+- *(examples)* Use zero-alloc NodeRef/compute_with in draw loops
+
+### 📚 Documentation
+
+- *(readme)* Sync English README with Chinese version
+
+### ⚙️ Miscellaneous Tasks
+
+- Add CHANGELOG
 ## [0.1.1] - 2026-06-13
 
 ### 🚀 Features
@@ -43,3 +45,4 @@
 
 - Init
 - *(scripts)* Add PTY-driven TUI capture tool
+- Release ratatui-style version 0.1.1
