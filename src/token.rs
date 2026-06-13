@@ -13,8 +13,11 @@ use crate::color::Color;
 use crate::error::{CssError, Result};
 
 /// A CSS custom-property value. Currently supports [`Color`] and [`Length`]
-/// (the latter for `width`/`height`). `padding`/`margin`/`border` cannot yet
-/// be driven by `var()` (their `BoxEdges`/`BorderSpec` representations don't
+/// (the latter for `width`/`height`). The color fields — `color`,
+/// `background`, `underline-color`, and the `color` nested inside a `border`
+/// spec — are all `var()`-driven and resolved during the cascade. By contrast
+/// `padding`/`margin` and a border's *style*/*edges* cannot yet be driven by
+/// `var()` (their `BoxEdges`/`BorderStyle`/`Borders` representations don't
 /// carry a `Var` variant).
 ///
 /// [`Token::Var`] covers the case where a custom property is itself a bare

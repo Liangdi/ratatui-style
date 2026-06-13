@@ -1,5 +1,13 @@
 ## [Unreleased]
 
+### 🐛 Bug Fixes
+
+- *(cascade)* Resolve `var()` in border colors. A `border: rounded var(--dim)`
+  or `border-color: var(--rim)` was left as an unresolved `Color::Var` during
+  the cascade, so `paint` silently dropped it and the border drew with no
+  explicit color. The nested `BorderSpec.color` is now resolved against the
+  token table like every other color field.
+
 ### 🚀 Features
 
 - *(presets)* New workspace member `ratatui-style-presets` — ready-to-use CSS

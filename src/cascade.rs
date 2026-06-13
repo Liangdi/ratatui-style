@@ -365,12 +365,20 @@ fn resolve_explicit_inherit(own: &mut CssStyle, parent: &CssStyle) {
 }
 
 /// Resolve every `var()` / leftover `inherit` in the color and length fields
-/// to a literal. Color fields degrade to `Reset` on failure; length fields
-/// degrade to `Auto` — both lenient, neither panics.
+/// to a literal — including the `Color` nested inside a `border` spec. Color
+/// fields degrade to `Reset` on failure; length fields degrade to `Auto` —
+/// both lenient, neither panics.
 fn resolve_vars_in_place(style: &mut CssStyle, tokens: &ThemeTokens) {
     resolve_color_field(&mut style.color, tokens);
     resolve_color_field(&mut style.background, tokens);
     resolve_color_field(&mut style.underline_color, tokens);
+    // The border color is a `Color` nested inside `Option<BorderSpec>`, so it is
+    // not covered by the top-level field passes above. Resolve it here too, or a
+    // `border: rounded var(--dim)` survives the cascade as a `Var` and `paint`
+    // drops it — the border then draws with no explicit color.
+    if let Some(border) = style.border.as_mut() {
+        resolve_color_field(&mut border.color, tokens);
+    }
     resolve_length_field(&mut style.width, tokens);
     resolve_length_field(&mut style.height, tokens);
 }
@@ -449,6 +457,51 @@ mod tests {
         let n = OwnedNode::new("Text").with_classes(["accented"]);
         let c = s.compute(&n, None);
         assert_eq!(c.style.color, Some(Color::literal(RC::Cyan)));
+    }
+
+    #[test]
+    fn border_color_var_resolves_from_tokens() {
+        // Regression for the 0.1.1 limitation: a `var()` in the border
+        // shorthand color must be resolved against the token table, not left as
+        // a `Color::Var` (which `paint` would silently drop).
+        //
+        // This is the exact downstream DetailPanel case: `#003237` was used as a
+        // literal in place of `var(--border-dim)` because the cascade did not
+        // resolve border colors. With the fix, the token resolves.
+        let sheet = Stylesheet::parse(
+            ":root{--border-dim:#003237} .panel { border: rounded var(--border-dim); }",
+        )
+        .unwrap();
+        let n = OwnedNode::new("Div").with_classes(["panel"]);
+        let c = sheet.compute(&n, None);
+        let border = c.style.border.expect("border present");
+        assert_eq!(border.style, crate::box_model::BorderStyle::Rounded);
+        assert_eq!(border.color, Some(Color::literal(RC::Rgb(0x00, 0x32, 0x37))));
+    }
+
+    #[test]
+    fn border_color_var_via_subdeclaration_resolves() {
+        // The `border-color: var(--x)` sub-declaration path must resolve too —
+        // it lands in the same nested `BorderSpec.color` field.
+        let sheet = Stylesheet::parse(
+            ":root{--rim:#ff0000} .b { border-style: single; border-color: var(--rim); }",
+        )
+        .unwrap();
+        let n = OwnedNode::new("Div").with_classes(["b"]);
+        let c = sheet.compute(&n, None);
+        let border = c.style.border.expect("border present");
+        assert_eq!(border.color, Some(Color::literal(RC::Rgb(0xff, 0x00, 0x00))));
+    }
+
+    #[test]
+    fn border_color_var_fallback_resolves() {
+        // An undefined border-color var with a fallback degrades to the
+        // fallback, mirroring the other color fields.
+        let sheet = Stylesheet::parse(".b { border: rounded var(--nope, #00ff00); }").unwrap();
+        let n = OwnedNode::new("Div").with_classes(["b"]);
+        let c = sheet.compute(&n, None);
+        let border = c.style.border.expect("border present");
+        assert_eq!(border.color, Some(Color::literal(RC::Rgb(0x00, 0xff, 0x00))));
     }
 
     #[test]
