@@ -2,13 +2,16 @@
 name = "ratatui-style"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.85"
 authors = ["Liangdi <wu@liangdi.me>"]
 description = "A CSS cascade engine for ratatui — selectors, specificity, inheritance, pseudo-states, and data-driven styling."
 license = "MIT"
-repository = "https://github.com/Liangdi/a2ui"
+repository = "https://github.com/Liangdi/ratatui-style"
+documentation = "https://docs.rs/ratatui-style"
 keywords = ["ratatui", "css", "style", "theme", "tui"]
 categories = ["command-line-interface", "gui"]
 readme = "README.md"
+exclude = ["/design.md", "/justfile", "/cliff.toml", "/release.toml"]
 
 [dependencies]
 ratatui = "0.30"
