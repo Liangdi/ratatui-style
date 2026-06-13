@@ -462,6 +462,15 @@ cargo run --example 10_scss_embed --features scss
 
 # themekit 桥接（需要 themekit feature）
 cargo run --example 11_themekit_bridge --features themekit
+
+# CSS 驱动布局 —— width/height 声明 → ratatui Constraint
+cargo run --example 13_sizing
+
+# 服务端驱动 UI —— 通过 serde 加载 JSON 样式
+cargo run --example 14_data_driven
+
+# 严格模式 —— 捕获 CSS 属性名拼写错误和未定义变量
+cargo run --example 15_strict
 ```
 
 ## 预设库：`ratatui-style-presets`
