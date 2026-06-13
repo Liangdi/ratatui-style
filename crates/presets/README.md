@@ -79,9 +79,13 @@ let sheet = PresetBuilder::new()
 ## Example
 
 ```sh
-cargo run -p ratatui-style-presets --example showcase
-cargo run -p ratatui-style-presets --example showcase --all-features
+cargo run -p ratatui-style-presets --example 02_gallery
+cargo run -p ratatui-style-presets --example 02_gallery --all-features
 ```
+
+A preset gallery: browse every preset in a sidebar and preview any of them
+live. Press `c` to toggle *restyle* mode, where the whole frame restyles with
+the active palette — the theme-swap story in action.
 
 ## License
 

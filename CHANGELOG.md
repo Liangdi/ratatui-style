@@ -8,7 +8,9 @@
   Catppuccin/Nord/Dracula palettes. All themes fill one canonical semantic-token
   vocabulary so swapping the base stylesheet restyles a whole UI. Per-preset
   feature flags, `&'static Stylesheet` accessors, and a `Preset`/`merge`/
-  `PresetBuilder` composition API. Includes a live theme-switcher showcase.
+  `PresetBuilder` composition API. Includes a preset gallery example
+  (`02_gallery`) that browses every preset and can restyle the whole frame with
+  the active palette.
 
 ## [0.1.1] - 2026-06-13
 

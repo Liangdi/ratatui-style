@@ -487,8 +487,8 @@ let _block = computed.to_block();
 ```
 
 ```sh
-# 主题切换器演示（1-4 切换 default/catppuccin/nord/dracula）
-cargo run -p ratatui-style-presets --example showcase --all-features
+# 预设画廊：侧栏浏览全部预设，`c` 切换「整框随主题重渲染」
+cargo run -p ratatui-style-presets --example 02_gallery --all-features
 ```
 
 详见 [presets/README.md](crates/presets/README.md)。
