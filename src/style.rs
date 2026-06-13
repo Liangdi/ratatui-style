@@ -14,7 +14,7 @@ use ratatui::{
     widgets::Block,
 };
 
-use crate::box_model::{BorderSpec, BoxEdges, Length};
+use crate::box_model::{BorderStyle, BorderSpec, BoxEdges, Length};
 use crate::color::Color;
 
 // ---------------------------------------------------------------------------
@@ -151,6 +151,25 @@ impl CssStyle {
         self
     }
 
+    /// Set only the border style (CSS `border-style`), leaving any border color
+    /// already on this block intact. This is what makes Tailwind-style utilities
+    /// like `.rounded` and `.border-slate-700` compose into one declaration.
+    pub fn border_style(mut self, style: BorderStyle) -> Self {
+        let mut spec = self.border.unwrap_or_default();
+        spec.style = style;
+        self.border = Some(spec);
+        self
+    }
+
+    /// Set only the border color (CSS `border-color`), leaving any border style
+    /// already on this block intact.
+    pub fn border_color(mut self, color: impl Into<Color>) -> Self {
+        let mut spec = self.border.unwrap_or_default();
+        spec.color = Some(color.into());
+        self.border = Some(spec);
+        self
+    }
+
     // --- cascade -----------------------------------------------------------
 
     /// Overlay `other` onto `self`: every field that is `Some` in `other`
@@ -172,7 +191,21 @@ impl CssStyle {
         over!(underline_color);
         over!(padding);
         over!(margin);
-        over!(border);
+        // `border` cascades at the sub-field level: a rule declaring only
+        // `border-style` (e.g. `.rounded`) and another declaring only
+        // `border-color` (e.g. `.border-slate-700`) merge into one spec instead
+        // of one clobbering the other. A `None` style is "not declared" and
+        // does not override; an explicit `BorderStyle::None` is preserved.
+        if let Some(other_border) = &other.border {
+            let mut merged = self.border.clone().unwrap_or_default();
+            if other_border.style != BorderStyle::None {
+                merged.style = other_border.style;
+            }
+            if let Some(c) = &other_border.color {
+                merged.color = Some(c.clone());
+            }
+            self.border = Some(merged);
+        }
         over!(text_align);
         over!(width);
         over!(height);
@@ -303,7 +336,7 @@ impl From<ratatui::style::Color> for Color {
 
 #[cfg(feature = "serde")]
 mod serde_impl {
-    use super::{Align, CssStyle, FontStyle, TextDecoration, Weight};
+    use super::{Align, BorderStyle, CssStyle, FontStyle, TextDecoration, Weight};
     use serde::de::Error as DeError;
     use serde::ser::Error as SerError;
     use serde::{de::DeserializeOwned, Deserialize, Deserializer, Serialize, Serializer};
@@ -435,6 +468,20 @@ mod serde_impl {
                     "padding" => parse_opt(val).map(|v| s.padding = v).map_err(|_| "padding"),
                     "margin" => parse_opt(val).map(|v| s.margin = v).map_err(|_| "margin"),
                     "border" => parse_opt(val).map(|v| s.border = v).map_err(|_| "border"),
+                    "border-style" => parse_opt::<BorderStyle>(val)
+                        .map(|v| {
+                            let mut spec = s.border.clone().unwrap_or_default();
+                            spec.style = v.unwrap_or_default();
+                            s.border = Some(spec);
+                        })
+                        .map_err(|_| "border-style"),
+                    "border-color" => parse_opt(val)
+                        .map(|v| {
+                            let mut spec = s.border.clone().unwrap_or_default();
+                            spec.color = v;
+                            s.border = Some(spec);
+                        })
+                        .map_err(|_| "border-color"),
                     "text-align" => parse_opt(val).map(|v| s.text_align = v).map_err(|_| "text-align"),
                     "width" => parse_opt(val).map(|v| s.width = v).map_err(|_| "width"),
                     "height" => parse_opt(val).map(|v| s.height = v).map_err(|_| "height"),
@@ -512,5 +559,24 @@ mod tests {
         let s = CssStyle::new();
         let area = Rect::new(0, 0, 10, 10);
         assert_eq!(s.apply_margin(area), area); // no margin
+    }
+
+    #[test]
+    fn overlay_merges_border_subfields() {
+        // `.rounded` declares only a style; `.border-slate-700` only a color.
+        // The cascade must merge them rather than let one clobber the other.
+        let mut a = CssStyle::new().border_style(BorderStyle::Rounded);
+        let b = CssStyle::new().border_color(RC::Blue);
+        a.overlay(&b);
+        let border = a.border.as_ref().expect("border present");
+        assert_eq!(border.style, BorderStyle::Rounded); // survived
+        assert_eq!(border.color, Some(Color::literal(RC::Blue))); // applied
+
+        // A later full shorthand still wins on the sub-fields it sets.
+        let c = CssStyle::new().border("single red");
+        a.overlay(&c);
+        let border = a.border.as_ref().expect("border present");
+        assert_eq!(border.style, BorderStyle::Single);
+        assert_eq!(border.color, Some(Color::literal(RC::Red)));
     }
 }

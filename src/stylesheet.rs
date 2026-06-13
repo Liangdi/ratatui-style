@@ -153,6 +153,17 @@ pub fn apply_decl(style: &mut CssStyle, prop: &str, value: &str) -> Result<()> {
         "padding" => style.padding = Some(crate::box_model::BoxEdges::parse(value)?),
         "margin" => style.margin = Some(crate::box_model::BoxEdges::parse(value)?),
         "border" => style.border = Some(crate::box_model::BorderSpec::parse_shorthand(value)?),
+        "border-style" => {
+            let mut spec = style.border.clone().unwrap_or_default();
+            spec.style = crate::box_model::BorderStyle::parse_keyword(value)
+                .ok_or_else(|| CssError::InvalidLength(format!("border-style: {value}")))?;
+            style.border = Some(spec);
+        }
+        "border-color" => {
+            let mut spec = style.border.clone().unwrap_or_default();
+            spec.color = Some(Color::parse(value)?);
+            style.border = Some(spec);
+        }
         "text-align" => style.text_align = Some(parse_align(value)?),
         "width" => style.width = Some(crate::box_model::Length::parse(value)?),
         "height" => style.height = Some(crate::box_model::Length::parse(value)?),
@@ -256,6 +267,7 @@ fn push_decl<'a>(chunk: &'a str, out: &mut Vec<(&'a str, &'a str)>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::node::OwnedNode;
     use ratatui::style::Color as RColor;
 
     #[test]
@@ -289,5 +301,25 @@ mod tests {
         let mut sheet = Stylesheet::new();
         sheet.add("Text, .muted, #title", CssStyle::new(), Origin::User).unwrap();
         assert_eq!(sheet.rules().len(), 3);
+    }
+
+    #[test]
+    fn border_style_and_color_compose_through_cascade() {
+        // Two atomic utility classes — one for the border type, one for its
+        // color — compose on a single element. This is the Tailwind idiom
+        // (`rounded border-slate-700`) and only works because `border` cascades
+        // at the sub-field level.
+        let sheet = Stylesheet::parse(
+            r#"
+            .rounded          { border-style: rounded; }
+            .border-slate-700 { border-color: #334155; }
+            "#,
+        )
+        .unwrap();
+        let node = OwnedNode::new("Div").with_classes(["rounded", "border-slate-700"]);
+        let computed = sheet.compute(&node, None);
+        let border = computed.style.border.expect("border present");
+        assert_eq!(border.style, crate::box_model::BorderStyle::Rounded);
+        assert_eq!(border.color, Some(Color::literal(RColor::Rgb(0x33, 0x41, 0x55))));
     }
 }
