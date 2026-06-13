@@ -1,0 +1,89 @@
+/* ratatui-style-presets — default theme.
+ *
+ * Defines the canonical semantic color-token vocabulary that EVERY shipped
+ * theme (catppuccin / nord / dracula …) reproduces, plus a set of base
+ * component classes that reference those tokens through var(). Swap the base
+ * stylesheet for a different theme and everything below restyles with zero
+ * edits — only the :root values change.
+ *
+ * Rules are parsed with Origin::Theme (the accessor sets this), so a
+ * user/runtime layer (Origin::User) overrides them at equal specificity.
+ *
+ * Supported CSS subset: color, background(/-color), font-weight, font-style,
+ * text-decoration, underline-color, border + per-edge border-*, padding,
+ * margin, text-align, width/height. No descendant combinators, no @media,
+ * no nth-child — keep selectors to `Type`, `.class`, `#id`, `:pseudo`.
+ */
+
+:root {
+    /* A neutral "graphite" default — intentionally distinct from the named
+     * theme packs (Catppuccin Mocha / Nord / Dracula) so swapping between them
+     * is visible. A named theme maps its official palette onto these same token
+     * names to restyle the whole UI. */
+    /* --- surfaces --- */
+    --bg:        #0d1117;
+    --surface:   #161b22;
+    --surface-2: #21262d;
+    --border:    #30363d;
+
+    /* --- text --- */
+    --text:       #e6edf3;
+    --text-muted: #7d8590;
+
+    /* --- brand + semantics --- */
+    --accent:    #2f81f7;
+    --accent-fg: #0d1117;
+    --success:   #3fb950;
+    --warning:   #d29922;
+    --danger:    #f85149;
+    --info:      #39c5cf;
+}
+
+/* Root fill + inherited text color. */
+Root { background: var(--bg); color: var(--text); }
+
+/* Structural elements. */
+Header { color: var(--accent); background: var(--surface); font-weight: bold; }
+Footer { color: var(--text-muted); }
+
+/* Panels carry a text color their children inherit. */
+Panel {
+    color: var(--text);
+    background: var(--surface);
+    border: rounded var(--border);
+    padding: 1;
+}
+
+/* A plain bordered block. */
+Block { color: var(--text); border: rounded var(--border); }
+
+/* Text variants — class-based. */
+Text         { color: var(--text); }
+Text.title   { color: var(--accent); font-weight: bold; }
+Text.success { color: var(--success); }
+Text.warning { color: var(--warning); }
+Text.danger  { color: var(--danger); }
+Text.info    { color: var(--info); }
+Text.muted   { color: var(--text-muted); }
+
+/* Buttons + pseudo-state variants. */
+Button          { color: var(--text); padding: 0 2; text-align: center; }
+Button.primary  { background: var(--accent); color: var(--accent-fg); font-weight: bold; }
+Button.outline  { border: rounded var(--accent); color: var(--accent); }
+Button.ghost    { color: var(--text-muted); }
+Button:focus            { background: var(--surface-2); color: var(--text); }
+Button.primary:focus    { background: var(--accent); color: var(--accent-fg); }
+Button:disabled         { color: var(--text-muted); }
+Button.primary:disabled { background: var(--surface-2); color: var(--text-muted); }
+
+/* List + rows. */
+List            { color: var(--text); }
+ListRow         { color: var(--text-muted); }
+ListRow.active  { color: var(--accent); font-weight: bold; }
+
+/* A small status pill / badge. */
+Badge           { padding: 0 1; font-weight: bold; text-align: center; }
+Badge.success   { background: var(--success); color: var(--bg); }
+Badge.warning   { background: var(--warning); color: var(--bg); }
+Badge.danger    { background: var(--danger); color: var(--bg); }
+Badge.info      { background: var(--info); color: var(--bg); }

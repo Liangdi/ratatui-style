@@ -1,3 +1,15 @@
+## [Unreleased]
+
+### 🚀 Features
+
+- *(presets)* New workspace member `ratatui-style-presets` — ready-to-use CSS
+  themes & utilities built on the engine: default theme + base component
+  classes, Tailwind-style atomic utilities, ratatui widget-type defaults, and
+  Catppuccin/Nord/Dracula palettes. All themes fill one canonical semantic-token
+  vocabulary so swapping the base stylesheet restyles a whole UI. Per-preset
+  feature flags, `&'static Stylesheet` accessors, and a `Preset`/`merge`/
+  `PresetBuilder` composition API. Includes a live theme-switcher showcase.
+
 ## [0.1.1] - 2026-06-13
 
 ### 🚀 Features

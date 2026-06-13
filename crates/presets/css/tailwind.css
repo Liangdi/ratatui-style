@@ -1,0 +1,104 @@
+/*
+ * tailwind.css — a self-contained Tailwind-style utility-first design system
+ * for ratatui-style's CSS cascade engine.
+ *
+ * Three layers, in cascade order:
+ *   1. Design tokens  — the Tailwind color palette as CSS custom properties
+ *      on :root, referenced by utilities via var().
+ *   2. Atomic utilities — single-property class rules (.bg-slate-900,
+ *      .text-slate-100, .p-1, .px-2, .rounded, .border-slate-700, …). Because
+ *      every utility writes a *different* CSS field, an element carrying many of
+ *      them composes with zero conflicts.
+ *   3. Component + variant layer — a .btn component with primary/outline/ghost
+ *      variants, plus :focus and :disabled pseudo-state rules (Tailwind's
+ *      focus:/disabled: prefixes as state-qualified selectors).
+ *
+ * This preset is intentionally self-contained: it ships Tailwind's OWN palette
+ * (slate/blue/green/amber/red) and does NOT share canonical semantic tokens.
+ *
+ * Source: examples/06_tailwind.rs (the known-good stylesheet block).
+ */
+
+/* ============================================================= *
+ * 1. Design tokens — the Tailwind color palette, as CSS          *
+ *    custom properties. Utilities reference them via var().      *
+ * ============================================================= */
+:root {
+    --slate-900: #0f172a;
+    --slate-800: #1e293b;
+    --slate-700: #334155;
+    --slate-500: #64748b;
+    --slate-400: #94a3b8;
+    --slate-300: #cbd5e1;
+    --slate-100: #f1f5f9;
+
+    --blue-300:  #93c5fd;
+    --blue-500:  #3b82f6;
+    --blue-600:  #2563eb;
+
+    --green-500: #22c55e;
+    --amber-500: #f59e0b;
+    --red-500:   #ef4444;
+}
+
+/* ============================================================= *
+ * 2. Atomic utilities — one declaration each. Because every     *
+ *    utility writes a *different* CSS field, an element that     *
+ *    carries many of them composes with no conflicts.            *
+ * ============================================================= */
+
+/* background */
+.bg-slate-900 { background: var(--slate-900); }
+.bg-slate-800 { background: var(--slate-800); }
+.bg-slate-700 { background: var(--slate-700); }
+.bg-blue-500  { background: var(--blue-500); }
+.bg-green-500 { background: var(--green-500); }
+.bg-amber-500 { background: var(--amber-500); }
+.bg-red-500   { background: var(--red-500); }
+
+/* text color */
+.text-slate-100 { color: var(--slate-100); }
+.text-slate-300 { color: var(--slate-300); }
+.text-slate-400 { color: var(--slate-400); }
+.text-slate-500 { color: var(--slate-500); }
+.text-slate-900 { color: var(--slate-900); }
+.text-blue-300  { color: var(--blue-300); }
+.text-white     { color: #ffffff; }
+
+/* spacing (terminal cells) */
+.p-1  { padding: 1; }
+.px-1 { padding: 0 1; }
+.px-2 { padding: 0 2; }
+
+/* border — `border-style` and `border-color` are independent utilities that
+ * merge into one border (the cascade composes sub-fields), so
+ * `rounded border-slate-700` yields a rounded, slate-colored border. */
+.rounded           { border-style: rounded; }
+.border-slate-500  { border-color: var(--slate-500); }
+.border-slate-700  { border-color: var(--slate-700); }
+.border-blue-500   { border-color: var(--blue-500); }
+
+/* typography */
+.font-bold    { font-weight: bold; }
+.italic       { font-style: italic; }
+.underline    { text-decoration: underline; }
+.line-through { text-decoration: line-through; }
+.text-left    { text-align: left; }
+.text-center  { text-align: center; }
+
+/* ============================================================= *
+ * 3. Component + variant layer. Tailwind writes `focus:bg-blue-600`*
+ *    inline; here the same idea is a state-qualified rule on a    *
+ *    base class. Specificity climbs with each qualifier, so the   *
+ *    focused/disabled variant cleanly overrides the base.         *
+ * ============================================================= */
+.btn             { padding: 0 2; font-weight: bold; text-align: center; }
+.btn.primary     { background: var(--blue-500); color: var(--slate-900); border-style: rounded; }
+.btn.outline     { border-style: rounded; border-color: var(--blue-500); color: var(--blue-300); }
+.btn.ghost       { color: var(--slate-300); border-style: rounded; }
+
+.btn:focus            { background: var(--slate-700); color: var(--slate-100); }
+.btn.primary:focus    { background: var(--blue-600); color: var(--slate-100); }
+.btn.outline:focus    { background: var(--blue-500); color: var(--slate-900); }
+.btn:disabled         { color: var(--slate-500); }
+.btn.primary:disabled { background: var(--slate-700); color: var(--slate-500); }

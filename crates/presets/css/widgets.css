@@ -1,0 +1,206 @@
+/*
+ * widgets.css — ratatui-style-presets: default styles keyed by ratatui
+ * WIDGET TYPE NAMES (ratatui 0.30).
+ *
+ * An app that names its style nodes after the ratatui widgets it renders
+ * (Table, List, Tabs, Gauge, …) gets a coherent look for free by loading this
+ * stylesheet. These rules are theme-agnostic: every color references one of
+ * the canonical semantic tokens via var(), so pairing this preset with any
+ * palette (default / catppuccin / nord / dracula …) restyles everything. No
+ * hardcoded hex appears anywhere — only the token names defined in default.css.
+ *
+ * Selectors stay within the engine's lenient CSS subset: Type, .class, #id,
+ * :pseudo, and compound forms like Table.Row.active. There are NO descendant
+ * (`A B`) or child (`A > B`) combinators, NO @media, NO :nth-child — the parser
+ * silently drops anything outside the subset, so this file deliberately avoids
+ * them. padding/margin use literal integer cell counts (var() is not supported
+ * there).
+ */
+
+/* ============================================================= *
+ * Block / Panel — the framed container family.                  *
+ * ============================================================= */
+
+/* A bordered container with rounded corners, base text, and 1-cell padding. */
+Block {
+    color: var(--text);
+    background: var(--surface);
+    border: rounded var(--border);
+    padding: 1;
+}
+
+/* Like Block, but a distinct raised surface fill — used for primary panels. */
+Panel {
+    color: var(--text);
+    background: var(--surface);
+    border: rounded var(--border);
+    padding: 1;
+}
+
+/* A deeper / active panel surface for nested grouping. */
+Panel.raised {
+    background: var(--surface-2);
+}
+
+/* ============================================================= *
+ * Table family — Table, Header, Row, Cell.                       *
+ * ============================================================= */
+
+/* The table frame: rounded border, base text. */
+Table {
+    color: var(--text);
+    border: rounded var(--border);
+}
+
+/* Header row — emphasized in the accent color and bold. */
+Header {
+    color: var(--accent);
+    font-weight: bold;
+}
+
+/* A data row. */
+Row {
+    color: var(--text);
+}
+
+/* Row states: active cursor / selected rows use accent + bold. */
+Row.active,
+Row.selected {
+    color: var(--accent);
+    font-weight: bold;
+    background: var(--surface-2);
+}
+
+/* A single cell within a row. */
+Cell {
+    color: var(--text);
+}
+
+/* An emphasized (header-like) cell. */
+Cell.header {
+    color: var(--accent);
+    font-weight: bold;
+}
+
+/* ============================================================= *
+ * List family — List, ListItem.                                  *
+ * ============================================================= */
+
+/* The list container: base text color. */
+List {
+    color: var(--text);
+}
+
+/* List items are muted by default and lift to accent when selected. */
+ListItem {
+    color: var(--text-muted);
+}
+
+ListItem.active,
+ListItem.selected {
+    color: var(--accent);
+    font-weight: bold;
+    background: var(--surface-2);
+}
+
+/* A focused item underlines its title for keyboard affordance. */
+ListItem:focus {
+    text-decoration: underline;
+    underline-color: var(--accent);
+}
+
+/* ============================================================= *
+ * Tabs family — Tabs, Tab.                                       *
+ * ============================================================= */
+
+/* The tab bar: muted text with a bottom border dividing it from content. */
+Tabs {
+    color: var(--text-muted);
+    border-bottom: single var(--border);
+}
+
+/* An individual tab label. */
+Tab {
+    color: var(--text-muted);
+}
+
+/* Active / selected tab is accent-colored and bold. */
+Tab.active,
+Tab.selected {
+    color: var(--accent);
+    font-weight: bold;
+}
+
+/* Focused tab gets an underline in the accent color. */
+Tab:focus {
+    text-decoration: underline;
+    underline-color: var(--accent);
+}
+
+/* ============================================================= *
+ * Gauge / progress family.                                       *
+ * ============================================================= */
+
+/* Filled gauge: accent fill, label readable on top in accent-fg. */
+Gauge {
+    background: var(--accent);
+    color: var(--accent-fg);
+}
+
+/* A linear gauge: the line itself is accent-colored. */
+LineGauge {
+    color: var(--accent);
+}
+
+/* ============================================================= *
+ * Charts — BarChart, Bar, Sparkline.                             *
+ * ============================================================= */
+
+/* Bar chart: bars use the accent, value labels stay readable. */
+BarChart {
+    color: var(--text);
+}
+
+Bar {
+    background: var(--accent);
+}
+
+/* A highlighted / max-value bar can lift to a brighter surface. */
+Bar.active {
+    background: var(--surface-2);
+    color: var(--accent);
+}
+
+/* Sparkline: the line/bar color is accent. */
+Sparkline {
+    color: var(--accent);
+}
+
+/* ============================================================= *
+ * Text blocks — Paragraph, Canvas.                               *
+ * ============================================================= */
+
+/* Flowing text: base text color. */
+Paragraph {
+    color: var(--text);
+}
+
+/* A free-form drawing canvas: base text color. */
+Canvas {
+    color: var(--text);
+}
+
+/* ============================================================= *
+ * Scrollbar — track + thumb.                                     *
+ * ============================================================= */
+
+/* The scrollbar track is muted; the thumb stands out in accent. */
+Scrollbar {
+    color: var(--text-muted);
+    background: var(--surface);
+}
+
+Scrollbar.active,
+Scrollbar:focus {
+    color: var(--accent);
+}

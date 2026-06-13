@@ -1,0 +1,37 @@
+[package]
+name = "ratatui-style-presets"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+authors = ["Liangdi <wu@liangdi.me>"]
+description = "Ready-to-use CSS theme & utility presets for ratatui-style — default theme, Tailwind utilities, widget defaults, and Catppuccin/Nord/Dracula palettes."
+license = "MIT"
+repository = "https://github.com/Liangdi/ratatui-style"
+documentation = "https://docs.rs/ratatui-style-presets"
+keywords = ["ratatui", "css", "style", "theme", "preset"]
+categories = ["command-line-interface", "gui"]
+readme = "README.md"
+
+[dependencies]
+# Path for local workspace dev; the version constraint is what crates.io
+# resolves when this crate is published.
+ratatui-style = { version = "0.1", path = "../.." }
+
+[features]
+# Every preset is opt-in except the always-available default theme + base
+# component classes, which are compiled unconditionally. Enable the rest
+# individually, or `all-features` for the full bundle.
+default = []
+tailwind = []
+widgets = []
+catppuccin = []
+nord = []
+dracula = []
+
+[dev-dependencies]
+ratatui = "0.30"
+crossterm = "0.29"
+
+[[example]]
+name = "01_widget_defaults"
+required-features = ["widgets"]

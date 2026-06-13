@@ -1,0 +1,71 @@
+/*
+ * Theme:   Nord — an arctic, north-bluish color palette
+ * Author:  Arctic Ice Studio (original palette)
+ * Source:  https://www.nordtheme.com/docs/colors-and-palettes
+ *
+ * Nord colors are numbered nord0..nord15, grouped into four palettes:
+ *   Polar Night: nord0..nord3  (dark backgrounds / borders)
+ *   Snow Storm:  nord4..nord6  (light foregrounds)
+ *   Frost:       nord7..nord10 (bluish accents)
+ *   Aurora:      nord11..nord15 (red, orange, yellow, green, purple)
+ *
+ * Verified official hex values:
+ *   nord0  #2e3440  nord1  #3b4252  nord2  #434c5e  nord3  #4c566a
+ *   nord4  #d8dee9  nord5  #e5e9f0  nord6  #eceff4
+ *   nord7  #8fbcbb  nord8  #88c0d0  nord9  #81a1c1  nord10 #5e81ac
+ *   nord11 #bf616a  nord12 #d08770  nord13 #ebcb8b  nord14 #a3be8c  nord15 #b48ead
+ *
+ * Semantic token mapping (dark ambiance):
+ *   --bg         -> nord0   (#2e3440) Polar Night origin / background
+ *   --surface    -> nord1   (#3b4252) elevated panels
+ *   --surface-2  -> nord2   (#434c5e) active line / selection
+ *   --border     -> nord3   (#4c566a) brightest Polar Night shade
+ *   --text       -> nord4   (#d8dee9) Snow Storm origin / foreground
+ *   --text-muted -> nord3   (#4c566a) Nord's conventional comment color
+ *   --accent     -> nord8   (#88c0d0) primary Frost accent (bright clear ice)
+ *   --accent-fg  -> nord0   (#2e3440) readable text on top of --accent
+ *   --success    -> nord14  (#a3be8c) Aurora green
+ *   --warning    -> nord13  (#ebcb8b) Aurora yellow
+ *   --danger     -> nord11  (#bf616a) Aurora red
+ *   --info       -> nord7   (#8fbcbb) Frost calm water
+ */
+
+:root {
+  /* Polar Night (dark base) */
+  --nord0: #2e3440;
+  --nord1: #3b4252;
+  --nord2: #434c5e;
+  --nord3: #4c566a;
+
+  /* Snow Storm (light foregrounds) */
+  --nord4: #d8dee9;
+  --nord5: #e5e9f0;
+  --nord6: #eceff4;
+
+  /* Frost (bluish accents) */
+  --nord7: #8fbcbb;
+  --nord8: #88c0d0;
+  --nord9: #81a1c1;
+  --nord10: #5e81ac;
+
+  /* Aurora (colorful accents) */
+  --nord11: #bf616a;
+  --nord12: #d08770;
+  --nord13: #ebcb8b;
+  --nord14: #a3be8c;
+  --nord15: #b48ead;
+
+  /* Canonical semantic tokens (hex from official Nord palette) */
+  --bg: #2e3440;
+  --surface: #3b4252;
+  --surface-2: #434c5e;
+  --border: #4c566a;
+  --text: #d8dee9;
+  --text-muted: #4c566a;
+  --accent: #88c0d0;
+  --accent-fg: #2e3440;
+  --success: #a3be8c;
+  --warning: #ebcb8b;
+  --danger: #bf616a;
+  --info: #8fbcbb;
+}

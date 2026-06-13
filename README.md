@@ -464,6 +464,35 @@ cargo run --example 10_scss_embed --features scss
 cargo run --example 11_themekit_bridge --features themekit
 ```
 
+## 预设库：`ratatui-style-presets`
+
+不想从零写 CSS？配套 crate [`ratatui-style-presets`](crates/presets) 提供开箱即用的主题与样式，按 feature flag 按需启用：
+
+| 预设 | 说明 |
+|---|---|
+| `default`（始终可用） | neutral 默认主题 + 基础组件类（`Button`/`Panel`/`Text`/`List`/`Badge` …） |
+| `tailwind` | Tailwind 式原子工具类（`.bg-*`/`.text-*`/`.p-*`/`.rounded` …） |
+| `widgets` | ratatui widget 类型默认样式（`Table`/`List`/`Tabs`/`Gauge`/`Scrollbar` …） |
+| `catppuccin` / `nord` / `dracula` | 官方调色板，填同一套语义 token |
+
+所有主题填**同一套规范语义 token**（`--bg`/`--text`/`--accent`/`--success`/…），换基表即换肤：
+
+```rust
+use ratatui_style_presets::{merge, Preset};
+
+// 默认主题 + widget 默认样式 + Catppuccin 调色板，叠成一张表。
+let sheet = merge(&[Preset::Default, Preset::Widgets, Preset::Catppuccin]);
+let computed = sheet.compute(&ratatui_style::NodeRef::new("Button").classes(&["primary"]), None);
+let _block = computed.to_block();
+```
+
+```sh
+# 主题切换器演示（1-4 切换 default/catppuccin/nord/dracula）
+cargo run -p ratatui-style-presets --example showcase --all-features
+```
+
+详见 [presets/README.md](crates/presets/README.md)。
+
 ## 生态定位
 
 | Crate | 定位 | `ratatui-style` |

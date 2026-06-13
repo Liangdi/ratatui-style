@@ -44,3 +44,10 @@ required-features = ["themekit"]
 [[example]]
 name = "10_scss_embed"
 required-features = ["scss"]
+
+# --- workspace -------------------------------------------------------------
+# The presets crate ships ready-to-use CSS themes/utilities built on this
+# engine. It is a separate package so the engine stays dependency- and
+# content-free; themes version independently and consumers opt in per-feature.
+[workspace]
+members = ["crates/presets"]

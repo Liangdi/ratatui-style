@@ -1,0 +1,69 @@
+/*
+ * Theme: Dracula — a dark, vibrant color palette
+ * Author: Zeno Rocha and the Dracula team (original palette)
+ * Source: https://draculatheme.com/contribute  (Color Palette)
+ *         https://draculatheme.com/spec        (full spec)
+ *
+ * Verified official hex values (hex/RGB):
+ *   Background   #282a36 (40,42,54)      Current Line  #44475a (68,71,90)
+ *   Selection    #44475a (68,71,90)      Foreground    #f8f8f2 (248,248,242)
+ *   Comment      #6272a4 (98,114,164)    Cyan          #8be9fd (139,233,253)
+ *   Green        #50fa7b (80,250,123)    Orange        #ffb86c (255,184,108)
+ *   Pink         #ff79c6 (255,121,198)   Purple        #bd93f9 (189,147,249)
+ *   Red          #ff5555 (255,85,85)     Yellow        #f1fa8c (241,250,140)
+ *   Line Highlight (classic fallback) #353747  (from /spec)
+ *
+ * Official Dracula color -> semantic token mapping:
+ *   --bg          Background    #282a36   default background
+ *   --surface     Current Line  #44475a   elevated panel / card
+ *   --surface-2   Line Highlight #353747  raised/active surface; Selection
+ *                                          (#44475a) is identical to Current
+ *                                          Line, so Line Highlight is used
+ *                                          here to give surface-2 a distinct
+ *                                          darker tier (official /spec value)
+ *   --border      Comment       #6272a4   divider / hairline tone
+ *   --text        Foreground    #f8f8f2   primary foreground
+ *   --text-muted  Comment       #6272a4   dimmed / secondary text
+ *   --accent      Purple        #bd93f9   Dracula's signature primary accent
+ *   --accent-fg   Background    #282a36   text readable on top of --accent
+ *   --success     Green         #50fa7b   ok / positive
+ *   --warning     Orange        #ffb86c   caution (Numbers/Constants color)
+ *   --danger      Red           #ff5555   error / destructive (Variables/Errors)
+ *   --info        Cyan          #8be9fd   informational (Classes/Types)
+ *
+ * Extra official Dracula tokens below expose Pink and Yellow (not otherwise
+ * used by the canonical set) so the full palette is available via var().
+ */
+
+:root {
+  /* --- canonical semantic tokens (required) --- */
+  --bg: #282a36;          /* Background                          */
+  --surface: #44475a;     /* Current Line                        */
+  --surface-2: #353747;   /* Line Highlight (selection=#44475a)  */
+  --border: #6272a4;      /* Comment                             */
+  --text: #f8f8f2;        /* Foreground                          */
+  --text-muted: #6272a4;  /* Comment                             */
+  --accent: #bd93f9;      /* Purple                              */
+  --accent-fg: #282a36;   /* Background (readable on --accent)   */
+  --success: #50fa7b;     /* Green                               */
+  --warning: #ffb86c;     /* Orange                              */
+  --danger: #ff5555;      /* Red                                 */
+  --info: #8be9fd;        /* Cyan                                */
+
+  /* --- official Dracula accent palette (extra flavor tokens) --- */
+  --pink: #ff79c6;        /* Pink   (Keywords)                   */
+  --yellow: #f1fa8c;      /* Yellow (Functions/Attributes)       */
+  --purple: #bd93f9;      /* Purple (Operators/Tags)             */
+  --cyan: #8be9fd;        /* Cyan   (Classes/Types)              */
+  --green: #50fa7b;       /* Green  (Strings)                    */
+  --orange: #ffb86c;      /* Orange (Numbers/Constants)          */
+  --red: #ff5555;         /* Red    (Variables/Errors)           */
+
+  /* --- official Dracula base tiers (extra) --- */
+  --background: #282a36;  /* Background                          */
+  --current-line: #44475a;/* Current Line                        */
+  --selection: #44475a;   /* Selection                           */
+  --foreground: #f8f8f2;  /* Foreground                          */
+  --comment: #6272a4;     /* Comment                             */
+  --line-highlight: #353747; /* Line Highlight (classic fallback) */
+}
