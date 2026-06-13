@@ -428,6 +428,9 @@ ratatui-style = { version = "0.1", default-features = false }
 ## 示例
 
 ```sh
+# Hello, World! —— 最小示例：一条 CSS 规则 → 渲染 "Hello, World!"
+cargo run --example 00_hello_world
+
 # 交互式仪表盘 —— 纯 CSS 驱动，单一样式表
 cargo run --example 05_dashboard
 

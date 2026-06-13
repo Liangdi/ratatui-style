@@ -205,6 +205,9 @@ ratatui-style = { version = "0.1", default-features = false }
 ## Examples
 
 ```sh
+# Hello, World! — minimal: one CSS rule → render "Hello, World!"
+cargo run --example 00_hello_world
+
 # Interactive dashboard — all CSS, single stylesheet
 cargo run --example 05_dashboard
 
