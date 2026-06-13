@@ -15,9 +15,20 @@
 
 ## 截图展示
 
-| [06_tailwind](examples/06_tailwind.rs) · 工具类设计系统 | [07_scifi_hud](examples/07_scifi_hud.rs) · 赛博朋克 HUD |
-|:---:|:---:|
-| ![tailwind 风格](screenshot/tailwind-style.png) | ![sci-fi HUD](screenshot/sci-fi-hud.png) |
+<p align="center">
+  <a href="examples/00_hello_world.rs"><b>00_hello_world</b> · 最小首渲染</a><br>
+  <img src="screenshot/hello-world.png" alt="hello world">
+</p>
+
+<p align="center">
+  <a href="examples/06_tailwind.rs"><b>06_tailwind</b> · 工具类设计系统</a><br>
+  <img src="screenshot/tailwind-style.png" alt="tailwind 风格">
+</p>
+
+<p align="center">
+  <a href="examples/07_scifi_hud.rs"><b>07_scifi_hud</b> · 赛博朋克 HUD</a><br>
+  <img src="screenshot/sci-fi-hud.png" alt="sci-fi HUD">
+</p>
 
 更多示例见下文 [示例](#示例) 一节。
 

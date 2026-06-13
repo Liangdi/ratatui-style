@@ -18,9 +18,20 @@ cascade: **origin × specificity × inheritance × pseudo-states**.
 
 ## Screenshots
 
-| [06_tailwind](examples/06_tailwind.rs) · utility-class design system | [07_scifi_hud](examples/07_scifi_hud.rs) · cyberpunk HUD |
-|:---:|:---:|
-| ![tailwind style](screenshot/tailwind-style.png) | ![sci-fi HUD](screenshot/sci-fi-hud.png) |
+<p align="center">
+  <a href="examples/00_hello_world.rs"><b>00_hello_world</b> · minimal first render</a><br>
+  <img src="screenshot/hello-world.png" alt="hello world">
+</p>
+
+<p align="center">
+  <a href="examples/06_tailwind.rs"><b>06_tailwind</b> · utility-class design system</a><br>
+  <img src="screenshot/tailwind-style.png" alt="tailwind style">
+</p>
+
+<p align="center">
+  <a href="examples/07_scifi_hud.rs"><b>07_scifi_hud</b> · cyberpunk HUD</a><br>
+  <img src="screenshot/sci-fi-hud.png" alt="sci-fi HUD">
+</p>
 
 See [Examples](#examples) below for the full list.
 
