@@ -21,7 +21,7 @@ use ratatui::{
     widgets::{Block, List, ListItem, Paragraph},
 };
 
-use ratatui_style::{OwnedNode, State, Stylesheet};
+use ratatui_style::{ComputeScratch, NodeRef, State, Stylesheet};
 
 type Term = Terminal<CrosstermBackend<Stdout>>;
 
@@ -65,8 +65,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     )?;
 
     let mut terminal = setup()?;
+    // Reused across every frame and every compute() — zero allocation once
+    // warmed up.
+    let mut scratch = ComputeScratch::new();
     loop {
-        terminal.draw(|f| draw(f, &sheet))?;
+        terminal.draw(|f| draw(f, &sheet, &mut scratch))?;
         if event::poll(Duration::from_millis(120))?
             && let Event::Key(key) = event::read()?
             && matches!(key.code, KeyCode::Char('q') | KeyCode::Esc)
@@ -78,9 +81,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn draw(frame: &mut ratatui::Frame<'_>, sheet: &Stylesheet) {
+fn draw(frame: &mut ratatui::Frame<'_>, sheet: &Stylesheet, scratch: &mut ComputeScratch) {
     let area = frame.area();
-    let root = sheet.compute(&OwnedNode::new("Root"), None);
+    let root = sheet.compute_with(&NodeRef::new("Root"), None, scratch);
     frame.render_widget(Block::default().style(root.to_style()), area);
 
     let outer = Layout::default()
@@ -89,7 +92,7 @@ fn draw(frame: &mut ratatui::Frame<'_>, sheet: &Stylesheet) {
         .split(area);
 
     // Header.
-    let header = sheet.compute(&OwnedNode::new("Header"), None);
+    let header = sheet.compute_with(&NodeRef::new("Header"), None, scratch);
     frame.render_widget(
         Paragraph::new(Line::from(" ◆ ratatui-style dashboard"))
             .style(header.to_style())
@@ -104,26 +107,28 @@ fn draw(frame: &mut ratatui::Frame<'_>, sheet: &Stylesheet) {
         .split(outer[1]);
 
     // Side panel with a styled list.
-    let side = sheet.compute(&OwnedNode::new("Panel").with_classes(["side"]), None);
+    let side = sheet.compute_with(&NodeRef::new("Panel").classes(&["side"]), None, scratch);
     let side_inner = render_block(frame, side.to_block(), body[0]);
     let rows = ["Inbox", "Drafts", "Sent", "Archive"];
+    let active_cls: &[&str] = &["active"];
+    let empty_cls: &[&str] = &[];
     let items: Vec<ListItem<'_>> = rows
         .iter()
         .enumerate()
         .map(|(i, r)| {
-            let classes: Vec<&str> = if i == 0 { vec!["active"] } else { vec![] };
-            let node = OwnedNode::new("ListRow")
-                .with_classes(classes)
-                .with_state(State::empty());
-            let st = sheet.compute(&node, Some(&side)).to_style();
+            // NodeRef borrows a &'static str slice — zero allocation here.
+            let node = NodeRef::new("ListRow")
+                .classes(if i == 0 { active_cls } else { empty_cls })
+                .state(State::empty());
+            let st = sheet.compute_with(&node, Some(&side), scratch).to_style();
             ListItem::new(Line::from(format!(" {r}"))).style(st)
         })
         .collect();
-    let list_style = sheet.compute(&OwnedNode::new("List"), Some(&side)).to_style();
+    let list_style = sheet.compute_with(&NodeRef::new("List"), Some(&side), scratch).to_style();
     frame.render_widget(List::new(items).style(list_style), side_inner);
 
     // Main panel — children inherit the panel text color.
-    let panel = sheet.compute(&OwnedNode::new("Panel"), None);
+    let panel = sheet.compute_with(&NodeRef::new("Panel"), None, scratch);
     let panel_inner = render_block(frame, panel.to_block(), body[1]);
     let panel_area = panel_inner;
     let chunks = Layout::default()
@@ -131,7 +136,7 @@ fn draw(frame: &mut ratatui::Frame<'_>, sheet: &Stylesheet) {
         .constraints([Constraint::Length(2), Constraint::Min(1), Constraint::Length(3)])
         .split(panel_area);
 
-    let title = sheet.compute(&OwnedNode::new("Text").with_classes(["title"]), Some(&panel));
+    let title = sheet.compute_with(&NodeRef::new("Text").classes(&["title"]), Some(&panel), scratch);
     frame.render_widget(
         Paragraph::new(Line::from("Status")).style(title.to_style()),
         chunks[0],
@@ -146,8 +151,9 @@ fn draw(frame: &mut ratatui::Frame<'_>, sheet: &Stylesheet) {
     ];
     let mut merged: Vec<Line<'_>> = Vec::new();
     for (text, cls) in lines {
-        let node = OwnedNode::new("Text").with_classes([cls]);
-        let st = sheet.compute(&node, Some(&panel)).to_style();
+        let classes = [cls];
+        let node = NodeRef::new("Text").classes(&classes);
+        let st = sheet.compute_with(&node, Some(&panel), scratch).to_style();
         merged.push(Line::from(format!(" • {text}")).style(st));
     }
     frame.render_widget(
@@ -166,10 +172,11 @@ fn draw(frame: &mut ratatui::Frame<'_>, sheet: &Stylesheet) {
         ("Remove", "ghost", true),
     ];
     for (rect, (label, class, dis)) in btn_rects.iter().zip(buttons.iter()) {
-        let node = OwnedNode::new("Button")
-            .with_classes([*class])
-            .with_state(State { disabled: *dis, ..State::empty() });
-        let computed = sheet.compute(&node, None);
+        let classes = [*class];
+        let node = NodeRef::new("Button")
+            .classes(&classes)
+            .state(State { disabled: *dis, ..State::empty() });
+        let computed = sheet.compute_with(&node, None, scratch);
         let para = Paragraph::new(Line::from(format!(" {label} ")))
             .style(computed.to_style())
             .alignment(Alignment::Center);
@@ -178,7 +185,7 @@ fn draw(frame: &mut ratatui::Frame<'_>, sheet: &Stylesheet) {
     }
 
     // Footer.
-    let footer = sheet.compute(&OwnedNode::new("Footer"), None);
+    let footer = sheet.compute_with(&NodeRef::new("Footer"), None, scratch);
     frame.render_widget(
         Paragraph::new(Line::from(" q to quit")).style(footer.to_style()),
         outer[2],

@@ -59,18 +59,18 @@ impl Color {
             return Self::parse_var(rest);
         }
         if let Some(rest) = lower.strip_prefix('#') {
-            let c = parse_hex(rest).ok_or_else(|| CssError::InvalidColor(s.into()))?;
+            let c = parse_hex(rest).ok_or_else(|| CssError::invalid_color(s))?;
             return Ok(literal_or_reset(c));
         }
         if let Some(rest) = lower.strip_prefix("rgba(").or_else(|| lower.strip_prefix("rgb(")) {
-            let c = parse_rgb(rest).ok_or_else(|| CssError::InvalidColor(s.into()))?;
+            let c = parse_rgb(rest).ok_or_else(|| CssError::invalid_color(s))?;
             return Ok(literal_or_reset(c));
         }
         if let Some(c) = named_color(&lower) {
             return Ok(Self::Literal(c));
         }
 
-        Err(CssError::InvalidColor(s.into()))
+        Err(CssError::invalid_color(s))
     }
 
     fn parse_var(inner: &str) -> Result<Self> {
@@ -80,7 +80,7 @@ impl Color {
         let (name_part, fallback_part) = split_top_comma(inner);
         let name = name_part.trim().trim_start_matches('-').trim().to_string();
         if name.is_empty() {
-            return Err(CssError::InvalidColor(format!("var(): empty name in {inner}")));
+            return Err(CssError::invalid_color(format!("var(): empty name in {inner}")));
         }
         let fallback = match fallback_part.trim() {
             "" => None,

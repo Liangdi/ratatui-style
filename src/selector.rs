@@ -4,7 +4,7 @@
 //! Descendant/child/sibling combinators (`A B`, `A > B`, `A + B`) are P3.
 
 use crate::error::{CssError, Result};
-use crate::node::StyledNode;
+use crate::node::{Classes, State, StyledNode};
 
 /// A single pseudo-class.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -61,7 +61,7 @@ impl Selector {
     pub fn parse_compound(s: &str) -> Result<Self> {
         let s = s.trim();
         if s.is_empty() {
-            return Err(CssError::InvalidSelector("empty selector".into()));
+            return Err(CssError::invalid_selector("empty selector"));
         }
 
         let mut sel = Self::universal();
@@ -98,7 +98,7 @@ impl Selector {
                 chars.next();
             }
             if end == start {
-                return Err(CssError::InvalidSelector(format!(
+                return Err(CssError::invalid_selector(format!(
                     "selector `{s}` has a dangling `{c}`"
                 )));
             }
@@ -107,7 +107,7 @@ impl Selector {
                 '.' => sel.classes.push(token.to_string()),
                 '#' => {
                     if sel.id.is_some() {
-                        return Err(CssError::InvalidSelector(format!(
+                        return Err(CssError::invalid_selector(format!(
                             "selector `{s}` has multiple ids"
                         )));
                     }
@@ -116,7 +116,7 @@ impl Selector {
                 ':' => match PseudoClass::parse(token) {
                     Some(p) => sel.pseudos.push(p),
                     None => {
-                        return Err(CssError::InvalidSelector(format!(
+                        return Err(CssError::invalid_selector(format!(
                             "unsupported pseudo-class `:{token}`"
                         )))
                     }
@@ -138,35 +138,52 @@ impl Selector {
     }
 
     /// Whether this selector matches a given node (including pseudo-state).
+    ///
+    /// Thin wrapper over [`matches_values`](Self::matches_values) — the two
+    /// share a single implementation so behavior can never diverge.
     pub fn matches(&self, node: &dyn StyledNode) -> bool {
+        self.matches_values(node.type_name(), node.id(), &node.classes(), node.state())
+    }
+
+    /// Core match against raw values, without going through `&dyn StyledNode`.
+    ///
+    /// This is what the cascade hoists out of the per-rule loop: callers fetch
+    /// `classes` once per node and pass the [`Classes`] view in repeatedly.
+    /// [`Selector::matches`] delegates here, guaranteeing a single source of
+    /// truth for the match semantics.
+    pub(crate) fn matches_values(
+        &self,
+        type_name: &str,
+        id: Option<&str>,
+        classes: &Classes<'_>,
+        state: State,
+    ) -> bool {
         // Type: case-insensitive (convenience); universal matches anything.
         if let Some(t) = &self.type_name
-            && !node.type_name().eq_ignore_ascii_case(t)
+            && !type_name.eq_ignore_ascii_case(t)
         {
             return false;
         }
         // Id: case-sensitive.
-        if let Some(id) = &self.id
-            && node.id() != Some(id.as_str())
+        if let Some(sel_id) = &self.id
+            && id != Some(sel_id.as_str())
         {
             return false;
         }
         // Classes: all must be present (case-sensitive).
-        let node_classes = node.classes();
         for c in &self.classes {
-            if !node_classes.contains(&c.as_str()) {
+            if !classes.contains(c.as_str()) {
                 return false;
             }
         }
         // Pseudo-classes: all must be reflected in the node's state.
-        let st = node.state();
         for p in &self.pseudos {
             let on = match p {
-                PseudoClass::Focus => st.focus,
-                PseudoClass::Hover => st.hover,
-                PseudoClass::Disabled => st.disabled,
-                PseudoClass::Checked => st.checked,
-                PseudoClass::Active => st.active,
+                PseudoClass::Focus => state.focus,
+                PseudoClass::Hover => state.hover,
+                PseudoClass::Disabled => state.disabled,
+                PseudoClass::Checked => state.checked,
+                PseudoClass::Active => state.active,
             };
             if !on {
                 return false;

@@ -49,13 +49,41 @@ pub mod scss_macro;
 pub use grass;
 
 // Re-exports — the primary public surface.
-pub use box_model::{BorderSpec, BorderStyle, BoxEdges, Length};
-pub use cascade::ComputedStyle;
+pub use box_model::{BorderSpec, BorderStyle, BoxEdges, IntoBorderSpec, IntoBoxEdges, Length};
+pub use cascade::{render_computed, CascadeContext, ComputedStyle, ComputeScratch};
 pub use color::Color;
-pub use error::{CssError, Result};
-pub use node::{OwnedNode, Position, State, StyledNode};
+pub use error::{CssError, CssErrorKind, Loc, Result};
+pub use node::{Classes, NodeRef, OwnedNode, Position, State, StyledNode};
 pub use runtime::RuntimeStyle;
 pub use selector::{PseudoClass, Selector};
 pub use style::{Align, CssStyle, FontStyle, TextDecoration, Weight};
 pub use stylesheet::{apply_decl, Origin, RuleEntry, Stylesheet};
 pub use token::ThemeTokens;
+
+/// Convenience re-exports — `use ratatui_style::prelude::*;` to pull in the
+/// common public surface in one line.
+///
+/// This is purely an ergonomic entry point: every item here is also re-exported
+/// at the crate root, so the prelude adds nothing new — it just gathers the
+/// types/traits/functions/macros a downstream app most often needs into one
+/// glob-importable list.
+///
+/// The `css!` macro is `#[macro_export]`-ed at the crate root and (as a
+/// `macro_rules!`) cannot be reliably re-exported through a module glob, so it
+/// is **not** included here. Import it directly:
+///
+/// ```rust,ignore
+/// use ratatui_style::css;
+/// ```
+pub mod prelude {
+    pub use crate::box_model::{BorderSpec, BorderStyle, BoxEdges, IntoBorderSpec, IntoBoxEdges, Length};
+    pub use crate::cascade::{render_computed, CascadeContext, ComputedStyle, ComputeScratch};
+    pub use crate::color::Color;
+    pub use crate::error::{CssError, CssErrorKind, Loc, Result};
+    pub use crate::node::{Classes, NodeRef, OwnedNode, Position, State, StyledNode};
+    pub use crate::runtime::RuntimeStyle;
+    pub use crate::selector::{PseudoClass, Selector};
+    pub use crate::style::{Align, CssStyle, FontStyle, TextDecoration, Weight};
+    pub use crate::stylesheet::{Origin, RuleEntry, Stylesheet};
+    pub use crate::token::ThemeTokens;
+}

@@ -14,7 +14,7 @@ use ratatui::{
     widgets::Block,
 };
 
-use crate::box_model::{BorderStyle, BorderSpec, BoxEdges, Length};
+use crate::box_model::{BorderStyle, BorderSpec, BoxEdges, IntoBorderSpec, IntoBoxEdges, Length};
 use crate::color::Color;
 use crate::error::{CssError, Result};
 
@@ -23,6 +23,14 @@ use crate::error::{CssError, Result};
 // ---------------------------------------------------------------------------
 
 /// `font-weight`.
+///
+/// **Terminal limitation**: ratatui (and terminals themselves) only carry a
+/// single bold modifier bit (`Modifier::BOLD`), so there is no real 100–900
+/// weight gradient. [`Weight::parse`] collapses any numeric weight to one of
+/// two values: `≥ 600` → [`Bold`](Self::Bold), `< 600` →
+/// [`Normal`](Self::Normal). Thus `500` is indistinguishable from `normal`,
+/// and `600`–`900` are all equivalent to `bold`. This is a property of the
+/// rendering target, not a parser shortcoming.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Weight {
     #[default]
@@ -40,7 +48,7 @@ impl Weight {
             other => other
                 .parse::<u32>()
                 .map(|n| if n >= 600 { Self::Bold } else { Self::Normal })
-                .map_err(|_| CssError::InvalidLength(format!("font-weight: {s}"))),
+                .map_err(|_| CssError::invalid_length(format!("font-weight: {s}"))),
         }
     }
 
@@ -67,7 +75,7 @@ impl FontStyle {
         match s.trim().to_ascii_lowercase().as_str() {
             "italic" | "oblique" => Ok(Self::Italic),
             "normal" | "" => Ok(Self::Normal),
-            other => Err(CssError::InvalidSelector(format!("font-style: {other}"))),
+            other => Err(CssError::invalid_selector(format!("font-style: {other}"))),
         }
     }
 
@@ -148,7 +156,7 @@ impl Align {
             "left" | "justify" => Ok(Self::Left),
             "center" => Ok(Self::Center),
             "right" => Ok(Self::Right),
-            other => Err(CssError::InvalidSelector(format!("text-align: {other}"))),
+            other => Err(CssError::invalid_selector(format!("text-align: {other}"))),
         }
     }
 
@@ -219,19 +227,23 @@ impl CssStyle {
         self
     }
 
-    /// Box-model builders. These parse CSS shorthand strings and panic on a
-    /// malformed value — intended for builder ergonomics where the literal is
-    /// known at compile time. For data-driven input, deserialize instead.
-    pub fn padding(mut self, shorthand: &str) -> Self {
-        self.padding = Some(crate::box_model::BoxEdges::parse(shorthand).expect("valid padding"));
+    /// Box-model builders. Accept typed input (zero panic) or a CSS shorthand
+    /// string. Typed forms: `.padding(1)`, `.padding((0, 2))`,
+    /// `.padding((1, 2, 3, 4))`, `.border(BorderStyle::Rounded)`,
+    /// `.border((BorderStyle::Rounded, "#00d4ff"))`. The string shorthand
+    /// (`.padding("1 2")`, `.border("rounded #f00")`) is kept for literal
+    /// convenience but **panics** on a malformed value — only use it for
+    /// compile-time-known literals. For data-driven input, deserialize instead.
+    pub fn padding(mut self, edges: impl IntoBoxEdges) -> Self {
+        self.padding = Some(edges.into_edges());
         self
     }
-    pub fn margin(mut self, shorthand: &str) -> Self {
-        self.margin = Some(crate::box_model::BoxEdges::parse(shorthand).expect("valid margin"));
+    pub fn margin(mut self, edges: impl IntoBoxEdges) -> Self {
+        self.margin = Some(edges.into_edges());
         self
     }
-    pub fn border(mut self, shorthand: &str) -> Self {
-        self.border = Some(crate::box_model::BorderSpec::parse_shorthand(shorthand).expect("valid border"));
+    pub fn border(mut self, spec: impl IntoBorderSpec) -> Self {
+        self.border = Some(spec.into_spec());
         self
     }
 
@@ -393,8 +405,8 @@ impl CssStyle {
         if self.width.is_none() && self.height.is_none() {
             return None;
         }
-        let w = self.width.map(|l| l.to_constraint()).unwrap_or(Constraint::Min(0));
-        let h = self.height.map(|l| l.to_constraint()).unwrap_or(Constraint::Min(0));
+        let w = self.width.as_ref().map(|l| l.to_constraint()).unwrap_or(Constraint::Min(0));
+        let h = self.height.as_ref().map(|l| l.to_constraint()).unwrap_or(Constraint::Min(0));
         Some((w, h))
     }
 
@@ -552,8 +564,8 @@ mod serde_impl {
             put!("margin", self.margin);
             put!("border", self.border.as_ref());
             put!("text-align", self.text_align);
-            put!("width", self.width);
-            put!("height", self.height);
+            put!("width", self.width.as_ref());
+            put!("height", self.height.as_ref());
             map.serialize(s)
         }
     }
@@ -620,9 +632,56 @@ mod tests {
     }
 
     #[test]
+    fn padding_typed_uniform() {
+        let s = CssStyle::new().padding(1u16);
+        assert_eq!(s.padding, Some(BoxEdges::uniform(1)));
+    }
+
+    #[test]
+    fn padding_typed_pair() {
+        let s = CssStyle::new().padding((0u16, 2u16));
+        let e = s.padding.expect("padding");
+        assert_eq!((e.top, e.right, e.bottom, e.left), (0, 2, 0, 2));
+    }
+
+    #[test]
+    fn padding_typed_quad() {
+        let s = CssStyle::new().padding((1u16, 2u16, 3u16, 4u16));
+        let e = s.padding.expect("padding");
+        assert_eq!((e.top, e.right, e.bottom, e.left), (1, 2, 3, 4));
+    }
+
+    #[test]
+    fn padding_string_still_works() {
+        assert_eq!(CssStyle::new().padding("0 2").padding, CssStyle::new().padding((0u16, 2u16)).padding);
+    }
+
+    #[test]
+    fn border_typed_style_only() {
+        let s = CssStyle::new().border(BorderStyle::Rounded);
+        let b = s.border.expect("border");
+        assert_eq!(b.style, BorderStyle::Rounded);
+        assert_eq!(b.color, None);
+    }
+
+    #[test]
+    fn border_typed_with_color() {
+        let s = CssStyle::new().border((BorderStyle::Double, "#ff0000"));
+        let b = s.border.expect("border");
+        assert_eq!(b.style, BorderStyle::Double);
+        assert_eq!(b.color, Some(Color::literal(RC::Rgb(255, 0, 0))));
+    }
+
+    #[test]
+    fn border_string_still_works() {
+        let typed = CssStyle::new().border(BorderStyle::Single).border;
+        let from_str = CssStyle::new().border("single").border;
+        assert_eq!(typed.map(|b| (b.style, b.color)), from_str.map(|b| (b.style, b.color)));
+    }
+
+    #[test]
     #[cfg(feature = "serde")]
-    fn serde_border_style_and_color_compose() {
-        // Two atomic border declarations deserialize into one merged spec —
+    fn serde_border_style_and_color_compose() {        // Two atomic border declarations deserialize into one merged spec —
         // the same Tailwind idiom the cascade exercises, but via the serde
         // path (which now funnels through `border_mut`).
         let json = r##"{ "border-style": "rounded", "border-color": "#334155" }"##;
@@ -633,5 +692,36 @@ mod tests {
             border.color,
             Some(Color::literal(ratatui::style::Color::Rgb(0x33, 0x41, 0x55)))
         );
+        // The legacy serde path sets no edges → None (draws ALL via fallback).
+        assert_eq!(border.edges, None);
+    }
+
+    #[test]
+    #[cfg(feature = "serde")]
+    fn serde_border_edges_roundtrip() {
+        // An explicit edges set serializes to a readable keyword and round-trips
+        // back through the object form.
+        let original = CssStyle::new().border(crate::box_model::BorderSpec {
+            style: BorderStyle::Rounded,
+            color: None,
+            edges: Some(ratatui::widgets::Borders::BOTTOM),
+        });
+        let json = serde_json::to_string(&original).unwrap();
+        assert!(json.contains("\"edges\":\"bottom\""), "edges serialized as keyword: {json}");
+        let back: CssStyle = serde_json::from_str(&json).unwrap();
+        let border = back.border.expect("border present");
+        assert_eq!(border.edges, Some(ratatui::widgets::Borders::BOTTOM));
+        assert_eq!(border.borders(), ratatui::widgets::Borders::BOTTOM);
+    }
+
+    #[test]
+    #[cfg(feature = "serde")]
+    fn serde_border_edges_absent_is_none() {
+        // Backwards compatibility: an object without an `edges` key deserializes
+        // to edges == None (legacy ALL-fallback).
+        let json = r##"{ "style": "rounded", "color": "#f00" }"##;
+        let spec: crate::box_model::BorderSpec = serde_json::from_str(json).unwrap();
+        assert_eq!(spec.edges, None);
+        assert_eq!(spec.borders(), ratatui::widgets::Borders::ALL);
     }
 }

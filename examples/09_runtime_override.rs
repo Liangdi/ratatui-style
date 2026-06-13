@@ -30,7 +30,7 @@ use ratatui::{
     widgets::{Block, Paragraph},
 };
 
-use ratatui_style::{css, OwnedNode, RuntimeStyle, Stylesheet};
+use ratatui_style::{css, ComputeScratch, NodeRef, RuntimeStyle, Stylesheet};
 
 type Term = Terminal<CrosstermBackend<Stdout>>;
 
@@ -58,8 +58,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let mut terminal = setup()?;
+    // Reused across every frame — zero allocation once warmed up.
+    let mut scratch = ComputeScratch::new();
     loop {
-        terminal.draw(|f| draw(f, &style, &override_msg))?;
+        terminal.draw(|f| draw(f, &style, &override_msg, &mut scratch))?;
         if event::poll(Duration::from_millis(120))?
             && let Event::Key(key) = event::read()?
             && matches!(key.code, KeyCode::Char('q') | KeyCode::Esc)
@@ -71,9 +73,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn draw(frame: &mut ratatui::Frame<'_>, style: &RuntimeStyle, override_msg: &str) {
+fn draw(frame: &mut ratatui::Frame<'_>, style: &RuntimeStyle, override_msg: &str, scratch: &mut ComputeScratch) {
     let area = frame.area();
-    let root = style.compute(&OwnedNode::new("Root"), None);
+    let root = style.compute_with(&NodeRef::new("Root"), None, scratch);
     frame.render_widget(Block::default().style(root.to_style()), area);
 
     let chunks = Layout::default()
@@ -87,7 +89,7 @@ fn draw(frame: &mut ratatui::Frame<'_>, style: &RuntimeStyle, override_msg: &str
         .split(area);
 
     // Header.
-    let header = style.compute(&OwnedNode::new("Header"), None);
+    let header = style.compute_with(&NodeRef::new("Header"), None, scratch);
     frame.render_widget(
         Paragraph::new(Line::from(" ◆ css! — embedded + runtime override"))
             .style(header.to_style()),
@@ -100,13 +102,14 @@ fn draw(frame: &mut ratatui::Frame<'_>, style: &RuntimeStyle, override_msg: &str
         .constraints([Constraint::Percentage(34), Constraint::Percentage(33), Constraint::Percentage(33)])
         .split(chunks[1]);
 
-    let nodes: [(OwnedNode, &str); 3] = [
-        (OwnedNode::new("Button"), "Button"),
-        (OwnedNode::new("Button").with_classes(["primary"]), "primary"),
-        (OwnedNode::new("Button").with_id("save"), "#save"),
+    // NodeRef borrows &'static str — zero allocation per frame.
+    let nodes: [(NodeRef<'_>, &str); 3] = [
+        (NodeRef::new("Button"), "Button"),
+        (NodeRef::new("Button").classes(&["primary"]), "primary"),
+        (NodeRef::new("Button").id("save"), "#save"),
     ];
     for (rect, (node, label)) in btn_rects.iter().zip(nodes.iter()) {
-        let computed = style.compute(node, None);
+        let computed = style.compute_with(node, None, scratch);
         let para = Paragraph::new(Line::from(format!(" {label} ")))
             .style(computed.to_style())
             .alignment(Alignment::Center);
@@ -114,7 +117,7 @@ fn draw(frame: &mut ratatui::Frame<'_>, style: &RuntimeStyle, override_msg: &str
     }
 
     // Status line.
-    let text = style.compute(&OwnedNode::new("Text"), None);
+    let text = style.compute_with(&NodeRef::new("Text"), None, scratch);
     let lines = [
         format!(" • status: {override_msg}"),
         " • try: echo 'Button.primary { color: red; }' > o.css".to_string(),

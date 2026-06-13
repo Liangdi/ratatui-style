@@ -37,7 +37,7 @@ use ratatui::{
     widgets::{Block, Paragraph},
 };
 
-use ratatui_style::{OwnedNode, State, Stylesheet};
+use ratatui_style::{ComputeScratch, NodeRef, State, Stylesheet};
 
 type Term = Terminal<CrosstermBackend<Stdout>>;
 
@@ -177,8 +177,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut focus = 0usize;
 
     let mut terminal = setup()?;
+    // Reused across every frame and every theme — zero allocation once warmed up.
+    let mut scratch = ComputeScratch::new();
     loop {
-        terminal.draw(|f| draw(f, &themes[theme].1, &themes[theme].0, theme, themes.len(), &buttons, focus))?;
+        terminal.draw(|f| draw(f, &themes[theme].1, &themes[theme].0, theme, themes.len(), &buttons, focus, &mut scratch))?;
 
         if !event::poll(Duration::from_millis(100))? {
             continue;
@@ -216,11 +218,12 @@ fn draw(
     theme_count: usize,
     buttons: &[Button],
     focus: usize,
+    scratch: &mut ComputeScratch,
 ) {
     let area = frame.area();
 
     // Root background fill — changes per theme.
-    let root = sheet.compute(&OwnedNode::new("Root"), None);
+    let root = sheet.compute_with(&NodeRef::new("Root"), None, scratch);
     frame.render_widget(Block::default().style(root.to_style()), area);
 
     let cols = Layout::default()
@@ -229,7 +232,7 @@ fn draw(
         .split(area);
 
     // Header: shows which theme is active.
-    let header = sheet.compute(&OwnedNode::new("Header"), None);
+    let header = sheet.compute_with(&NodeRef::new("Header"), None, scratch);
     frame.render_widget(
         Paragraph::new(Line::from(format!(
             " ◆ {theme_name}   [{theme_idx}/{theme_count}]"
@@ -239,12 +242,12 @@ fn draw(
     );
 
     // Panel with a title and a button row inside it.
-    let panel = sheet.compute(&OwnedNode::new("Panel"), None);
+    let panel = sheet.compute_with(&NodeRef::new("Panel"), None, scratch);
     let inner = panel_block(frame, panel.to_block(), cols[1]);
 
-    let title = sheet.compute(&OwnedNode::new("PanelTitle"), None);
-    let text = sheet.compute(&OwnedNode::new("Text"), None);
-    let label = sheet.compute(&OwnedNode::new("Label"), None);
+    let title = sheet.compute_with(&NodeRef::new("PanelTitle"), None, scratch);
+    let text = sheet.compute_with(&NodeRef::new("Text"), None, scratch);
+    let label = sheet.compute_with(&NodeRef::new("Label"), None, scratch);
 
     let rows = Layout::default()
         .direction(Direction::Vertical)
@@ -269,13 +272,15 @@ fn draw(
         .split(rows[3]);
 
     for (i, b) in buttons.iter().enumerate() {
-        let node = OwnedNode::new("Button")
-            .with_classes([b.class])
-            .with_state(State {
+        // NodeRef borrows &'static str (b.class is &'static) — zero allocation.
+        let classes = [b.class];
+        let node = NodeRef::new("Button")
+            .classes(&classes)
+            .state(State {
                 focus: i == focus,
                 ..State::empty()
             });
-        let computed = sheet.compute(&node, None);
+        let computed = sheet.compute_with(&node, None, scratch);
         let para = Paragraph::new(Line::from(format!(" {} ", b.label)))
             .style(computed.to_style())
             .alignment(Alignment::Center);
@@ -283,7 +288,7 @@ fn draw(
     }
 
     // Footer hint.
-    let footer = sheet.compute(&OwnedNode::new("Footer"), None);
+    let footer = sheet.compute_with(&NodeRef::new("Footer"), None, scratch);
     frame.render_widget(
         Paragraph::new(Line::from(format!(
             " {:<-10} switch theme · {:<-8} jump · {:<-10} move focus · q to quit",

@@ -23,7 +23,7 @@ use ratatui::{
     widgets::{Block, Paragraph},
 };
 
-use ratatui_style::{OwnedNode, State, Stylesheet};
+use ratatui_style::{ComputeScratch, NodeRef, State, Stylesheet};
 
 type Term = Terminal<CrosstermBackend<Stdout>>;
 
@@ -69,8 +69,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut disabled = false;
 
     let mut terminal = setup()?;
+    // Reused across every frame — zero allocation once warmed up.
+    let mut scratch = ComputeScratch::new();
     loop {
-        terminal.draw(|f| draw(f, &sheet, &buttons, focus, disabled))?;
+        terminal.draw(|f| draw(f, &sheet, &mut scratch, &buttons, focus, disabled))?;
 
         if !event::poll(Duration::from_millis(100))? {
             continue;
@@ -92,6 +94,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 fn draw(
     frame: &mut ratatui::Frame<'_>,
     sheet: &Stylesheet,
+    scratch: &mut ComputeScratch,
     buttons: &[Button],
     focus: usize,
     disabled: bool,
@@ -99,7 +102,7 @@ fn draw(
     let area = frame.area();
 
     // Root background fill.
-    let root = sheet.compute(&OwnedNode::new("Root"), None);
+    let root = sheet.compute_with(&NodeRef::new("Root"), None, scratch);
     frame.render_widget(Block::default().style(root.to_style()), area);
 
     let cols = Layout::default()
@@ -108,7 +111,7 @@ fn draw(
         .split(area);
 
     // Header.
-    let header = sheet.compute(&OwnedNode::new("Header"), None);
+    let header = sheet.compute_with(&NodeRef::new("Header"), None, scratch);
     frame.render_widget(
         Paragraph::new(Line::from(" ratatui-style · live cascade demo"))
             .style(header.to_style())
@@ -117,7 +120,7 @@ fn draw(
     );
 
     // Panel + button row.
-    let panel = sheet.compute(&OwnedNode::new("Panel"), None);
+    let panel = sheet.compute_with(&NodeRef::new("Panel"), None, scratch);
     let inner = panel_block(frame, panel.to_block(), cols[1]);
 
     let instructions = Paragraph::new(Line::from(format!(
@@ -129,14 +132,16 @@ fn draw(
     frame.render_widget(instructions, btn_rects[0]);
 
     for (i, b) in buttons.iter().enumerate() {
-        let node = OwnedNode::new("Button")
-            .with_classes([b.class])
-            .with_state(State {
+        // NodeRef borrows &'static str (b.class is &'static) — zero allocation.
+        let classes = [b.class];
+        let node = NodeRef::new("Button")
+            .classes(&classes)
+            .state(State {
                 focus: i == focus,
                 disabled,
                 ..State::empty()
             });
-        let computed = sheet.compute(&node, None);
+        let computed = sheet.compute_with(&node, None, scratch);
         let para = Paragraph::new(Line::from(format!(" {} ", b.label)))
             .style(computed.to_style())
             .alignment(Alignment::Center);
@@ -152,7 +157,7 @@ fn draw(
     }
 
     // Footer hint.
-    let footer = sheet.compute(&OwnedNode::new("Footer"), None);
+    let footer = sheet.compute_with(&NodeRef::new("Footer"), None, scratch);
     frame.render_widget(
         Paragraph::new(Line::from(format!(
             " {:<-10} to move focus · {:<-10} to toggle disabled · q to quit",
