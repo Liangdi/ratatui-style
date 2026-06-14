@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | Implemented through P4 (sibling combinators + `@media` not/comma + media-scoped tokens + LRU cache) |
+| **Status** | Implemented through P5 (nested sibling chains + `:nth-of-type` + `@media` nesting + token specificity + access-order LRU) |
 | **Version** | 0.2.0 |
 | **Authors** | Liangdi `<wu@liangdi.me>` |
 | **Depends on** | `ratatui` 0.30 (core types: `Style` / `Color` / `Modifier` / `Rect` / `Block`) |
@@ -251,7 +251,8 @@ Hard dependency: `ratatui` 0.30. Optional: `serde` (default), `serde_json` (`jso
 | **P2** | inheritance + `var()` tokens + themekit interop | ✅ Done |
 | **P3** | descendant/child combinators, `:nth-child`, `@media` (terminal size + color capability) | ✅ Done |
 | **P4** | adjacent `+` / general sibling `~` combinators; `@media` `not`/comma/`and`; media-scoped `:root` tokens; `ComputedStyle` LRU cache | ✅ Done |
-| **P5** | nested sibling chains (`A + B + C`); access-order LRU (vs current FIFO); media-query specificity cascade for tokens; `@media` nesting; `:nth-of-type` | ☐ Future |
+| **P5** | nested sibling chains (`A + B + C`); access-order LRU; media-query specificity cascade for tokens; `@media` nesting; `:nth-of-type` | ✅ Done |
+| **P6** | `:last/only/nth-last-of-type` (needs forward-sibling tracking); precise `not` in nested `@media`; `@supports`; per-property `var()` for `BoxEdges`/`BorderStyle` | ☐ Future |
 
 ## 11. Resolved Design Questions
 

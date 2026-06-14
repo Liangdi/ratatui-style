@@ -1,8 +1,9 @@
 ## [0.2.0] - 2026-06-15
 
-A breaking release: the P3 + P4 roadmaps land — structural pseudo-classes, all four
-combinators, `@media` queries with `not`/`or`/comma + media-scoped tokens, a `ComputedStyle`
-LRU cache — alongside a serde cross-format overhaul and cascade performance work.
+A breaking release: the P3 + P4 + P5 roadmaps land — structural pseudo-classes (incl.
+`:nth-of-type`), all four combinators (incl. nested sibling chains), `@media` queries with
+`not`/`or`/comma + nesting + media-scoped tokens with specificity cascade, an access-order
+`ComputedStyle` LRU cache — alongside a serde cross-format overhaul and cascade perf work.
 
 ### 🚀 Features
 
@@ -45,7 +46,20 @@ LRU cache — alongside a serde cross-format overhaul and cascade performance wo
   results across frames; keys fold node identity + ancestor-chain signature +
   sibling identities + media. Auto-invalidated via a `Stylesheet::generation()`
   counter bumped on every mutation (`add`/`add_rule`/`extend`/`tokens_mut`).
-  Off by default — the no-cache path is unchanged.
+  Off by default — the no-cache path is unchanged. **Access-order LRU**
+  (a `get` hit promotes; eviction is least-recently-used, O(capacity)).
+- *(selector)* Nested sibling chains — `A + B + C`, `A ~ B ~ C`, and mixed
+  `A + B ~ C` now resolve (the matched sibling's own previous siblings are
+  threaded through the recursion).
+- *(selector)* `:nth-of-type(an+b)` and `:first-of-type` — count only same-type
+  siblings. (`:last/only/nth-last-of-type` need forward-sibling info and are
+  not supported; they error at parse.)
+- *(media)* `@media` nesting — `@media (a) { @media (b) { … } }` AND-combines
+  the queries (`MediaQuery::and`, cross-product of alternatives). `not` inside
+  nested `@media` is approximate (documented); use a flat query for precision.
+- *(token)* Media-token specificity cascade — when multiple media overrides
+  match, the **most specific** (most conditions) wins; ties break by source
+  order. Replaces the prior "last-matching-wins" rule.
 
 ### 🚜 Refactor
 

@@ -187,10 +187,14 @@ impl Stylesheet {
     ///   itself a CSS fragment parsed recursively.
     /// - **`:root` inside `@media`** declares a **media-gated override** — the
     ///   token is resolved against the active [`MediaContext`] at compute time
-    ///   (last matching query wins, with the default `:root` value as fallback).
-    ///   See [`ThemeTokens::get_color_with`](crate::token::ThemeTokens::get_color_with).
-    /// - **Nested `@media` inside `@media` is rejected** with a structural error;
-    ///   combine conditions into one query instead.
+    ///   (the most-specific matching query wins, ties broken by source order,
+    ///   with the default `:root` value as fallback). See
+    ///   [`ThemeTokens::get_color_with`](crate::token::ThemeTokens::get_color_with).
+    /// - **Nested `@media` inside `@media`** is supported: the inner query is
+    ///   combined with the enclosing query via logical AND (see
+    ///   [`MediaQuery::and`]), so the inner block's rules are gated on BOTH
+    ///   queries holding. Negation inside a nested `@media` is approximate — see
+    ///   the `and` docs.
     ///
     /// **Lenient behavior** (unchanged from earlier versions): unknown
     /// properties are silently ignored (forward-compat), and `var(--name)`
@@ -359,26 +363,30 @@ fn parse_rule_loop(
         let is_media_at =
             lowered_head == "@medi" && selector_part.len() >= 6 && selector_part.as_bytes()[5] == b'a';
         if is_media_at {
-            // Reject nested @media inside @media for v1 (clear semantics).
-            if media.is_some() {
-                let loc = line_col(cleaned, sel_off);
-                return Err(CssError::invalid_selector(
-                    "nested `@media` inside `@media` is not supported in v1 — combine conditions into one query",
-                )
-                .at(loc.line, loc.column));
-            }
             let query_str = selector_part[6..].trim();
-            let query = MediaQuery::parse(query_str).map_err(|mut e| {
+            let inner_query = MediaQuery::parse(query_str).map_err(|mut e| {
                 if e.loc.is_none() {
                     let loc = line_col(cleaned, sel_off);
                     e = e.at(loc.line, loc.column);
                 }
                 e
             })?;
-            // Recurse: parse the body fragment with the query tagging its rules.
-            // The body lives in `cleaned[body_offset..body_offset + body.len()]`,
-            // so offsets stay correct.
-            parse_rule_loop(cleaned, body, body_offset, strict, Some(&query), sheet)?;
+            // Nested @media: AND-combine the inner query with the enclosing
+            // query. A top-level @media (media == None) tags rules with the
+            // inner query directly; a nested @media combines outer ∧ inner via
+            // [`MediaQuery::and`] so rules inside are gated on BOTH holding.
+            // `combined` is owned here so we can hand a stable `&MediaQuery` to
+            // the recursive call for the inner body.
+            let combined = match media {
+                Some(outer) => outer.and(&inner_query),
+                None => inner_query,
+            };
+            // Recurse: parse the body fragment with the combined query tagging
+            // its rules (and :root inserts landing in `media_vars` under it).
+            // The body lives in
+            // `cleaned[body_offset..body_offset + body.len()]`, so offsets stay
+            // correct.
+            parse_rule_loop(cleaned, body, body_offset, strict, Some(&combined), sheet)?;
             continue;
         }
 
@@ -1137,11 +1145,112 @@ mod tests {
     }
 
     #[test]
-    fn nested_media_errors() {
-        // Nested @media is a structural error in v1.
-        let css = "@media (min-width:1){ @media (max-width:2){ Button { color: red; } } }";
-        let err = Stylesheet::parse(css).unwrap_err();
-        assert!(matches!(err.kind, CssErrorKind::InvalidSelector(_)));
+    fn nested_media_combines_queries() {
+        // P5-4: nested @media ANDs the inner query with the enclosing query.
+        // @media (min-width: 80) { @media (color) { Button { color: red } } }
+        // → Button rule gated on (min-width:80) AND (color).
+        let css = "@media (min-width: 80) { @media (color) { Button { color: red; } } }";
+        let sheet = Stylesheet::parse(css).unwrap();
+        let button_rules: Vec<_> =
+            sheet.rules().iter().filter(|r| r.selector.type_name.as_deref() == Some("Button")).collect();
+        assert_eq!(button_rules.len(), 1, "exactly one Button rule");
+        let media = button_rules[0].media.as_ref().expect("Button rule is media-gated");
+        // One alternative, two concatenated conditions.
+        assert_eq!(
+            media.alternatives,
+            vec![crate::media::MediaAlternative {
+                negated: false,
+                conditions: vec![
+                    crate::media::MediaCondition::MinWidth(80),
+                    crate::media::MediaCondition::Color,
+                ],
+            }],
+            "nested @media AND-combines the queries"
+        );
+        // Drive a real cascade: under {cols:100, color} the rule applies; under
+        // {cols:100, no_color} it does not; under {cols:60, color} it does not.
+        use crate::cascade::ComputeScratch;
+        let node = OwnedNode::new("Button");
+        let mut scratch = ComputeScratch::new();
+        let both = MediaContext { cols: 100, no_color: false, ..Default::default() };
+        let computed = sheet.compute_with_media(&node, None, &mut scratch, &both);
+        assert_eq!(
+            computed.style.color,
+            Some(Color::literal(RColor::Red)),
+            "both conditions hold → rule applies"
+        );
+        let color_off = MediaContext { cols: 100, no_color: true, ..Default::default() };
+        let computed = sheet.compute_with_media(&node, None, &mut scratch, &color_off);
+        assert_eq!(
+            computed.style.color, None,
+            "color=false → combined query fails → rule does NOT apply"
+        );
+        let width_off = MediaContext { cols: 60, no_color: false, ..Default::default() };
+        let computed = sheet.compute_with_media(&node, None, &mut scratch, &width_off);
+        assert_eq!(
+            computed.style.color, None,
+            "min-width fails → combined query fails → rule does NOT apply"
+        );
+    }
+
+    #[test]
+    fn nested_media_three_deep() {
+        // @media (a){@media (b){@media (c){ X{…} }}} → tagged with (a∧b∧c).
+        let css = "@media (min-width: 80) {\n  @media (color) {\n    @media (truecolor) {\n      X { color: red; }\n    }\n  }\n}";
+        let sheet = Stylesheet::parse(css).unwrap();
+        let x_rules: Vec<_> =
+            sheet.rules().iter().filter(|r| r.selector.type_name.as_deref() == Some("X")).collect();
+        assert_eq!(x_rules.len(), 1);
+        let media = x_rules[0].media.as_ref().expect("X rule is media-gated");
+        assert_eq!(
+            media.alternatives,
+            vec![crate::media::MediaAlternative {
+                negated: false,
+                conditions: vec![
+                    crate::media::MediaCondition::MinWidth(80),
+                    crate::media::MediaCondition::Color,
+                    crate::media::MediaCondition::Truecolor,
+                ],
+            }],
+            "three-deep nesting AND-combines all three queries"
+        );
+        // Only all-three ctx matches.
+        let all = MediaContext {
+            cols: 100,
+            no_color: false,
+            truecolor: true,
+            ..Default::default()
+        };
+        assert!(media.matches(&all), "all three hold → matches");
+        let missing_truecolor = MediaContext {
+            cols: 100,
+            no_color: false,
+            truecolor: false,
+            ..Default::default()
+        };
+        assert!(
+            !media.matches(&missing_truecolor),
+            "missing truecolor → no match"
+        );
+    }
+
+    #[test]
+    fn nested_media_root_inserts_under_combined_query() {
+        // :root inside a nested @media lands in media_vars under the COMBINED
+        // query, not just the inner one.
+        let css = "@media (min-width: 80) { @media (color) { :root { --x: red; } } }";
+        let sheet = Stylesheet::parse(css).unwrap();
+        // Default map: not present.
+        assert_eq!(sheet.tokens().get_color("x"), None);
+        // Only (min-width:80) matches but not (color) → combined query fails → no value.
+        let width_only = MediaContext { cols: 100, no_color: true, ..Default::default() };
+        assert_eq!(sheet.tokens().get_color_with("x", &width_only), None);
+        // Both → resolves.
+        let both = MediaContext { cols: 100, no_color: false, ..Default::default() };
+        assert_eq!(
+            sheet.tokens().get_color_with("x", &both),
+            Some(Color::literal(RColor::Red))
+        );
     }
 
     #[test]

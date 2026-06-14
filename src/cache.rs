@@ -31,12 +31,16 @@
 //!
 //! # Eviction policy
 //!
-//! Capacity is a hard bound. When the cache is full and a NEW key is inserted,
-//! the OLDEST insertion is evicted (FIFO). This is **not** access-order LRU — a
-//! `get` does not reorder. FIFO is simpler, has no `&mut self`-on-read
-//! complications beyond the generation check, and is fine for the stable-tree
-//! render loop where the working set is touched every frame anyway. Capacity 0
-//! disables storage entirely (`get` always misses).
+//! Capacity is a hard bound. The cache is an **access-order LRU**: the
+//! least-recently-USED entry is evicted when a NEW key must be inserted into a
+//! full cache. Both a `get` hit and an `insert` of an existing key promote that
+//! key to the back of the order (most-recently-used), so hot entries survive
+//! longer than cold ones. Eviction takes from the front (least-recently-used).
+//!
+//! Promotion uses a linear scan over the order deque, so `get` and `insert` are
+//! O(capacity). That is fine here — the cache is small and bounded — but it
+//! means a very large capacity would raise per-access cost. Capacity 0 disables
+//! storage entirely (`get` always misses, `insert` is a no-op).
 
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, VecDeque};
@@ -53,11 +57,16 @@ use crate::selector::NodeIdentity;
 ///
 /// See the [module docs](crate::cache) for the correctness invariants and the
 /// eviction policy. Two computes with the same signature yield the same
-/// `ComputedStyle`, so a hit short-circuits the cascade. The cache is NOT
-/// access-order LRU — it is bounded FIFO (oldest insertion evicted when full).
+/// `ComputedStyle`, so a hit short-circuits the cascade. The cache is an
+/// **access-order LRU**: both a `get` hit and an `insert` of an existing key
+/// promote that key to most-recently-used, and the least-recently-used entry is
+/// evicted when the cache is full.
 ///
-/// `get` takes `&mut self` because a stylesheet generation mismatch (detected
-/// on every access) clears the cache in place — see [`Self::check_generation`].
+/// `get` takes `&mut self` for two reasons: a stylesheet generation mismatch
+/// (detected on every access) clears the cache in place — see
+/// [`Self::check_generation`] — and a hit promotes the key to the back of the
+/// eviction order. Both `get` and `insert` are O(capacity) because promotion
+/// scans the order deque.
 pub struct ComputeCache {
     entries: HashMap<u64, ComputedStyle>,
     order: VecDeque<u64>,
@@ -95,17 +104,31 @@ impl ComputeCache {
     /// [`ComputedStyle`] clone on a hit (cheap — a post-resolution
     /// `ComputedStyle` holds no heap `Color::Var`).
     ///
+    /// A hit promotes `sig` to the back of the eviction order
+    /// (most-recently-used), so frequently accessed entries survive longer.
+    /// This is the access-order LRU promotion. The scan over the order deque
+    /// makes `get` O(capacity); acceptable for a small bounded cache. A miss
+    /// does NOT mutate the order.
+    ///
     /// `&mut self` because [`check_generation`](Self::check_generation) may
-    /// clear.
+    /// clear, and a hit promotes.
     pub fn get(&mut self, sig: u64, current_gen: u64) -> Option<ComputedStyle> {
         self.check_generation(current_gen);
+        if self.entries.contains_key(&sig) {
+            // Promote to most-recently-used (back of the order).
+            if let Some(pos) = self.order.iter().position(|&k| k == sig) {
+                self.order.remove(pos);
+            }
+            self.order.push_back(sig);
+        }
         self.entries.get(&sig).cloned()
     }
 
     /// Insert a computed result under `sig`. If the key already exists, update
-    /// its value and move it to the back of the eviction order (most-recently
-    /// inserted). If at capacity and the key is new, evict the oldest
-    /// insertion. A no-op when capacity is 0.
+    /// its value and move it to the back of the eviction order
+    /// (most-recently-used) — an access-order LRU promotion. If at capacity and
+    /// the key is new, evict the least-recently-used entry (front of the order).
+    /// A no-op when capacity is 0. O(capacity) due to the promotion scan.
     pub fn insert(&mut self, sig: u64, value: ComputedStyle, current_gen: u64) {
         self.check_generation(current_gen);
         if self.capacity == 0 {
@@ -423,29 +446,80 @@ mod tests {
     }
 
     #[test]
-    fn cache_capacity_evicts_oldest() {
+    fn lru_get_promotes_entry_so_it_survives_eviction() {
         let mut cache = ComputeCache::new(2);
-        cache.insert(10, cs(RC::Red), 0);
-        cache.insert(20, cs(RC::Blue), 0);
-        // At capacity. Inserting a new key (30) evicts the oldest (10).
-        cache.insert(30, cs(RC::Green), 0);
-        assert!(cache.get(10, 0).is_none(), "oldest evicted");
-        assert!(cache.get(20, 0).is_some(), "second still present");
-        assert!(cache.get(30, 0).is_some(), "newest present");
+        cache.insert(10, cs(RC::Red), 0); // A
+        cache.insert(20, cs(RC::Blue), 0); // B
+        // Order (front -> back): [A, B]. Promote A via a get hit.
+        let _ = cache.get(10, 0);
+        // Order is now [B, A]. Inserting C evicts the LRU, which is B — not A.
+        cache.insert(30, cs(RC::Green), 0); // C
+        assert!(cache.get(10, 0).is_some(), "A survived because it was promoted");
+        assert!(cache.get(20, 0).is_none(), "B evicted as least-recently-used");
+        assert!(cache.get(30, 0).is_some(), "C present");
         assert_eq!(cache.len(), 2);
     }
 
     #[test]
-    fn cache_update_existing_does_not_evict() {
+    fn lru_insert_update_promotes() {
         let mut cache = ComputeCache::new(2);
-        cache.insert(10, cs(RC::Red), 0);
-        cache.insert(20, cs(RC::Blue), 0);
-        // Update key 10 in place — no eviction.
+        cache.insert(10, cs(RC::Red), 0); // A
+        cache.insert(20, cs(RC::Blue), 0); // B
+        // Update A in place — this also promotes A to most-recently-used.
         cache.insert(10, cs(RC::Yellow), 0);
-        assert_eq!(cache.len(), 2);
-        let got = cache.get(10, 0).expect("hit");
+        // Order is now [B, A]. Inserting C evicts the LRU = B, not A.
+        cache.insert(30, cs(RC::Green), 0); // C
+        let got = cache.get(10, 0).expect("A present (promoted by update)");
         assert_eq!(got.style.color, Some(crate::color::Color::literal(RC::Yellow)));
-        assert!(cache.get(20, 0).is_some());
+        assert!(cache.get(20, 0).is_none(), "B evicted as least-recently-used");
+        assert!(cache.get(30, 0).is_some(), "C present");
+        assert_eq!(cache.len(), 2);
+    }
+
+    #[test]
+    fn lru_miss_does_not_reorder() {
+        let mut cache = ComputeCache::new(2);
+        cache.insert(10, cs(RC::Red), 0); // A
+        cache.insert(20, cs(RC::Blue), 0); // B
+        // A miss must NOT mutate the order — A stays the least-recently-used.
+        assert!(cache.get(999, 0).is_none());
+        // Inserting C therefore evicts A (the LRU), leaving B and C.
+        cache.insert(30, cs(RC::Green), 0); // C
+        assert!(cache.get(10, 0).is_none(), "A evicted (oldest, never promoted)");
+        assert!(cache.get(20, 0).is_some(), "B present");
+        assert!(cache.get(30, 0).is_some(), "C present");
+        assert_eq!(cache.len(), 2);
+    }
+
+    #[test]
+    fn lru_capacity_zero_never_stores() {
+        let mut cache = ComputeCache::new(0);
+        cache.insert(1, cs(RC::Red), 0);
+        assert!(cache.is_empty());
+        assert_eq!(cache.len(), 0);
+        assert!(cache.get(1, 0).is_none());
+    }
+
+    #[test]
+    fn lru_generation_clear_resets_order() {
+        // Insert under gen 0.
+        let mut cache = ComputeCache::new(2);
+        cache.insert(10, cs(RC::Red), 0); // A
+        cache.insert(20, cs(RC::Blue), 0); // B
+        // Bump gen — the next access clears everything, including the order.
+        // Inserting under gen 1 starts fresh: old A is gone.
+        cache.insert(30, cs(RC::Green), 1); // C, fresh sequence
+        assert!(cache.get(10, 1).is_none(), "A cleared by generation bump");
+        // The fresh order should be just [C] (capacity 2, one entry).
+        // Fill it again to confirm eviction follows the NEW order, not the old.
+        cache.insert(40, cs(RC::Yellow), 1); // D
+        assert_eq!(cache.len(), 2);
+        // Promote C, then insert E — D becomes the LRU and is evicted.
+        let _ = cache.get(30, 1);
+        cache.insert(50, cs(RC::Magenta), 1); // E
+        assert!(cache.get(30, 1).is_some(), "C survived (promoted)");
+        assert!(cache.get(40, 1).is_none(), "D evicted as LRU of the fresh order");
+        assert!(cache.get(50, 1).is_some(), "E present");
     }
 
     #[test]

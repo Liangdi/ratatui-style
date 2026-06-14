@@ -104,6 +104,94 @@ impl MediaQuery {
         self.alternatives.iter().any(|a| a.matches(ctx))
     }
 
+    /// Combine two queries with logical AND: the result matches iff **both**
+    /// `self` and `other` match.
+    ///
+    /// This is used to resolve nested `@media` blocks (`@media (a) { @media (b)
+    /// { … } }` is equivalent to a single `@media (a) and (b) { … }`).
+    ///
+    /// # Semantics
+    ///
+    /// A query is an OR of [`MediaAlternative`]s, and each alternative is an AND
+    /// of [`MediaCondition`]s. To form `self ∧ other` we take the **cross
+    /// product** of the two alternatives lists: for each `a1` in `self` and each
+    /// `a2` in `other`, the combined alternative has
+    /// `conditions = a1.conditions ++ a2.conditions`. So `(a),(b)` AND-ed with
+    /// `(c)` yields two alternatives `(a,c)` and `(b,c)` — each must be fully
+    /// satisfied for the OR to match, which is exactly AND-of-OR semantics.
+    ///
+    /// Match-all short-circuits: if either side has **zero alternatives** (the
+    /// match-all gate) the other side is returned unchanged (cloned). If both
+    /// are empty the result is empty (still match-all).
+    ///
+    /// # Negation limitation (approximate for `not`)
+    ///
+    /// A [`MediaAlternative`] carries a single `negated` flag for the *whole*
+    /// conjunction, so a precise `(¬a1) ∧ a2` (one side negated, the other not)
+    /// cannot be represented as one alternative. For the cross product:
+    ///
+    /// - If **neither** side is negated, the combined alternative is exact:
+    ///   `{ negated: false, conditions: a1.conditions ++ a2.conditions }`.
+    /// - If **either** side is negated, the precise AND-semantics cannot be
+    ///   represented, so the combined alternative is an **approximation**:
+    ///   `negated = a1.negated || a2.negated` with the concatenated conditions.
+    ///
+    /// The common case (no `not` inside nested `@media`) is exact. If you need
+    /// a `not` in a nested context, prefer writing it as a single flat
+    /// `@media` with the conditions spelled out rather than nesting.
+    pub fn and(&self, other: &MediaQuery) -> MediaQuery {
+        // Match-all short-circuits: an empty alternatives list means "matches
+        // everything", so X AND all == X.
+        if self.alternatives.is_empty() {
+            return other.clone();
+        }
+        if other.alternatives.is_empty() {
+            return self.clone();
+        }
+
+        let mut combined = Vec::with_capacity(self.alternatives.len() * other.alternatives.len());
+        for a1 in &self.alternatives {
+            for a2 in &other.alternatives {
+                // Concatenate conditions. The negation handling is the
+                // documented approximation for the negated case.
+                let mut conditions = Vec::with_capacity(a1.conditions.len() + a2.conditions.len());
+                conditions.extend(a1.conditions.iter().cloned());
+                conditions.extend(a2.conditions.iter().cloned());
+                combined.push(MediaAlternative {
+                    negated: a1.negated || a2.negated,
+                    conditions,
+                });
+            }
+        }
+        MediaQuery { alternatives: combined }
+    }
+
+    /// The specificity of `self` against `media`: the maximum condition-count
+    /// among the alternatives that **match** under `media`. Returns `None` if
+    /// the query does not match `media` at all.
+    ///
+    /// A match-all query (zero alternatives) has specificity `0`. Used by the
+    /// media-token resolution scan to rank competing overrides: the override
+    /// backed by the most-conditioned matching query wins (ties broken by source
+    /// order).
+    pub(crate) fn matching_specificity(&self, media: &MediaContext) -> Option<usize> {
+        if self.alternatives.is_empty() {
+            // Matches everything (specificity 0).
+            return Some(0);
+        }
+        let mut best: Option<usize> = None;
+        for a in &self.alternatives {
+            if a.matches(media) {
+                let n = a.conditions.len();
+                best = Some(match best {
+                    Some(b) if b >= n => b,
+                    _ => n,
+                });
+            }
+        }
+        best
+    }
+
     /// Parse the text BETWEEN `@media` and the block's opening `{`.
     ///
     /// Grammar (case-insensitive), precedence tightest first:
@@ -819,5 +907,130 @@ mod tests {
     fn display_roundtrip_comma_and_not() {
         let q = MediaQuery::parse("(min-width: 80), not (color)").unwrap();
         assert_eq!(q.to_string(), "(min-width: 80), not (color)");
+    }
+
+    // --- and (nested @media combinator) -------------------------------------
+
+    #[test]
+    fn media_query_and_concatenates_conditions() {
+        // (min-width: 80).and((color)) → one alternative with BOTH conditions;
+        // matches only when both hold.
+        let q1 = MediaQuery::parse("(min-width: 80)").unwrap();
+        let q2 = MediaQuery::parse("(color)").unwrap();
+        let combined = q1.and(&q2);
+        assert_eq!(
+            combined.alternatives,
+            vec![alt(false, [MediaCondition::MinWidth(80), MediaCondition::Color])],
+            "AND of two single-condition queries concatenates conditions"
+        );
+        // Matches only when both hold.
+        let both = MediaContext { cols: 100, no_color: false, ..Default::default() };
+        let width_only = MediaContext { cols: 100, no_color: true, ..Default::default() };
+        let color_only = MediaContext { cols: 60, no_color: false, ..Default::default() };
+        let neither = MediaContext { cols: 60, no_color: true, ..Default::default() };
+        assert!(combined.matches(&both), "both hold → matches");
+        assert!(!combined.matches(&width_only), "color missing → no match");
+        assert!(!combined.matches(&color_only), "width missing → no match");
+        assert!(!combined.matches(&neither), "neither → no match");
+    }
+
+    #[test]
+    fn media_query_and_cross_product() {
+        // (a),(b) AND (c) → two alternatives (a,c),(b,c).
+        let q1 = MediaQuery::parse("(min-width: 80), (max-width: 40)").unwrap();
+        let q2 = MediaQuery::parse("(color)").unwrap();
+        let combined = q1.and(&q2);
+        assert_eq!(
+            combined.alternatives,
+            vec![
+                alt(false, [MediaCondition::MinWidth(80), MediaCondition::Color]),
+                alt(false, [MediaCondition::MaxWidth(40), MediaCondition::Color]),
+            ],
+            "OR cross-product with AND concatenates per-alternative"
+        );
+        // cols:100, color → first alt matches.
+        let large_color = MediaContext { cols: 100, no_color: false, ..Default::default() };
+        assert!(combined.matches(&large_color));
+        // cols:30, color → second alt matches.
+        let small_color = MediaContext { cols: 30, no_color: false, ..Default::default() };
+        assert!(combined.matches(&small_color));
+        // cols:50, color → neither alt (50 is between 40 and 80).
+        let mid_color = MediaContext { cols: 50, no_color: false, ..Default::default() };
+        assert!(!combined.matches(&mid_color));
+        // cols:100, no color → first alt's color condition fails; second alt's
+        // width fails too.
+        let large_mono = MediaContext { cols: 100, no_color: true, ..Default::default() };
+        assert!(!combined.matches(&large_mono));
+    }
+
+    #[test]
+    fn media_query_and_empty_short_circuit() {
+        // empty AND other == other; other AND empty == other.
+        let empty = MediaQuery::default();
+        let other = MediaQuery::parse("(min-width: 80)").unwrap();
+        assert_eq!(empty.and(&other), other, "match-all AND other == other");
+        assert_eq!(other.and(&empty), other, "other AND match-all == other");
+        // Both empty → empty.
+        assert_eq!(empty.and(&MediaQuery::default()), MediaQuery::default());
+    }
+
+    #[test]
+    fn media_query_and_negation_is_approximate() {
+        // (not (min-width: 80)).and((color)): the documented v1 approximation
+        // propagates negation onto the combined alternative. So the combined
+        // alternative is `not ((min-width: 80) and (color))`.
+        //
+        // This is NOT the precise semantics of `(¬min-width:80) ∧ (color)` —
+        // that would require a per-condition negation model we don't have. The
+        // test pins the documented approximation so a future change is caught.
+        let not_q = MediaQuery::parse("not (min-width: 80)").unwrap();
+        let color_q = MediaQuery::parse("(color)").unwrap();
+        let combined = not_q.and(&color_q);
+        // One alternative, negated, with both conditions.
+        assert_eq!(
+            combined.alternatives,
+            vec![alt(true, [MediaCondition::MinWidth(80), MediaCondition::Color])],
+            "negation propagates to the combined alternative (approximation)"
+        );
+        // Under the approximation: `not ((min-width: 80) and (color))`.
+        // cols:100, color → both hold → negated → no match.
+        let large_color = MediaContext { cols: 100, no_color: false, ..Default::default() };
+        assert!(
+            !combined.matches(&large_color),
+            "approximation: both hold → negated → no match"
+        );
+        // cols:60, color → min-width fails → conjunction false → negated true.
+        let small_color = MediaContext { cols: 60, no_color: false, ..Default::default() };
+        assert!(
+            combined.matches(&small_color),
+            "approximation: one fails → negated → matches"
+        );
+    }
+
+    #[test]
+    fn matching_specificity_returns_max_condition_count() {
+        // A 2-condition matching alternative is more specific than a 1-condition
+        // one in the same query (under OR).
+        let q = MediaQuery::parse("(min-width: 80) and (color), (max-width: 40)").unwrap();
+        // cols:100, color → first alt (2 conds) matches → specificity 2.
+        let large_color = MediaContext { cols: 100, no_color: false, ..Default::default() };
+        assert_eq!(q.matching_specificity(&large_color), Some(2));
+        // cols:30, color → only second alt (1 cond) matches → specificity 1.
+        let small_color = MediaContext { cols: 30, no_color: false, ..Default::default() };
+        assert_eq!(q.matching_specificity(&small_color), Some(1));
+    }
+
+    #[test]
+    fn matching_specificity_none_when_no_match() {
+        let q = MediaQuery::parse("(min-width: 80)").unwrap();
+        // cols:60 → no match → None.
+        let small = MediaContext { cols: 60, ..Default::default() };
+        assert_eq!(q.matching_specificity(&small), None);
+    }
+
+    #[test]
+    fn matching_specificity_zero_for_match_all() {
+        let empty = MediaQuery::default();
+        assert_eq!(empty.matching_specificity(&MediaContext::default()), Some(0));
     }
 }

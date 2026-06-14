@@ -162,6 +162,18 @@ fn parse_bare_int(s: &str) -> Result<i32> {
 }
 
 /// A (possibly parameterized) pseudo-class.
+///
+/// # Same-type sibling pseudos and the forward-sibling limitation
+///
+/// `NthOfType` and `FirstOfType` count only among previous siblings of the SAME
+/// element type. They are fully computable from the previous-sibling identities
+/// threaded in by [`CascadeContext`](crate::CascadeContext).
+///
+/// `:last-of-type`, `:nth-last-of-type`, and `:only-of-type` are deliberately
+/// **not** supported: they require the total same-type sibling count, which in
+/// turn requires knowledge of siblings that come AFTER the subject. The cascade
+/// walk only tracks PREVIOUS siblings, so these variants are not determinable at
+/// match time. Parsing them yields an "unsupported pseudo-class" error.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Pseudo {
     /// A simple state flag: :focus, :hover, :disabled, :checked, :active.
@@ -173,6 +185,15 @@ pub enum Pseudo {
     NthChild(NthExpr),
     /// :nth-last-child(an+b)
     NthLastChild(NthExpr),
+    /// :nth-of-type(an+b) — among same-type previous siblings, the node is the
+    /// (an+b)-th of its type. Requires sibling identities (matched through
+    /// [`matches_chain`](Selector::matches_chain)); the one-shot
+    /// [`matches_values`](Selector::matches_values) path has no siblings, so
+    /// `:nth-of-type` does not match there.
+    NthOfType(NthExpr),
+    /// :first-of-type — no previous sibling shares this element type. Same
+    /// sibling-identity requirement as [`NthOfType`](Self::NthOfType).
+    FirstOfType,
 }
 
 impl Pseudo {
@@ -194,6 +215,8 @@ impl Pseudo {
             return match name.to_ascii_lowercase().as_str() {
                 "nth-child" => Ok(Self::NthChild(parse_nth(inner)?)),
                 "nth-last-child" => Ok(Self::NthLastChild(parse_nth(inner)?)),
+                "nth-of-type" => Ok(Self::NthOfType(parse_nth(inner)?)),
+                // nth-last-of-type needs forward-sibling knowledge — unsupported.
                 other => Err(CssError::invalid_selector(format!(
                     "unsupported pseudo-class `:{other}`"
                 ))),
@@ -205,6 +228,10 @@ impl Pseudo {
             "first-child" => Ok(Self::FirstChild),
             "last-child" => Ok(Self::LastChild),
             "only-child" => Ok(Self::OnlyChild),
+            "first-of-type" => Ok(Self::FirstOfType),
+            // last-of-type / only-of-type need forward-sibling knowledge —
+            // unsupported. Fall through to the generic error below by treating
+            // them as unknown names (they have no PseudoClass equivalent).
             other => match PseudoClass::parse(other) {
                 Some(p) => Ok(Self::State(p)),
                 None => Err(CssError::invalid_selector(format!(
@@ -221,16 +248,14 @@ impl Pseudo {
 /// child (`A > B`), adjacent-sibling (`A + B`), and general-sibling (`A ~ B`)
 /// combinators. Only reachable through [`Selector::ancestor`].
 ///
-/// # One-level-sibling limitation
-///
 /// Adjacent (`+`) and general (`~`) sibling combinators are matched against the
 /// previous-sibling identities threaded in by
-/// [`CascadeContext`](crate::CascadeContext). When matching recurses *into* an
-/// ancestor/sibling compound (e.g. the `A` in `A + B`), that sub-selector is
-/// given an empty siblings slice. So `A + B` and `A ~ B` (with a simple `A`,
-/// optionally itself carrying a descendant/child chain like `X A + B`) work
-/// fully; a *nested* sibling chain like `A + B + C` is not fully supported
-/// because the chain-of-siblings context does not propagate across recursion.
+/// [`CascadeContext`](crate::CascadeContext). Nested sibling chains such as
+/// `A + B + C`, `A ~ B ~ C`, and mixed `A + B ~ C` resolve correctly: when
+/// matching recurses into a sibling compound (the `B` in `A + B + C`), the
+/// sub-selector is handed the correct *prefix* of the subject's previous
+/// siblings — namely the slice that precedes the matched sibling — so the inner
+/// sibling combinator can resolve.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Combinator {
     /// `A B` — the subject is a descendant of `A` (any depth).
@@ -545,6 +570,13 @@ impl Selector {
     /// [`Position`] (count 0) carries no sibling information, so it is treated
     /// as "does not match" rather than spuriously matching `:first-child`
     /// (whose naive condition `index == 0` would be true for the default).
+    ///
+    /// The same-type sibling pseudos `:nth-of-type` and `:first-of-type` need
+    /// the previous-sibling identity list, which this path does not have. On the
+    /// one-shot path they see `same_type_before == 0`, so `:first-of-type` and
+    /// `:nth-of-type(1)` trivially match while `:nth-of-type(k>1)` does not.
+    /// Use [`matches_chain`](Self::matches_chain) via
+    /// [`CascadeContext`](crate::CascadeContext) for accurate same-type counts.
     pub(crate) fn matches_values(
         &self,
         type_name: &str,
@@ -553,7 +585,9 @@ impl Selector {
         state: State,
         position: &Position,
     ) -> bool {
-        if !self.matches_subject_raw(type_name, id, classes, state, position) {
+        // The one-shot path has no sibling context: same_type_before = 0, so
+        // `:nth-of-type(1)` / `:first-of-type` match and higher indices do not.
+        if !self.matches_subject_raw(type_name, id, classes, state, position, 0) {
             return false;
         }
         // A combinator chain cannot be satisfied without ancestor identities.
@@ -563,6 +597,11 @@ impl Selector {
     /// Subject-compound match against raw values (the historical
     /// `matches_values` body, factored out). Does NOT consult [`ancestor`].
     ///
+    /// `same_type_before` is the count of previous siblings sharing the subject's
+    /// element type-name — supplied by [`matches_subject`] from the threaded
+    /// sibling list, or `0` on the one-shot path. It backs the
+    /// `:nth-of-type` / `:first-of-type` pseudos.
+    ///
     /// [`ancestor`]: Self::ancestor
     fn matches_subject_raw(
         &self,
@@ -571,6 +610,7 @@ impl Selector {
         classes: &Classes<'_>,
         state: State,
         position: &Position,
+        same_type_before: i32,
     ) -> bool {
         // Type: case-insensitive (convenience); universal matches anything.
         if let Some(t) = &self.type_name
@@ -591,32 +631,56 @@ impl Selector {
             }
         }
         // Pseudo-classes: all must be satisfied.
-        self.pseudos_satisfied(state, position)
+        self.pseudos_satisfied(state, position, same_type_before)
     }
 
     /// Subject compound of this selector against one [`NodeIdentity`].
-    fn matches_subject(&self, id: &NodeIdentity) -> bool {
+    ///
+    /// `siblings` is the node's list of PREVIOUS siblings (oldest-first), used
+    /// only by the same-type-counting pseudos `:nth-of-type` and `:first-of-type`.
+    /// The other structural pseudos consult `id.position`. Callers that have no
+    /// sibling context (the one-shot `matches_values` path) pass `&[]`, in which
+    /// case `:nth-of-type(1)`/`:first-of-type` trivially match (a node with no
+    /// previous same-type siblings is the first of its type) and other
+    /// `:nth-of-type(k>1)` do not.
+    fn matches_subject(&self, id: &NodeIdentity, siblings: &[NodeIdentity]) -> bool {
         let class_strs: Vec<&str> = id.classes.iter().map(String::as_str).collect();
         let classes = Classes::from_slice(&class_strs);
-        self.matches_subject_raw(&id.type_name, id.id.as_deref(), &classes, id.state, &id.position)
+        // The of-type pseudos need the previous same-type sibling count, which
+        // we compute here and pass into the raw matcher via a side channel.
+        let same_type_before = siblings
+            .iter()
+            .filter(|s| s.type_name.eq_ignore_ascii_case(&id.type_name))
+            .count() as i32;
+        self.matches_subject_raw(
+            &id.type_name,
+            id.id.as_deref(),
+            &classes,
+            id.state,
+            &id.position,
+            same_type_before,
+        )
     }
 
     /// Subject matches `node_id`, and the ancestor chain matches `ancestors`
     /// (closest ancestor = last element). Right-to-left CSS matching.
     ///
     /// `siblings` is the node's list of PREVIOUS siblings (oldest-first,
-    /// closest = last), threaded in by
-    /// [`CascadeContext`](crate::CascadeContext). It backs the adjacent (`+`)
-    /// and general (`~`) sibling combinators. When recursing into an ancestor
-    /// compound, the sub-selector is given `&[]` for siblings — see the
-    /// one-level-sibling limitation in [`Combinator`].
+    /// closest = last), threaded in by [`CascadeContext`](crate::CascadeContext).
+    /// It backs the adjacent (`+`), general (`~`), and same-type (`:nth-of-type`,
+    /// `:first-of-type`) sibling matching. When recursing into a descendant or
+    /// child ancestor compound the sub-selector is given `&[]` for siblings
+    /// (ancestor matching uses the `ancestors` slice, not siblings); when
+    /// recursing into a sibling-joined compound the sub-selector is given the
+    /// correct PREFIX of `siblings` so a nested sibling chain (`A + B + C`)
+    /// resolves.
     pub(crate) fn matches_chain(
         &self,
         node_id: &NodeIdentity,
         ancestors: &[NodeIdentity],
         siblings: &[NodeIdentity],
     ) -> bool {
-        if !self.matches_subject(node_id) {
+        if !self.matches_subject(node_id, siblings) {
             return false;
         }
         match &self.ancestor {
@@ -635,19 +699,24 @@ impl Selector {
                 false
             }
             Some((Combinator::Adjacent, anc)) => {
-                // The immediately-preceding sibling must match the ancestor
-                // compound. Siblings share ancestors, so we forward `ancestors`
-                // (a descendant/child chain on the ancestor compound still works).
-                match siblings.last() {
-                    None => false,
-                    Some(prev) => anc.matches_chain(prev, ancestors, &[]),
+                // The matched sibling is `siblings.last()`; that sibling's OWN
+                // previous siblings are `&siblings[..n-1]`, which we thread in so
+                // a nested adjacent chain like `A + B + C` can resolve the inner
+                // `A + B`. Siblings share ancestors, so `ancestors` is forwarded.
+                let n = siblings.len();
+                if n == 0 {
+                    return false;
                 }
+                let last = &siblings[n - 1];
+                anc.matches_chain(last, ancestors, &siblings[..n - 1])
             }
             Some((Combinator::Sibling, anc)) => {
                 // Some previous sibling matches the ancestor compound. Search
-                // closest-first (last) backward through the sibling list.
-                for s in siblings.iter().rev() {
-                    if anc.matches_chain(s, ancestors, &[]) {
+                // closest-first (reverse). For a match at index `i`, that
+                // sibling's OWN previous siblings are `&siblings[..i]`, threaded
+                // so a nested general-sibling chain like `A ~ B ~ C` resolves.
+                for i in (0..siblings.len()).rev() {
+                    if anc.matches_chain(&siblings[i], ancestors, &siblings[..i]) {
                         return true;
                     }
                 }
@@ -656,8 +725,10 @@ impl Selector {
         }
     }
 
-    /// Evaluate all [`pseudos`](Self::pseudos) against `state` and `position`.
-    fn pseudos_satisfied(&self, state: State, position: &Position) -> bool {
+    /// Evaluate all [`pseudos`](Self::pseudos) against `state`, `position`, and
+    /// `same_type_before` (the count of previous siblings sharing the subject's
+    /// element type-name — used by `:nth-of-type` / `:first-of-type`).
+    fn pseudos_satisfied(&self, state: State, position: &Position, same_type_before: i32) -> bool {
         for p in &self.pseudos {
             let on = match p {
                 Pseudo::State(PseudoClass::Focus) => state.focus,
@@ -677,6 +748,10 @@ impl Selector {
                     position.sibling_count > 0
                         && expr.matches(position.sibling_count as i32 - position.index as i32)
                 }
+                // of_type_index = 1 + (count of previous same-type siblings).
+                Pseudo::NthOfType(expr) => expr.matches(same_type_before + 1),
+                // No previous sibling shares this type.
+                Pseudo::FirstOfType => same_type_before == 0,
             };
             if !on {
                 return false;
@@ -1028,7 +1103,10 @@ mod tests {
     #[test]
     fn unknown_pseudo_errors() {
         assert!(Selector::parse_compound("a:visited").is_err());
-        assert!(Selector::parse_compound("a:nth-of-type(2)").is_err());
+        // The forward-sibling-dependent of-type variants are unsupported.
+        assert!(Selector::parse_compound("a:last-of-type").is_err());
+        assert!(Selector::parse_compound("a:only-of-type").is_err());
+        assert!(Selector::parse_compound("a:nth-last-of-type(2)").is_err());
     }
 
     #[test]
@@ -1349,5 +1427,187 @@ mod tests {
         assert_eq!(*c0, Combinator::Descendant);
         let (c1, _) = list[1].ancestor.as_ref().expect("anc1");
         assert_eq!(*c1, Combinator::Child);
+    }
+
+    // ---------------------------------------------------------------------
+    // P5-1: nested sibling chains (`A + B + C`, `A ~ B ~ C`, mixed)
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn nested_adjacent_chain_matches() {
+        // `Label + Input + Button` — Button whose immediate previous sibling is
+        // Input, whose immediate previous sibling is Label. Subject = Button.
+        let sel = Selector::parse_chain("Label + Input + Button").unwrap();
+        assert_eq!(sel.type_name.as_deref(), Some("Button"));
+        let label = nid("Label");
+        let input = nid("Input");
+        let button = nid("Button");
+        // siblings for Button = [Label, Input] (oldest-first, closest = last).
+        // Input's own previous siblings = [Label].
+        assert!(sel.matches_chain(&button, &[], &[label.clone(), input.clone()]));
+
+        // Broken chain: Button's immediate prev is Input, but Input's prev is NOT
+        // Label (it's Span). siblings = [Span, Input] → no match.
+        let span = nid("Span");
+        assert!(!sel.matches_chain(&button, &[], &[span, input]));
+
+        // Broken chain: missing the second hop entirely (siblings = [Label]).
+        assert!(!sel.matches_chain(&button, &[], std::slice::from_ref(&label)));
+    }
+
+    #[test]
+    fn nested_general_sibling_chain() {
+        // `A ~ B ~ C` — C has some prior sibling B, which has some prior sibling A.
+        let sel = Selector::parse_chain("A ~ B ~ C").unwrap();
+        assert_eq!(sel.type_name.as_deref(), Some("C"));
+        let a = nid("A");
+        let b = nid("B");
+        let c = nid("C");
+        // siblings for C = [A, X, B] (B somewhere before C; A before B).
+        let x = nid("X");
+        assert!(sel.matches_chain(&c, &[], &[a.clone(), x.clone(), b.clone()]));
+
+        // siblings = [B, A] (A is AFTER B, so B has no prior sibling A) → no match.
+        assert!(!sel.matches_chain(&c, &[], &[b, a.clone()]));
+
+        // No B at all before C.
+        assert!(!sel.matches_chain(&c, &[], &[a, x]));
+    }
+
+    #[test]
+    fn mixed_adjacent_then_general_sibling_chain() {
+        // `A + B ~ C` — C has some prior sibling B; B's immediate prior is A.
+        let sel = Selector::parse_chain("A + B ~ C").unwrap();
+        assert_eq!(sel.type_name.as_deref(), Some("C"));
+        let a = nid("A");
+        let b = nid("B");
+        let c = nid("C");
+        let x = nid("X");
+        // siblings for C = [A, B, X] → B (with A immediately before it) is a
+        // prior sibling of C → match.
+        assert!(sel.matches_chain(&c, &[], &[a.clone(), b.clone(), x.clone()]));
+        // siblings = [X, A, B] → B is found, B's immediate prev is A → match.
+        assert!(sel.matches_chain(&c, &[], &[x, a, b]));
+        // B present but its immediate prev is X (not A): siblings = [X, B].
+        let x2 = nid("X");
+        let b2 = nid("B");
+        assert!(!sel.matches_chain(&c, &[], &[x2, b2]));
+    }
+
+    #[test]
+    fn mixed_sibling_and_descendant() {
+        // `Panel Item + Item` — an Item that immediately follows an Item, both
+        // descendants of Panel. Subject = the second Item.
+        let sel = Selector::parse_chain("Panel Item + Item").unwrap();
+        assert_eq!(sel.type_name.as_deref(), Some("Item"));
+        // The ancestor of the second Item is the first Item joined by Adjacent;
+        // the first Item's ancestor is Panel joined by Descendant.
+        let panel = nid("Panel");
+        let item1 = nid("Item");
+        let item2 = nid("Item");
+        // ancestors for item2 = [Panel]; siblings = [Item].
+        assert!(sel.matches_chain(&item2, std::slice::from_ref(&panel), std::slice::from_ref(&item1)));
+        // Wrong ancestor type → no match.
+        let other = nid("Other");
+        assert!(!sel.matches_chain(&item2, std::slice::from_ref(&other), &[item1]));
+    }
+
+    #[test]
+    fn single_adjacent_still_matches() {
+        // Regression: the P4-2 single-level adjacent still works after the
+        // sibling-prefix refactor.
+        let sel = Selector::parse_chain("Label + Input").unwrap();
+        let label = nid("Label");
+        let input = nid("Input");
+        assert!(sel.matches_chain(&input, &[], std::slice::from_ref(&label)));
+        // Empty siblings → no match.
+        assert!(!sel.matches_chain(&input, &[], &[]));
+    }
+
+    // ---------------------------------------------------------------------
+    // P5-5: :nth-of-type and :first-of-type
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn parse_nth_of_type() {
+        let s = Selector::parse_compound("Item:nth-of-type(2n+1)").unwrap();
+        assert_eq!(s.type_name.as_deref(), Some("Item"));
+        assert_eq!(s.pseudos.len(), 1);
+        assert_eq!(s.pseudos[0], Pseudo::NthOfType(NthExpr { a: 2, b: 1 }));
+    }
+
+    #[test]
+    fn parse_first_of_type() {
+        let s = Selector::parse_compound("Item:first-of-type").unwrap();
+        assert_eq!(s.pseudos, vec![Pseudo::FirstOfType]);
+    }
+
+    #[test]
+    fn nth_of_type_counts_same_type_only() {
+        // Full sibling order in the parent: [Div, Item, Div, Item].
+        // For the 2nd Item as subject, its PREVIOUS siblings are [Div, Item, Div]
+        // — exactly one Item before it → of_type_index = 2.
+        let div = nid("Div");
+        let item = nid("Item");
+        let second_item = nid("Item");
+        let siblings = [div.clone(), item.clone(), div.clone()];
+
+        let nth2 = Selector::parse_compound("Item:nth-of-type(2)").unwrap();
+        assert!(nth2.matches_chain(&second_item, &[], &siblings));
+        let nth1 = Selector::parse_compound("Item:nth-of-type(1)").unwrap();
+        assert!(!nth1.matches_chain(&second_item, &[], &siblings));
+
+        // A Div subject with one prior Div in its previous siblings
+        // ([Div, Item]) → of_type_index 2; `Div:nth-of-type(2)` matches,
+        // `Div:nth-of-type(1)` does not.
+        let second_div = nid("Div");
+        let div_siblings = [div.clone(), item.clone()];
+        let div_nth1 = Selector::parse_compound("Div:nth-of-type(1)").unwrap();
+        let div_nth2 = Selector::parse_compound("Div:nth-of-type(2)").unwrap();
+        assert!(!div_nth1.matches_chain(&second_div, &[], &div_siblings));
+        assert!(div_nth2.matches_chain(&second_div, &[], &div_siblings));
+
+        // First Div (no previous same-type siblings) → of_type_index 1.
+        let first_div = nid("Div");
+        let first_siblings = [item.clone(), item.clone()]; // no Div before it
+        assert!(div_nth1.matches_chain(&first_div, &[], &first_siblings));
+    }
+
+    #[test]
+    fn first_of_type_matches_first_same_type() {
+        let item = nid("Item");
+        let div = nid("Div");
+        let second_item = nid("Item");
+
+        let sel = Selector::parse_compound("Item:first-of-type").unwrap();
+
+        // No previous same-type sibling → match.
+        assert!(sel.matches_chain(&item, &[], std::slice::from_ref(&div)));
+        // One previous Item → no match.
+        assert!(!sel.matches_chain(&second_item, &[], std::slice::from_ref(&item)));
+        // Previous siblings of other types don't count.
+        assert!(sel.matches_chain(&item, &[], &[div.clone(), div.clone()]));
+    }
+
+    #[test]
+    fn nth_of_type_specificity_counts_as_one() {
+        let s = Selector::parse_compound(":nth-of-type(2n+1)").unwrap();
+        assert_eq!(s.specificity(), (0, 1, 0));
+        let s2 = Selector::parse_compound(":first-of-type").unwrap();
+        assert_eq!(s2.specificity(), (0, 1, 0));
+    }
+
+    #[test]
+    fn nth_of_type_does_not_match_on_oneshot_path() {
+        // The one-shot matches_values path has no sibling context: same_type_before
+        // = 0, so :nth-of-type(2) does NOT match (it would need index 2).
+        let nth2 = Selector::parse_compound("Item:nth-of-type(2)").unwrap();
+        let classes = Classes::from_slice(&[]);
+        assert!(!nth2.matches_values("Item", None, &classes, State::empty(), &pos(1, 3)));
+        // :first-of-type / :nth-of-type(1) trivially match on the one-shot path.
+        let first = Selector::parse_compound("Item:first-of-type").unwrap();
+        assert!(first.matches_values("Item", None, &classes, State::empty(), &pos(0, 3)));
+        let nth1 = Selector::parse_compound("Item:nth-of-type(1)").unwrap();
+        assert!(nth1.matches_values("Item", None, &classes, State::empty(), &pos(0, 3)));
     }
 }

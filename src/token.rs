@@ -67,11 +67,13 @@ impl From<String> for Token {
 ///
 /// The default (media-agnostic) map lives in `vars`. Media-gated overrides —
 /// declared via `:root { --x: … }` *inside* an `@media` block — live in
-/// `media_vars`, an ordered list of `(query, map)` pairs in source order
-/// (later entries win on conflict). The media-aware getters
-/// ([`get_color_with`](Self::get_color_with) /
-/// [`get_length_with`](Self::get_length_with)) consult `media_vars` in reverse
-/// (last matching query wins) and fall back to `vars`.
+/// `media_vars`, an ordered list of `(query, map)` pairs in source order. The
+/// media-aware getters ([`get_color_with`](Self::get_color_with) /
+/// [`get_length_with`](Self::get_length_with)) consult `media_vars` and pick
+/// the **most specific** matching query that binds `name` — specificity being
+/// the number of conditions in the matching alternative (a 2-condition query
+/// beats a 1-condition one), with ties broken by source order (later wins).
+/// If no override matches/binds, the default `vars` is the fallback.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ThemeTokens {
     vars: HashMap<String, Token>,
@@ -182,10 +184,13 @@ impl ThemeTokens {
         None
     }
 
-    /// Media-aware color lookup. Walks [`media_vars`](Self) in REVERSE (so the
-    /// last query that both (a) [`MediaQuery::matches`] `media` and (b) binds
-    /// `name` to a color — following `Token::Var` chains, themselves resolved
-    /// media-aware — wins); if no media override matches, falls back to the
+    /// Media-aware color lookup. Among all `media_vars` entries whose query
+    /// [`MediaQuery::matches`] `media` **and** whose map binds `name` (following
+    /// [`Token::Var`] chains, themselves resolved media-aware), the **most
+    /// specific** one wins — specificity is the number of conditions in the
+    /// matching alternative (e.g. `(min-width:80) and (color)` at 2 conditions
+    /// beats `(min-width:80)` at 1), with ties broken by source order (the
+    /// later entry wins). If no override matches/binds, falls back to the
     /// default [`get_color`](Self::get_color). Returns an **owned** [`Color`]
     /// because the resolved value may live in any one of several maps and there
     /// is no single stable borrow.
@@ -194,32 +199,35 @@ impl ThemeTokens {
     }
 
     /// Media-aware length lookup — analogous to [`get_color_with`](Self::get_color_with).
-    /// Returns an owned [`Length`].
+    /// Most-specific matching query wins (ties → source order). Returns an
+    /// owned [`Length`].
     pub fn get_length_with(&self, name: &str, media: &MediaContext) -> Option<Length> {
         self.resolve_length_with(name, media, 0)
     }
 
     /// Recursive, depth-capped, cycle-guarded color resolver for the
-    /// media-aware path. Consults `media_vars` in reverse (last-match wins),
-    /// falling back to `vars` for the default. `Token::Var` chains are followed
-    /// recursively through the same media context.
+    /// media-aware path. Among all matching media overrides, the most specific
+    /// one that binds `name` (to a color, or to a `Var` chain) wins; ties go to
+    /// the later source-order entry. Falls back to `vars` for the default.
+    /// `Token::Var` chains are followed recursively through the same media
+    /// context.
     fn resolve_color_with(&self, name: &str, media: &MediaContext, depth: u8) -> Option<Color> {
         if depth > 32 {
             return None;
         }
-        // Media overrides: scan in reverse so a later source-order query wins.
-        for (query, map) in self.media_vars.iter().rev() {
-            if query.matches(media) {
-                if let Some(tok) = map.get(name) {
-                    match tok {
-                        Token::Color(c) => return Some(c.clone()),
-                        Token::Var { name: next } => {
-                            return self.resolve_color_with(next, media, depth + 1);
-                        }
-                        // A length token is not a color.
-                        Token::Length(_) => return None,
-                    }
+        // Pick the most-specific matching media override that binds `name` to a
+        // color-compatible token (a `Color` or a `Var` chain — a `Length` is a
+        // type mismatch and does not count as binding for the color path).
+        if let Some(map) = self.best_media_map(name, media, /* color_path */ true) {
+            // SAFETY-free: best_media_map only returns Some(map) when map[name]
+            // exists and is Color-or-Var; re-fetch the token.
+            match map.get(name).expect("best_media_map guarantees map[name] present") {
+                Token::Color(c) => return Some(c.clone()),
+                Token::Var { name: next } => {
+                    return self.resolve_color_with(next, media, depth + 1);
                 }
+                // Unreachable: best_media_map rejects Length on the color path.
+                Token::Length(_) => return None,
             }
         }
         // Default fallback.
@@ -231,23 +239,20 @@ impl ThemeTokens {
     }
 
     /// Recursive, depth-capped length resolver for the media-aware path.
-    /// Mirrors [`resolve_color_with`](Self::resolve_color_with).
+    /// Mirrors [`resolve_color_with`](Self::resolve_color_with): most-specific
+    /// matching override wins, ties → source order.
     fn resolve_length_with(&self, name: &str, media: &MediaContext, depth: u8) -> Option<Length> {
         if depth > 32 {
             return None;
         }
-        for (query, map) in self.media_vars.iter().rev() {
-            if query.matches(media) {
-                if let Some(tok) = map.get(name) {
-                    match tok {
-                        Token::Length(l) => return Some(l.clone()),
-                        Token::Var { name: next } => {
-                            return self.resolve_length_with(next, media, depth + 1);
-                        }
-                        // A color token is not a length.
-                        Token::Color(_) => return None,
-                    }
+        if let Some(map) = self.best_media_map(name, media, /* color_path */ false) {
+            match map.get(name).expect("best_media_map guarantees map[name] present") {
+                Token::Length(l) => return Some(l.clone()),
+                Token::Var { name: next } => {
+                    return self.resolve_length_with(next, media, depth + 1);
                 }
+                // Unreachable: best_media_map rejects Color on the length path.
+                Token::Color(_) => return None,
             }
         }
         match self.vars.get(name)? {
@@ -255,6 +260,61 @@ impl ThemeTokens {
             Token::Var { name: next } => self.resolve_length_with(next, media, depth + 1),
             Token::Color(_) => None,
         }
+    }
+
+    /// Find the map of the **most specific** matching media override that binds
+    /// `name` to a token usable on the requested path.
+    ///
+    /// - `color_path == true`: a binding counts only if it is a `Color` or a
+    ///   `Var` (a `Length` binding is a type mismatch and is skipped).
+    /// - `color_path == false`: symmetric — `Length` or `Var` counts, `Color`
+    ///   is skipped.
+    ///
+    /// Ranking: among entries whose query [`MediaQuery::matches`] `media` AND
+    /// whose map binds `name` to a path-compatible token, the winner is the one
+    /// with the highest [`MediaQuery::matching_specificity`] (most conditions in
+    /// the matching alternative). Ties are broken by **source order**: since we
+    /// scan `media_vars` front-to-back and replace the current winner whenever
+    /// the new entry's specificity is `>=` (equal-or-greater), a later
+    /// equal-specificity entry takes precedence (later wins).
+    ///
+    /// Returns `None` if no matching override binds `name` compatibly.
+    fn best_media_map(
+        &self,
+        name: &str,
+        media: &MediaContext,
+        color_path: bool,
+    ) -> Option<&HashMap<String, Token>> {
+        let mut best: Option<(&HashMap<String, Token>, usize)> = None;
+        for (query, map) in &self.media_vars {
+            // The query must match under the active context; skip if not.
+            let spec = match query.matching_specificity(media) {
+                Some(s) => s,
+                None => continue,
+            };
+            // ...and bind name to a path-compatible token.
+            let tok = match map.get(name) {
+                Some(t) => t,
+                None => continue,
+            };
+            let compatible = match tok {
+                Token::Var { .. } => true,
+                Token::Color(_) => color_path,
+                Token::Length(_) => !color_path,
+            };
+            if !compatible {
+                continue;
+            }
+            // Keep the entry with the highest specificity; on a tie, the LATER
+            // source-order entry wins. Since we iterate front-to-back, replace
+            // the current winner whenever `spec >= cur_spec` (equal → later
+            // entry wins, strictly greater → more specific wins).
+            match best {
+                Some((_, cur_spec)) if cur_spec > spec => {}
+                _ => best = Some((map, spec)),
+            }
+        }
+        best.map(|(map, _)| map)
     }
 
     /// Merge another token set into this one; `other` wins on conflict (both
@@ -688,5 +748,128 @@ mod tests {
         mine.merge(&other);
         assert_eq!(mine.get_color("a"), Some(&Color::literal(RColor::Red)));
         assert_eq!(mine.get_color_with("a", &ctx(100)), Some(Color::literal(RColor::Blue)));
+    }
+
+    // ---------------------------------------------------------------------
+    // Media-token specificity cascade (P5-3)
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn get_color_with_picks_more_specific_override() {
+        // media_vars: [ ((min-width:80), {--x: red}),
+        //               ((min-width:80) and (color), {--x: blue}) ].
+        // Under ctx matching BOTH (cols:100, color), the 2-condition query is
+        // MORE specific → --x resolves to BLUE (not red), even though red is
+        // the later/equal-source entry… here red is FIRST. The point: the
+        // 2-condition entry wins regardless of position.
+        let tokens = ThemeTokens::new()
+            .set_media(mq("(min-width: 80)"), "x", Color::literal(RColor::Red))
+            .set_media(mq("(min-width: 80) and (color)"), "x", Color::literal(RColor::Blue));
+        assert_eq!(
+            tokens.get_color_with("x", &ctx(100)),
+            Some(Color::literal(RColor::Blue)),
+            "the 2-condition override is more specific and wins"
+        );
+    }
+
+    #[test]
+    fn get_color_with_specificity_tie_falls_back_to_source_order() {
+        // Two matching overrides with EQUAL condition counts (1 each) → later
+        // source-order wins (existing behavior preserved for ties).
+        let tokens = ThemeTokens::new()
+            .set_media(mq("(min-width: 50)"), "x", Color::literal(RColor::Red))
+            .set_media(mq("(min-width: 80)"), "x", Color::literal(RColor::Blue));
+        // cols:100 matches both (both are 1-condition) → later (blue) wins.
+        assert_eq!(
+            tokens.get_color_with("x", &ctx(100)),
+            Some(Color::literal(RColor::Blue)),
+            "equal specificity → later source-order wins"
+        );
+    }
+
+    #[test]
+    fn get_color_with_less_specific_does_not_override_more_specific() {
+        // Reverse the insertion order from the first test: the more-specific
+        // (2-condition) override is inserted FIRST. It must STILL win.
+        let tokens = ThemeTokens::new()
+            .set_media(mq("(min-width: 80) and (color)"), "x", Color::literal(RColor::Blue))
+            .set_media(mq("(min-width: 80)"), "x", Color::literal(RColor::Red));
+        assert_eq!(
+            tokens.get_color_with("x", &ctx(100)),
+            Some(Color::literal(RColor::Blue)),
+            "more-specific wins regardless of source position"
+        );
+    }
+
+    #[test]
+    fn get_color_with_single_override_unchanged() {
+        // Regression: a single matching override behaves exactly as before.
+        let tokens = ThemeTokens::new()
+            .set("x", Color::literal(RColor::Red))
+            .set_media(mq("(min-width: 80)"), "x", Color::literal(RColor::Blue));
+        assert_eq!(tokens.get_color_with("x", &ctx(100)), Some(Color::literal(RColor::Blue)));
+        // Non-matching → default fallback.
+        assert_eq!(tokens.get_color_with("x", &ctx(40)), Some(Color::literal(RColor::Red)));
+    }
+
+    #[test]
+    fn get_color_with_no_override_falls_back_to_default() {
+        // Regression: no media override at all → default vars.
+        let tokens = ThemeTokens::new().set("x", Color::literal(RColor::Red));
+        assert_eq!(tokens.get_color_with("x", &ctx(100)), Some(Color::literal(RColor::Red)));
+        assert_eq!(tokens.get_color_with("x", &ctx(40)), Some(Color::literal(RColor::Red)));
+    }
+
+    #[test]
+    fn get_color_with_specificity_var_chain() {
+        // The winning (more-specific) override binds --x to a var() chain whose
+        // target is also in a (less-specific) override. The chain must resolve
+        // through the same media context, picking the more-specific --y too.
+        let tokens = ThemeTokens::new()
+            // Less specific: --x = red (direct), --y = magenta.
+            .set_media(mq("(min-width: 80)"), "x", Color::literal(RColor::Red))
+            .set_media(mq("(min-width: 80)"), "y", Color::literal(RColor::Magenta))
+            // More specific: --x = var(--y).
+            .set_media(mq("(min-width: 80) and (color)"), "x", Token::Var { name: "y".into() });
+        // cols:100, color → --x resolves via the 2-condition entry (var --y),
+        // and --y resolves via the 1-condition entry → magenta.
+        assert_eq!(
+            tokens.get_color_with("x", &ctx(100)),
+            Some(Color::literal(RColor::Magenta)),
+            "more-specific var() chain resolves through the same media context"
+        );
+    }
+
+    #[test]
+    fn get_length_with_picks_more_specific_override() {
+        // Length path mirrors the color path.
+        let tokens = ThemeTokens::new()
+            .set_media(mq("(min-width: 80)"), "w", Length::Cells(5))
+            .set_media(mq("(min-width: 80) and (color)"), "w", Length::Cells(50));
+        assert_eq!(
+            tokens.get_length_with("w", &ctx(100)),
+            Some(Length::Cells(50)),
+            "more-specific length override wins"
+        );
+    }
+
+    #[test]
+    fn get_color_with_more_specific_skipped_when_it_binds_different_name() {
+        // The more-specific query matches but does NOT bind `x` — only the
+        // less-specific one binds `x`. So the less-specific entry wins (the
+        // more-specific one is not a candidate for `x`).
+        let tokens = ThemeTokens::new()
+            .set_media(mq("(min-width: 80)"), "x", Color::literal(RColor::Red))
+            .set_media(mq("(min-width: 80) and (color)"), "other", Color::literal(RColor::Blue));
+        assert_eq!(
+            tokens.get_color_with("x", &ctx(100)),
+            Some(Color::literal(RColor::Red)),
+            "a more-specific query that does not bind `x` does not shadow `x`"
+        );
+        // And `other` resolves under the more-specific query.
+        assert_eq!(
+            tokens.get_color_with("other", &ctx(100)),
+            Some(Color::literal(RColor::Blue))
+        );
     }
 }
