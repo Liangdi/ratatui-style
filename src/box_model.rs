@@ -433,6 +433,7 @@ fn parse_cells(s: &str) -> Result<u16> {
 }
 
 /// Render a [`Length`] to its CSS string form (used by serde Serialize).
+#[cfg(feature = "serde")]
 fn length_to_css(length: &Length) -> String {
     match length {
         Length::Auto => "auto".to_string(),

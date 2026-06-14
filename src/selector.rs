@@ -215,17 +215,33 @@ impl Pseudo {
     }
 }
 
-/// A combinator joining a compound selector to an ancestor compound.
+/// A combinator joining a compound selector to an ancestor/sibling compound.
 ///
-/// Produced by the [`Selector`](crate::Selector) parser for descendant (`A B`)
-/// and child (`A > B`) combinators. Only reachable through
-/// [`Selector::ancestor`].
+/// Produced by the [`Selector`](crate::Selector) parser for descendant (`A B`),
+/// child (`A > B`), adjacent-sibling (`A + B`), and general-sibling (`A ~ B`)
+/// combinators. Only reachable through [`Selector::ancestor`].
+///
+/// # One-level-sibling limitation
+///
+/// Adjacent (`+`) and general (`~`) sibling combinators are matched against the
+/// previous-sibling identities threaded in by
+/// [`CascadeContext`](crate::CascadeContext). When matching recurses *into* an
+/// ancestor/sibling compound (e.g. the `A` in `A + B`), that sub-selector is
+/// given an empty siblings slice. So `A + B` and `A ~ B` (with a simple `A`,
+/// optionally itself carrying a descendant/child chain like `X A + B`) work
+/// fully; a *nested* sibling chain like `A + B + C` is not fully supported
+/// because the chain-of-siblings context does not propagate across recursion.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Combinator {
     /// `A B` — the subject is a descendant of `A` (any depth).
     Descendant,
     /// `A > B` — the subject is a direct child of `A`.
     Child,
+    /// `A + B` — the subject `B` is the immediately-following sibling of `A`.
+    Adjacent,
+    /// `A ~ B` — the subject `B` follows sibling `A` somewhere (not necessarily
+    /// immediately).
+    Sibling,
 }
 
 /// A compound selector: an optional type, plus class/id/pseudo qualifiers.
@@ -326,8 +342,8 @@ impl Selector {
     }
 
     /// Parse a selector chain — one or more compounds joined by descendant
-    /// (` `) or child (`>`) combinators. Sibling combinators (`+`, `~`) are not
-    /// supported and produce an error.
+    /// (` `), child (`>`), adjacent-sibling (`+`), or general-sibling (`~`)
+    /// combinators.
     ///
     /// Parentheses are tracked so spaces and `+` inside `:nth-child(2n + 1)`
     /// are not mistaken for combinators.
@@ -587,7 +603,19 @@ impl Selector {
 
     /// Subject matches `node_id`, and the ancestor chain matches `ancestors`
     /// (closest ancestor = last element). Right-to-left CSS matching.
-    pub(crate) fn matches_chain(&self, node_id: &NodeIdentity, ancestors: &[NodeIdentity]) -> bool {
+    ///
+    /// `siblings` is the node's list of PREVIOUS siblings (oldest-first,
+    /// closest = last), threaded in by
+    /// [`CascadeContext`](crate::CascadeContext). It backs the adjacent (`+`)
+    /// and general (`~`) sibling combinators. When recursing into an ancestor
+    /// compound, the sub-selector is given `&[]` for siblings — see the
+    /// one-level-sibling limitation in [`Combinator`].
+    pub(crate) fn matches_chain(
+        &self,
+        node_id: &NodeIdentity,
+        ancestors: &[NodeIdentity],
+        siblings: &[NodeIdentity],
+    ) -> bool {
         if !self.matches_subject(node_id) {
             return false;
         }
@@ -595,12 +623,31 @@ impl Selector {
             None => true,
             Some((Combinator::Child, anc)) => match ancestors.last() {
                 None => false,
-                Some(parent) => anc.matches_chain(parent, &ancestors[..ancestors.len() - 1]),
+                Some(parent) => anc.matches_chain(parent, &ancestors[..ancestors.len() - 1], &[]),
             },
             Some((Combinator::Descendant, anc)) => {
                 // Search closest-first (last) backward through the ancestor stack.
                 for i in (0..ancestors.len()).rev() {
-                    if anc.matches_chain(&ancestors[i], &ancestors[..i]) {
+                    if anc.matches_chain(&ancestors[i], &ancestors[..i], &[]) {
+                        return true;
+                    }
+                }
+                false
+            }
+            Some((Combinator::Adjacent, anc)) => {
+                // The immediately-preceding sibling must match the ancestor
+                // compound. Siblings share ancestors, so we forward `ancestors`
+                // (a descendant/child chain on the ancestor compound still works).
+                match siblings.last() {
+                    None => false,
+                    Some(prev) => anc.matches_chain(prev, ancestors, &[]),
+                }
+            }
+            Some((Combinator::Sibling, anc)) => {
+                // Some previous sibling matches the ancestor compound. Search
+                // closest-first (last) backward through the sibling list.
+                for s in siblings.iter().rev() {
+                    if anc.matches_chain(s, ancestors, &[]) {
                         return true;
                     }
                 }
@@ -709,10 +756,23 @@ fn tokenize_chain(s: &str) -> Result<Vec<ChainToken>> {
                             }
                             continue;
                         }
-                        b'+' | b'~' => {
-                            return Err(CssError::invalid_selector(
-                                "unsupported combinator `+`/`~`; use descendant (space) or child (>)",
-                            ));
+                        b'+' => {
+                            flush!();
+                            tokens.push(ChainToken::Combinator(Combinator::Adjacent));
+                            i += 1;
+                            while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+                                i += 1;
+                            }
+                            continue;
+                        }
+                        b'~' => {
+                            flush!();
+                            tokens.push(ChainToken::Combinator(Combinator::Sibling));
+                            i += 1;
+                            while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+                                i += 1;
+                            }
+                            continue;
                         }
                         _ => {
                             flush!();
@@ -732,10 +792,23 @@ fn tokenize_chain(s: &str) -> Result<Vec<ChainToken>> {
                     }
                     continue;
                 }
-                b'+' | b'~' => {
-                    return Err(CssError::invalid_selector(
-                        "unsupported combinator `+`/`~`; use descendant (space) or child (>)",
-                    ));
+                b'+' => {
+                    flush!();
+                    tokens.push(ChainToken::Combinator(Combinator::Adjacent));
+                    i += 1;
+                    while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+                        i += 1;
+                    }
+                    continue;
+                }
+                b'~' => {
+                    flush!();
+                    tokens.push(ChainToken::Combinator(Combinator::Sibling));
+                    i += 1;
+                    while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+                        i += 1;
+                    }
+                    continue;
                 }
                 _ => {
                     // Regular char: append to the current compound. Copy the
@@ -1119,9 +1192,143 @@ mod tests {
     }
 
     #[test]
-    fn parse_sibling_combinators_error() {
-        assert!(Selector::parse_chain("A + B").is_err());
-        assert!(Selector::parse_chain("A ~ B").is_err());
+    fn parse_adjacent_sibling_chain() {
+        // `Label + Input` — subject is Input, ancestor Label joined by Adjacent.
+        let s = Selector::parse_chain("Label + Input").unwrap();
+        assert_eq!(s.type_name.as_deref(), Some("Input"));
+        let (comb, anc) = s.ancestor.as_ref().expect("ancestor present");
+        assert_eq!(*comb, Combinator::Adjacent);
+        assert_eq!(anc.type_name.as_deref(), Some("Label"));
+        assert!(anc.ancestor.is_none());
+        // Specificity sums both type compounds: (0, 0, 2) — same as the
+        // descendant chain `Label Input`.
+        assert_eq!(s.specificity(), (0, 0, 2));
+    }
+
+    #[test]
+    fn parse_general_sibling_chain() {
+        let s = Selector::parse_chain("Label ~ Input").unwrap();
+        assert_eq!(s.type_name.as_deref(), Some("Input"));
+        let (comb, anc) = s.ancestor.as_ref().expect("ancestor present");
+        assert_eq!(*comb, Combinator::Sibling);
+        assert_eq!(anc.type_name.as_deref(), Some("Label"));
+    }
+
+    #[test]
+    fn sibling_specificity_matches_descendant() {
+        // A sibling combinator contributes the same specificity as a descendant
+        // joining the same two compounds — combinators themselves carry no
+        // specificity weight.
+        let desc = Selector::parse_chain("Label Input").unwrap();
+        let adj = Selector::parse_chain("Label + Input").unwrap();
+        let sib = Selector::parse_chain("Label ~ Input").unwrap();
+        assert_eq!(desc.specificity(), adj.specificity());
+        assert_eq!(desc.specificity(), sib.specificity());
+    }
+
+    #[test]
+    fn sibling_combinator_inside_parens_is_not_a_combinator() {
+        // `Item:nth-child(2n + 1) + Item` — the inner `+` lives inside the
+        // `:nth-child(...)` parens (depth 1) and must be parsed as part of the
+        // nth expression, NOT as an adjacent combinator. The OUTER `+` (depth 0)
+        // is the adjacent combinator joining the two compounds.
+        let s = Selector::parse_chain("Item:nth-child(2n + 1) + Item").unwrap();
+        // Subject is the second Item.
+        assert_eq!(s.type_name.as_deref(), Some("Item"));
+        assert!(s.classes.is_empty());
+        // Ancestor is the first compound joined by Adjacent.
+        let (comb, anc) = s.ancestor.as_ref().expect("ancestor present");
+        assert_eq!(*comb, Combinator::Adjacent);
+        assert_eq!(anc.type_name.as_deref(), Some("Item"));
+        // The nth expression on the ancestor compound is intact: `2n + 1`.
+        assert_eq!(anc.pseudos.len(), 1);
+        assert_eq!(anc.pseudos[0], Pseudo::NthChild(NthExpr { a: 2, b: 1 }));
+    }
+
+    #[test]
+    fn sibling_combinator_with_descendant_ancestor() {
+        // `Panel Label + Input` — Input is adjacent to Label, and Label is a
+        // descendant of Panel. Subject Input; ancestor (Adjacent) Label;
+        // Label's ancestor (Descendant) Panel.
+        let s = Selector::parse_chain("Panel Label + Input").unwrap();
+        assert_eq!(s.type_name.as_deref(), Some("Input"));
+        let (comb_label, anc_label) = s.ancestor.as_ref().expect("ancestor Label");
+        assert_eq!(*comb_label, Combinator::Adjacent);
+        assert_eq!(anc_label.type_name.as_deref(), Some("Label"));
+        let (comb_panel, anc_panel) = anc_label.ancestor.as_ref().expect("ancestor Panel");
+        assert_eq!(*comb_panel, Combinator::Descendant);
+        assert_eq!(anc_panel.type_name.as_deref(), Some("Panel"));
+    }
+
+    // ---------------------------------------------------------------------
+    // Sibling-combinator matching against hand-built NodeIdentity lists
+    // ---------------------------------------------------------------------
+
+    fn nid(type_name: &str) -> NodeIdentity {
+        NodeIdentity {
+            type_name: type_name.to_string(),
+            id: None,
+            classes: Vec::new(),
+            state: State::empty(),
+            position: Position::default(),
+        }
+    }
+
+    #[test]
+    fn adjacent_matches_when_last_sibling_is_label() {
+        let sel = Selector::parse_chain("Label + Input").unwrap();
+        let input = nid("Input");
+        let label = nid("Label");
+        // siblings = [Label] → last is Label → match.
+        assert!(sel.matches_chain(&input, &[], std::slice::from_ref(&label)));
+    }
+
+    #[test]
+    fn adjacent_does_not_match_empty_siblings() {
+        let sel = Selector::parse_chain("Label + Input").unwrap();
+        let input = nid("Input");
+        assert!(!sel.matches_chain(&input, &[], &[]));
+    }
+
+    #[test]
+    fn adjacent_does_not_match_when_last_sibling_is_not_label() {
+        let sel = Selector::parse_chain("Label + Input").unwrap();
+        let input = nid("Input");
+        let span = nid("Span");
+        // siblings = [Span] → last is Span, not Label → no match.
+        assert!(!sel.matches_chain(&input, &[], &[span]));
+    }
+
+    #[test]
+    fn adjacent_checks_only_immediate_sibling() {
+        // siblings = [Label, Span] (Label is older, Span is the immediate
+        // predecessor) → immediate = Span, not Label → no match.
+        let sel = Selector::parse_chain("Label + Input").unwrap();
+        let input = nid("Input");
+        let label = nid("Label");
+        let span = nid("Span");
+        assert!(!sel.matches_chain(&input, &[], &[label, span]));
+    }
+
+    #[test]
+    fn general_sibling_matches_when_some_prior_sibling_is_label() {
+        let sel = Selector::parse_chain("Label ~ Input").unwrap();
+        let input = nid("Input");
+        let label = nid("Label");
+        let span = nid("Span");
+        // [Label, Span] — Label is among prior siblings → match.
+        assert!(sel.matches_chain(&input, &[], &[label.clone(), span.clone()]));
+        // [Span, Label] — Label is among prior siblings → match.
+        assert!(sel.matches_chain(&input, &[], &[span, label]));
+    }
+
+    #[test]
+    fn general_sibling_does_not_match_when_no_label_among_prior() {
+        let sel = Selector::parse_chain("Label ~ Input").unwrap();
+        let input = nid("Input");
+        let span = nid("Span");
+        assert!(!sel.matches_chain(&input, &[], &[span]));
+        assert!(!sel.matches_chain(&input, &[], &[]));
     }
 
     #[test]

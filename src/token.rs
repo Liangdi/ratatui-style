@@ -11,6 +11,7 @@ use ratatui::style::Color as RColor;
 use crate::box_model::Length;
 use crate::color::Color;
 use crate::error::{CssError, Result};
+use crate::media::{MediaContext, MediaQuery};
 
 /// A CSS custom-property value. Currently supports [`Color`] and [`Length`]
 /// (the latter for `width`/`height`). The color fields — `color`,
@@ -63,9 +64,18 @@ impl From<String> for Token {
 }
 
 /// A map of CSS custom-property names to [`Token`] values.
+///
+/// The default (media-agnostic) map lives in `vars`. Media-gated overrides —
+/// declared via `:root { --x: … }` *inside* an `@media` block — live in
+/// `media_vars`, an ordered list of `(query, map)` pairs in source order
+/// (later entries win on conflict). The media-aware getters
+/// ([`get_color_with`](Self::get_color_with) /
+/// [`get_length_with`](Self::get_length_with)) consult `media_vars` in reverse
+/// (last matching query wins) and fall back to `vars`.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ThemeTokens {
     vars: HashMap<String, Token>,
+    media_vars: Vec<(MediaQuery, HashMap<String, Token>)>,
 }
 
 impl ThemeTokens {
@@ -84,9 +94,58 @@ impl ThemeTokens {
         self.vars.insert(name.into(), value.into());
     }
 
-    /// Look up a variable by name (without `--`).
+    /// Insert a media-gated override. `query` is the enclosing `@media` query;
+    /// `name` is given without the `--` prefix. If an entry for an equal `query`
+    /// already exists in `media_vars`, the name is inserted into that entry's
+    /// map (same-name overwrites); otherwise a new `(query, map)` entry is
+    /// appended, preserving source order.
+    pub fn insert_media<T: Into<Token>>(
+        &mut self,
+        query: MediaQuery,
+        name: impl Into<String>,
+        value: T,
+    ) {
+        // Find an existing entry with the same query (by equality) and accumulate
+        // into it; otherwise append a fresh entry. Equality on `MediaQuery` is
+        // structural, so two textually-identical queries collapse to one map.
+        let key = name.into();
+        for (q, map) in &mut self.media_vars {
+            if q == &query {
+                map.insert(key.clone(), value.into());
+                return;
+            }
+        }
+        let mut map = HashMap::new();
+        map.insert(key, value.into());
+        self.media_vars.push((query, map));
+    }
+
+    /// Builder form of [`insert_media`](Self::insert_media).
+    pub fn set_media<T: Into<Token>>(
+        mut self,
+        query: MediaQuery,
+        name: impl Into<String>,
+        value: T,
+    ) -> Self {
+        self.insert_media(query, name, value);
+        self
+    }
+
+    /// Look up a variable by name (without `--`), default map only.
     pub fn get(&self, name: &str) -> Option<&Token> {
         self.vars.get(name)
+    }
+
+    /// True iff `name` is defined in the default map OR in any media-gated
+    /// override. Used by strict-mode parsing: a `var(--name)` is "defined" if
+    /// it is declared *anywhere*, even inside an `@media` block.
+    pub fn is_defined(&self, name: &str) -> bool {
+        if self.vars.contains_key(name) {
+            return true;
+        }
+        self.media_vars
+            .iter()
+            .any(|(_, map)| map.contains_key(name))
     }
 
     /// Convenience: look up a variable as a [`Color`], if it holds one.
@@ -123,10 +182,90 @@ impl ThemeTokens {
         None
     }
 
-    /// Merge another token set into this one; `other` wins on conflict.
+    /// Media-aware color lookup. Walks [`media_vars`](Self) in REVERSE (so the
+    /// last query that both (a) [`MediaQuery::matches`] `media` and (b) binds
+    /// `name` to a color — following `Token::Var` chains, themselves resolved
+    /// media-aware — wins); if no media override matches, falls back to the
+    /// default [`get_color`](Self::get_color). Returns an **owned** [`Color`]
+    /// because the resolved value may live in any one of several maps and there
+    /// is no single stable borrow.
+    pub fn get_color_with(&self, name: &str, media: &MediaContext) -> Option<Color> {
+        self.resolve_color_with(name, media, 0)
+    }
+
+    /// Media-aware length lookup — analogous to [`get_color_with`](Self::get_color_with).
+    /// Returns an owned [`Length`].
+    pub fn get_length_with(&self, name: &str, media: &MediaContext) -> Option<Length> {
+        self.resolve_length_with(name, media, 0)
+    }
+
+    /// Recursive, depth-capped, cycle-guarded color resolver for the
+    /// media-aware path. Consults `media_vars` in reverse (last-match wins),
+    /// falling back to `vars` for the default. `Token::Var` chains are followed
+    /// recursively through the same media context.
+    fn resolve_color_with(&self, name: &str, media: &MediaContext, depth: u8) -> Option<Color> {
+        if depth > 32 {
+            return None;
+        }
+        // Media overrides: scan in reverse so a later source-order query wins.
+        for (query, map) in self.media_vars.iter().rev() {
+            if query.matches(media) {
+                if let Some(tok) = map.get(name) {
+                    match tok {
+                        Token::Color(c) => return Some(c.clone()),
+                        Token::Var { name: next } => {
+                            return self.resolve_color_with(next, media, depth + 1);
+                        }
+                        // A length token is not a color.
+                        Token::Length(_) => return None,
+                    }
+                }
+            }
+        }
+        // Default fallback.
+        match self.vars.get(name)? {
+            Token::Color(c) => Some(c.clone()),
+            Token::Var { name: next } => self.resolve_color_with(next, media, depth + 1),
+            Token::Length(_) => None,
+        }
+    }
+
+    /// Recursive, depth-capped length resolver for the media-aware path.
+    /// Mirrors [`resolve_color_with`](Self::resolve_color_with).
+    fn resolve_length_with(&self, name: &str, media: &MediaContext, depth: u8) -> Option<Length> {
+        if depth > 32 {
+            return None;
+        }
+        for (query, map) in self.media_vars.iter().rev() {
+            if query.matches(media) {
+                if let Some(tok) = map.get(name) {
+                    match tok {
+                        Token::Length(l) => return Some(l.clone()),
+                        Token::Var { name: next } => {
+                            return self.resolve_length_with(next, media, depth + 1);
+                        }
+                        // A color token is not a length.
+                        Token::Color(_) => return None,
+                    }
+                }
+            }
+        }
+        match self.vars.get(name)? {
+            Token::Length(l) => Some(l.clone()),
+            Token::Var { name: next } => self.resolve_length_with(next, media, depth + 1),
+            Token::Color(_) => None,
+        }
+    }
+
+    /// Merge another token set into this one; `other` wins on conflict (both
+    /// the default map and the media-gated overrides, the latter appended in
+    /// source order so other's overrides come later / win).
     pub fn merge(&mut self, other: &ThemeTokens) {
         for (k, v) in &other.vars {
             self.vars.insert(k.clone(), v.clone());
+        }
+        for (q, map) in &other.media_vars {
+            self.media_vars.push((q.clone(), map.clone()));
         }
     }
 
@@ -147,17 +286,45 @@ impl ThemeTokens {
 /// - `Inherit` resolves to `Reset` (it should have been folded in by the
 ///   inheritance pass already).
 /// - Cycles / chains deeper than 32 return [`CssError::CircularVariable`].
+///
+/// This is the default-media wrapper: it calls
+/// [`resolve_strict_with_media`] with [`MediaContext::default`], so media-gated
+/// overrides do NOT participate (the default map is still consulted). Use the
+/// `_with_media` variant to gate overrides against a terminal context.
 pub fn resolve_strict(color: &Color, tokens: &ThemeTokens) -> Result<RColor> {
-    resolve_inner(color, tokens, 0)
+    resolve_strict_with_media(color, tokens, &MediaContext::default())
 }
 
 /// Lenient variant used by the cascade: unresolved variables degrade to
-/// `Reset` rather than failing the whole render.
+/// `Reset` rather than failing the whole render. Default-media wrapper around
+/// [`resolve_with_media`].
 pub fn resolve(color: &Color, tokens: &ThemeTokens) -> RColor {
-    resolve_strict(color, tokens).unwrap_or(RColor::Reset)
+    resolve_with_media(color, tokens, &MediaContext::default())
 }
 
-fn resolve_inner(color: &Color, tokens: &ThemeTokens, depth: u8) -> Result<RColor> {
+/// Media-aware strict resolution: like [`resolve_strict`] but the `var()` chain
+/// is resolved via [`ThemeTokens::get_color_with`] against `media`, so
+/// `@media`-gated token overrides participate when their query matches.
+pub fn resolve_strict_with_media(
+    color: &Color,
+    tokens: &ThemeTokens,
+    media: &MediaContext,
+) -> Result<RColor> {
+    resolve_inner(color, tokens, media, 0)
+}
+
+/// Media-aware lenient resolution: like [`resolve`] but consults media-gated
+/// overrides. Unresolved variables degrade to `Reset`.
+pub fn resolve_with_media(color: &Color, tokens: &ThemeTokens, media: &MediaContext) -> RColor {
+    resolve_strict_with_media(color, tokens, media).unwrap_or(RColor::Reset)
+}
+
+fn resolve_inner(
+    color: &Color,
+    tokens: &ThemeTokens,
+    media: &MediaContext,
+    depth: u8,
+) -> Result<RColor> {
     if depth > 32 {
         return Err(CssError::circular_variable(
             "var() reference chain too deep (depth > 32)",
@@ -167,10 +334,10 @@ fn resolve_inner(color: &Color, tokens: &ThemeTokens, depth: u8) -> Result<RColo
         Color::Literal(c) => Ok(*c),
         Color::Reset => Ok(RColor::Reset),
         Color::Inherit => Ok(RColor::Reset),
-        Color::Var { name, fallback } => match tokens.get_color(name) {
-            Some(referent) => resolve_inner(referent, tokens, depth + 1),
+        Color::Var { name, fallback } => match tokens.get_color_with(name, media) {
+            Some(referent) => resolve_inner(&referent, tokens, media, depth + 1),
             None => match fallback {
-                Some(fb) => resolve_inner(fb, tokens, depth + 1),
+                Some(fb) => resolve_inner(fb, tokens, media, depth + 1),
                 None => Err(CssError::undefined_variable(name.clone())),
             },
         },
@@ -184,17 +351,46 @@ fn resolve_inner(color: &Color, tokens: &ThemeTokens, depth: u8) -> Result<RColo
 /// type mismatch (e.g. a name bound to a `Color`), or a too-deep chain all
 /// degrade to [`Length::Auto`] rather than failing the whole render. The strict
 /// form surfaces the error instead.
+///
+/// Default-media wrapper around [`resolve_length_strict_with_media`].
 pub fn resolve_length_strict(length: &Length, tokens: &ThemeTokens) -> Result<Length> {
-    resolve_length_inner(length, tokens, 0)
+    resolve_length_strict_with_media(length, tokens, &MediaContext::default())
 }
 
 /// Lenient variant used by the cascade: unresolved/mistyped length variables
 /// degrade to [`Length::Auto`] rather than failing the whole render.
+/// Default-media wrapper around [`resolve_length_with_media`].
 pub fn resolve_length(length: &Length, tokens: &ThemeTokens) -> Length {
-    resolve_length_strict(length, tokens).unwrap_or(Length::Auto)
+    resolve_length_with_media(length, tokens, &MediaContext::default())
 }
 
-fn resolve_length_inner(length: &Length, tokens: &ThemeTokens, depth: u8) -> Result<Length> {
+/// Media-aware strict length resolution: like [`resolve_length_strict`] but the
+/// `var()` chain is resolved via [`ThemeTokens::get_length_with`] against
+/// `media`.
+pub fn resolve_length_strict_with_media(
+    length: &Length,
+    tokens: &ThemeTokens,
+    media: &MediaContext,
+) -> Result<Length> {
+    resolve_length_inner(length, tokens, media, 0)
+}
+
+/// Media-aware lenient length resolution: like [`resolve_length`] but consults
+/// media-gated overrides.
+pub fn resolve_length_with_media(
+    length: &Length,
+    tokens: &ThemeTokens,
+    media: &MediaContext,
+) -> Length {
+    resolve_length_strict_with_media(length, tokens, media).unwrap_or(Length::Auto)
+}
+
+fn resolve_length_inner(
+    length: &Length,
+    tokens: &ThemeTokens,
+    media: &MediaContext,
+    depth: u8,
+) -> Result<Length> {
     if depth > 32 {
         return Err(CssError::circular_variable(
             "var() reference chain too deep (depth > 32)",
@@ -204,10 +400,10 @@ fn resolve_length_inner(length: &Length, tokens: &ThemeTokens, depth: u8) -> Res
         Length::Auto | Length::Cells(_) | Length::Percent(_) | Length::Min(_) | Length::Max(_) => {
             Ok(length.clone())
         }
-        Length::Var { name, fallback } => match tokens.get_length(name) {
-            Some(referent) => resolve_length_inner(referent, tokens, depth + 1),
+        Length::Var { name, fallback } => match tokens.get_length_with(name, media) {
+            Some(referent) => resolve_length_inner(&referent, tokens, media, depth + 1),
             None => match fallback {
-                Some(fb) => resolve_length_inner(fb, tokens, depth + 1),
+                Some(fb) => resolve_length_inner(fb, tokens, media, depth + 1),
                 None => Err(CssError::undefined_variable(name.clone())),
             },
         },
@@ -310,5 +506,187 @@ mod tests {
         };
         assert_eq!(resolve_length_strict(&l, &tokens).unwrap(), Length::Cells(7));
         assert_eq!(resolve_length(&l, &tokens), Length::Cells(7));
+    }
+
+    // ---------------------------------------------------------------------
+    // Media-gated overrides (P4-3)
+    // ---------------------------------------------------------------------
+
+    fn mq(s: &str) -> MediaQuery {
+        MediaQuery::parse(s).unwrap()
+    }
+    fn ctx(cols: u16) -> MediaContext {
+        MediaContext {
+            cols,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn get_color_with_uses_media_override_when_matching() {
+        let tokens = ThemeTokens::new()
+            .set("accent", Color::literal(RColor::Red))
+            .set_media(
+                mq("(min-width: 80)"),
+                "accent",
+                Color::literal(RColor::Blue),
+            );
+        // Matching context → override (blue).
+        assert_eq!(
+            tokens.get_color_with("accent", &ctx(100)),
+            Some(Color::literal(RColor::Blue))
+        );
+        // Non-matching context → default (red).
+        assert_eq!(
+            tokens.get_color_with("accent", &ctx(60)),
+            Some(Color::literal(RColor::Red))
+        );
+        // Default-only getter still returns the default (red), unaffected.
+        assert_eq!(
+            tokens.get_color("accent"),
+            Some(&Color::literal(RColor::Red))
+        );
+    }
+
+    #[test]
+    fn get_color_with_falls_back_when_override_is_for_a_different_name() {
+        // A media override for --other should not affect --accent.
+        let tokens = ThemeTokens::new()
+            .set("accent", Color::literal(RColor::Red))
+            .set_media(
+                mq("(min-width: 80)"),
+                "other",
+                Color::literal(RColor::Green),
+            );
+        assert_eq!(
+            tokens.get_color_with("accent", &ctx(100)),
+            Some(Color::literal(RColor::Red)),
+            "override for --other must not shadow --accent"
+        );
+    }
+
+    #[test]
+    fn get_color_with_last_matching_override_wins() {
+        // Two queries both match ctx{cols:100}; the later source-order entry wins.
+        let tokens = ThemeTokens::new()
+            .set("accent", Color::literal(RColor::Red))
+            .set_media(mq("(min-width: 50)"), "accent", Color::literal(RColor::Green))
+            .set_media(mq("(min-width: 80)"), "accent", Color::literal(RColor::Blue));
+        assert_eq!(
+            tokens.get_color_with("accent", &ctx(100)),
+            Some(Color::literal(RColor::Blue)),
+            "last-matching media override wins by source order"
+        );
+        // At cols:60 only the first query matches → green.
+        assert_eq!(
+            tokens.get_color_with("accent", &ctx(60)),
+            Some(Color::literal(RColor::Green))
+        );
+    }
+
+    #[test]
+    fn get_color_with_chains_through_media_var() {
+        // --x: var(--y), both media-gated under the matching ctx.
+        let tokens = ThemeTokens::new().set_media(
+            mq("(min-width: 80)"),
+            "x",
+            Token::Var { name: "y".to_string() },
+        );
+        let tokens = tokens.set_media(
+            mq("(min-width: 80)"),
+            "y",
+            Color::literal(RColor::Magenta),
+        );
+        assert_eq!(
+            tokens.get_color_with("x", &ctx(100)),
+            Some(Color::literal(RColor::Magenta)),
+            "media-gated var() chain resolves through both media entries"
+        );
+        // Non-matching context → none (no default for x/y).
+        assert_eq!(tokens.get_color_with("x", &ctx(40)), None);
+    }
+
+    #[test]
+    fn get_length_with_uses_media_override() {
+        let tokens = ThemeTokens::new()
+            .set("w", Length::Cells(5))
+            .set_media(mq("(min-width: 80)"), "w", Length::Cells(50));
+        assert_eq!(tokens.get_length_with("w", &ctx(100)), Some(Length::Cells(50)));
+        assert_eq!(tokens.get_length_with("w", &ctx(40)), Some(Length::Cells(5)));
+        // Default-only getter unaffected.
+        assert_eq!(tokens.get_length("w"), Some(&Length::Cells(5)));
+    }
+
+    #[test]
+    fn insert_media_accumulates_same_query_into_one_map() {
+        // Two insert_media calls with the same query string accumulate into one
+        // map entry (same query reused).
+        let q = mq("(min-width: 80)");
+        let mut tokens = ThemeTokens::new();
+        tokens.insert_media(q.clone(), "a", Color::literal(RColor::Red));
+        tokens.insert_media(q.clone(), "b", Color::literal(RColor::Green));
+        // Both resolve under the matching ctx.
+        assert_eq!(tokens.get_color_with("a", &ctx(100)), Some(Color::literal(RColor::Red)));
+        assert_eq!(tokens.get_color_with("b", &ctx(100)), Some(Color::literal(RColor::Green)));
+        // Same-name within one query overwrites.
+        tokens.insert_media(q, "a", Color::literal(RColor::Blue));
+        assert_eq!(tokens.get_color_with("a", &ctx(100)), Some(Color::literal(RColor::Blue)));
+    }
+
+    #[test]
+    fn is_defined_checks_default_and_all_media_maps() {
+        let mut tokens = ThemeTokens::new();
+        tokens.insert("default_only", Color::literal(RColor::Red));
+        tokens.insert_media(mq("(min-width: 80)"), "media_only", Color::literal(RColor::Red));
+        assert!(tokens.is_defined("default_only"));
+        assert!(tokens.is_defined("media_only"));
+        assert!(!tokens.is_defined("neither"));
+    }
+
+    #[test]
+    fn resolve_with_media_gates_var_against_context() {
+        // End-to-end: resolve() (default media) → default; resolve_with_media()
+        // (matching) → override.
+        let tokens = ThemeTokens::new()
+            .set("accent", Color::literal(RColor::Red))
+            .set_media(mq("(min-width: 80)"), "accent", Color::literal(RColor::Blue));
+        // Default: red (media override not consulted).
+        assert_eq!(resolve(&Color::var("accent"), &tokens), RColor::Red);
+        // Matching ctx: blue.
+        assert_eq!(
+            resolve_with_media(&Color::var("accent"), &tokens, &ctx(100)),
+            RColor::Blue
+        );
+        // Non-matching ctx: red (fallback to default).
+        assert_eq!(
+            resolve_with_media(&Color::var("accent"), &tokens, &ctx(40)),
+            RColor::Red
+        );
+    }
+
+    #[test]
+    fn resolve_length_with_media_gates_var_against_context() {
+        let tokens = ThemeTokens::new()
+            .set("w", Length::Cells(5))
+            .set_media(mq("(min-width: 80)"), "w", Length::Cells(50));
+        assert_eq!(
+            resolve_length_with_media(&Length::Var { name: "w".into(), fallback: None }, &tokens, &ctx(100)),
+            Length::Cells(50)
+        );
+        assert_eq!(
+            resolve_length_with_media(&Length::Var { name: "w".into(), fallback: None }, &tokens, &ctx(40)),
+            Length::Cells(5)
+        );
+    }
+
+    #[test]
+    fn merge_merges_media_vars_too() {
+        let other = ThemeTokens::new()
+            .set("a", Color::literal(RColor::Red))
+            .set_media(mq("(min-width: 80)"), "a", Color::literal(RColor::Blue));
+        let mut mine = ThemeTokens::new();
+        mine.merge(&other);
+        assert_eq!(mine.get_color("a"), Some(&Color::literal(RColor::Red)));
+        assert_eq!(mine.get_color_with("a", &ctx(100)), Some(Color::literal(RColor::Blue)));
     }
 }

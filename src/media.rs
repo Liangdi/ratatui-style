@@ -8,9 +8,21 @@
 //!
 //! # Matching model
 //!
-//! `MediaQuery::matches` is true iff **all** of its conditions hold against the
-//! supplied context. A query with no conditions matches anything (an empty
-//! `@media {}` is a no-op gate).
+//! A query is a comma-separated list (logical OR) of [`MediaAlternative`]s. Each
+//! alternative is an optional `not` prefix applied to a conjunction (logical AND)
+//! of [`MediaCondition`]s. Precedence, tightest first:
+//!
+//! `not` (whole-alternative) > `and` (conditions) > `,` (alternatives / OR)
+//!
+//! So `(min-width: 80), not (color) and (max-height: 40)` parses as two
+//! alternatives: `(min-width: 80)` OR `not ((color) and (max-height: 40))`.
+//!
+//! A query with **no alternatives** (e.g. a bare `@media {}` with no query text)
+//! matches anything — a no-op gate — preserving the historically lenient behavior.
+//!
+//! Media types (`screen`, `all`, `print`, `only`) are accepted syntactically and
+//! **ignored**: terminal apps are always "screen". A bare `@media print { }` is
+//! treated like `@media all { }` (matches everything).
 //!
 //! Default-context caution: [`MediaContext::default()`] is all-zero / all-false,
 //! which means "no terminal info". A media-gated rule with any condition will
@@ -37,10 +49,25 @@ pub struct MediaContext {
     pub no_color: bool,
 }
 
-/// One `@media` query: a conjunction (AND) of [`MediaCondition`]s.
+/// One `@media` query: one or more [`MediaAlternative`]s joined by comma (OR).
+///
+/// The query matches if **any** alternative matches. An `alternatives` list with
+/// zero entries (e.g. a bare `@media {}` with no query text) matches everything.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct MediaQuery {
-    /// All conditions must hold for [`matches`](Self::matches) to be true.
+    /// Comma-separated alternatives; the query matches if ANY matches. An empty
+    /// list matches everything (a no-op gate).
+    pub alternatives: Vec<MediaAlternative>,
+}
+
+/// One `and`-conjunction of [`MediaCondition`]s, optionally negated as a whole.
+///
+/// `matches` is true iff `(all conditions hold) XOR negated`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MediaAlternative {
+    /// A `not` prefix negates the whole alternative.
+    pub negated: bool,
+    /// Conditions joined by `and`; all must hold (before negation).
     pub conditions: Vec<MediaCondition>,
 }
 
@@ -68,114 +95,224 @@ pub enum MediaCondition {
 }
 
 impl MediaQuery {
-    /// True iff **all** conditions hold against `ctx`. An empty query (no
-    /// conditions) matches anything.
+    /// True iff **any** alternative matches `ctx`. A query with no alternatives
+    /// matches anything (a no-op gate).
     pub fn matches(&self, ctx: &MediaContext) -> bool {
-        self.conditions.iter().all(|c| c.matches(ctx))
+        if self.alternatives.is_empty() {
+            return true;
+        }
+        self.alternatives.iter().any(|a| a.matches(ctx))
     }
 
     /// Parse the text BETWEEN `@media` and the block's opening `{`.
     ///
-    /// Accepts an optional leading media-type keyword (`screen`, `all`, `only
-    /// screen` — accepted and ignored) followed by zero or more parenthesized
-    /// conditions joined by `and` (case-insensitive). Each condition is either
-    /// `(feature)` or `(feature: value)`.
+    /// Grammar (case-insensitive), precedence tightest first:
+    ///
+    /// `not` (whole-alternative) > `and` (conditions) > `,` (alternatives / OR)
+    ///
+    /// - The text is split on top-level commas into one [`MediaAlternative`]
+    ///   per part (OR).
+    /// - Each part may begin with an optional leading `not` (negates the whole
+    ///   alternative) and an optional media-type keyword sequence (`only`,
+    ///   `screen`, `all`, `print`, possibly `only screen`) which is accepted and
+    ///   **ignored** — terminal apps are always "screen". If a media type is
+    ///   present it may be followed by `and`, which is also consumed.
+    /// - The remainder is zero or more `(condition)` clauses joined by `and`.
     ///
     /// Unknown / malformed features surface as a [`CssError`] so strict stays
     /// honest; the stylesheet parser propagates it.
     pub fn parse(s: &str) -> Result<MediaQuery> {
-        let mut conditions = Vec::new();
-
-        // Lowercase the whole query once; tokens are case-insensitive. Keep the
-        // original slice around for nothing — we only operate on the lowercased
-        // copy below.
+        // Lowercase once; tokens are case-insensitive.
         let lower = s.to_ascii_lowercase();
-        let bytes = lower.as_bytes();
-        let mut i = 0usize;
 
-        // Skip an optional leading media-type keyword up to the first `(` (or
-        // end). Recognized keywords (`screen`, `all`, `only`) are ignored; any
-        // other keyword is also tolerated here, since the meaningful content is
-        // the parenthesized conditions. We do NOT honor `not`/`print` — those
-        // would invert/exclude matches and are out of scope for v1, so we just
-        // skip leading words and parse the conditions.
-        while i < bytes.len() {
-            // Skip whitespace.
-            while i < bytes.len() && bytes[i].is_ascii_whitespace() {
-                i += 1;
-            }
-            if i >= bytes.len() {
-                break;
-            }
-            if bytes[i] == b'(' {
-                // Reached the first condition — break to the condition loop.
-                break;
-            }
-            // Consume a leading word (media-type keyword). Skip until whitespace
-            // or `(`. We ignore its value for v1.
-            while i < bytes.len()
-                && !bytes[i].is_ascii_whitespace()
-                && bytes[i] != b'('
-            {
-                i += 1;
-            }
-            // Loop continues; next iteration skips whitespace then either finds
-            // `(` or another keyword (e.g. the `and` between `screen` and the
-            // first `(`), which we also skip.
+        // A wholly empty/whitespace query → zero alternatives (match-all gate).
+        // This is distinct from a stray comma, which yields an empty PART among
+        // non-empty ones and is a structural error.
+        if lower.trim().is_empty() {
+            return Ok(MediaQuery { alternatives: Vec::new() });
         }
 
-        // Now parse zero or more `(condition)` joined by `and`.
-        loop {
-            // Skip whitespace.
-            while i < bytes.len() && bytes[i].is_ascii_whitespace() {
-                i += 1;
+        // Split on top-level commas (respecting paren depth — commas inside
+        // parens don't occur in this grammar, but guard against future
+        // extensions like `(prefers-color-scheme: dark, light)`).
+        let mut alternatives = Vec::new();
+        for part in split_top_level_commas(&lower) {
+            let trimmed = part.trim();
+            // An empty part between/around commas (e.g. trailing `, `) is a
+            // structural error rather than a silent match-all alternative.
+            if trimmed.is_empty() {
+                return Err(CssError::invalid_selector(
+                    "media query: empty alternative (stray comma?)",
+                ));
             }
-            if i >= bytes.len() {
-                break;
-            }
-            if bytes[i] != b'(' {
-                // Expected either end-of-string or a `(`. Anything else is a
-                // structural error.
-                return Err(CssError::invalid_selector(format!(
-                    "media query: expected `(` near `{}`",
-                    &s[i.min(s.len())..]
-                )));
-            }
-            // Find the matching `)`.
-            let close = match lower[i..].find(')') {
-                Some(rel) => i + rel,
-                None => {
-                    return Err(CssError::invalid_selector(
-                        "media query: unbalanced parens (missing `)`)",
-                    ));
-                }
-            };
-            // Inner content between the parens (exclusive).
-            let inner = &lower[i + 1..close];
-            conditions.push(parse_condition(inner)?);
-            i = close + 1;
+            alternatives.push(parse_alternative(trimmed)?);
+        }
 
-            // After a condition, expect either end-of-string or ` and `.
-            while i < bytes.len() && bytes[i].is_ascii_whitespace() {
-                i += 1;
-            }
-            if i >= bytes.len() {
+        Ok(MediaQuery { alternatives })
+    }
+}
+
+impl MediaAlternative {
+    /// True iff `(all conditions hold against ctx) XOR negated`.
+    pub fn matches(&self, ctx: &MediaContext) -> bool {
+        let all_hold = self.conditions.iter().all(|c| c.matches(ctx));
+        all_hold != self.negated
+    }
+}
+
+/// Parse one comma-separated alternative (already trimmed, lowercased).
+///
+/// Handles the optional leading `not` and media-type keywords, then splits the
+/// remainder on `and` into conditions.
+fn parse_alternative(part: &str) -> Result<MediaAlternative> {
+    let bytes = part.as_bytes();
+    let mut i = 0usize;
+    let mut negated = false;
+
+    // Skip leading whitespace.
+    while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+        i += 1;
+    }
+
+    // Optional leading `not` (whole word). CSS media queries put `not` at the
+    // alternative level (it negates the whole comma-separated part), so this is
+    // distinct from the (unsupported) per-condition `not`.
+    if let Some(consumed) = consume_keyword(bytes, i, "not") {
+        i = consumed;
+        negated = true;
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+    }
+
+    // Consume an optional media-type keyword sequence: `only`, `screen`, `all`,
+    // `print`, possibly `only screen`. These are IGNORED (terminal apps are
+    // always "screen"). Also consume a trailing `and` if present so the
+    // remainder is the condition list.
+    loop {
+        let prev_i = i;
+        for kw in ["only", "screen", "all", "print"] {
+            if let Some(consumed) = consume_keyword(bytes, i, kw) {
+                i = consumed;
+                while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+                    i += 1;
+                }
                 break;
             }
-            // Must be the keyword `and`.
-            let rest = &lower[i..];
-            let and_len = "and".len();
-            if rest.len() >= and_len && &rest[..and_len] == "and" {
-                i += and_len;
-                continue;
-            }
+        }
+        if i == prev_i {
+            break;
+        }
+    }
+    // After consuming media types, consume a single following `and` if present
+    // (e.g. `screen and (...)`). This `and` separates the media type from the
+    // feature conditions, not conditions from each other.
+    if let Some(consumed) = consume_keyword(bytes, i, "and") {
+        i = consumed;
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+    }
+
+    // The remainder is the condition list: zero or more `(cond)` joined by
+    // `and`. If nothing remains (e.g. bare `screen` or `not screen`), the
+    // alternative has zero conditions → matches everything (before negation).
+    let mut conditions = Vec::new();
+    let mut seen_any = false;
+    loop {
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if i >= bytes.len() {
+            break;
+        }
+        if bytes[i] != b'(' {
             return Err(CssError::invalid_selector(format!(
-                "media query: expected `and` between conditions near `{rest}`"
+                "media query: expected `(` near `{}`",
+                &part[i.min(part.len())..]
             )));
         }
+        // Find the matching `)`.
+        let close = match part[i..].find(')') {
+            Some(rel) => i + rel,
+            None => {
+                return Err(CssError::invalid_selector(
+                    "media query: unbalanced parens (missing `)`)",
+                ));
+            }
+        };
+        let inner = &part[i + 1..close];
+        conditions.push(parse_condition(inner)?);
+        i = close + 1;
+        seen_any = true;
 
-        Ok(MediaQuery { conditions })
+        // After a condition, expect either end-of-string or ` and `.
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if i >= bytes.len() {
+            break;
+        }
+        if let Some(consumed) = consume_keyword(bytes, i, "and") {
+            i = consumed;
+            continue;
+        }
+        return Err(CssError::invalid_selector(format!(
+            "media query: expected `and` between conditions near `{}`",
+            &part[i..]
+        )));
     }
+
+    let _ = seen_any;
+    Ok(MediaAlternative { negated, conditions })
+}
+
+/// If `bytes[i..]` begins with `kw` as a whole word (followed by whitespace, a
+/// `(`, a `,`, or end-of-input), return the index just past the keyword; else
+/// `None`. Whole-word match prevents `notable` from matching `not`.
+fn consume_keyword(bytes: &[u8], i: usize, kw: &str) -> Option<usize> {
+    let kw_bytes = kw.as_bytes();
+    if i + kw_bytes.len() > bytes.len() {
+        return None;
+    }
+    if &bytes[i..i + kw_bytes.len()] != kw_bytes {
+        return None;
+    }
+    let after = i + kw_bytes.len();
+    // Whole-word boundary: next char must be whitespace, `(`, `,`, or end.
+    if after < bytes.len()
+        && !bytes[after].is_ascii_whitespace()
+        && bytes[after] != b'('
+        && bytes[after] != b','
+    {
+        return None;
+    }
+    Some(after)
+}
+
+/// Split `s` on top-level commas (those at paren depth 0), returning owned
+/// slices of the original. Whitespace is NOT trimmed here — callers trim.
+fn split_top_level_commas(s: &str) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut depth = 0i32;
+    let mut start = 0usize;
+    for (idx, ch) in s.char_indices() {
+        match ch {
+            '(' => depth += 1,
+            ')' => {
+                if depth > 0 {
+                    depth -= 1;
+                }
+            }
+            ',' if depth == 0 => {
+                parts.push(&s[start..idx]);
+                start = idx + 1;
+            }
+            _ => {}
+        }
+    }
+    parts.push(&s[start..]);
+    parts
 }
 
 /// Parse the inner content of one `(feature)` or `(feature: value)` condition
@@ -314,8 +451,23 @@ impl MediaCondition {
 
 impl std::fmt::Display for MediaQuery {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        if self.conditions.is_empty() {
+        if self.alternatives.is_empty() {
             return write!(f, "all");
+        }
+        for (i, a) in self.alternatives.iter().enumerate() {
+            if i > 0 {
+                write!(f, ", ")?;
+            }
+            std::fmt::Display::fmt(a, f)?;
+        }
+        Ok(())
+    }
+}
+
+impl std::fmt::Display for MediaAlternative {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.negated {
+            write!(f, "not ")?;
         }
         for (i, c) in self.conditions.iter().enumerate() {
             if i > 0 {
@@ -356,60 +508,69 @@ mod tests {
         }
     }
 
+    /// Build a `MediaAlternative` from a `negated` flag + a list of conditions.
+    fn alt<I: IntoIterator<Item = MediaCondition>>(negated: bool, conds: I) -> MediaAlternative {
+        MediaAlternative { negated, conditions: conds.into_iter().collect() }
+    }
+
+    fn no_color_ctx() -> MediaContext {
+        MediaContext { no_color: true, ..Default::default() }
+    }
+
     // --- parse ---------------------------------------------------------------
 
     #[test]
     fn parse_min_width() {
         let q = MediaQuery::parse("(min-width: 80)").unwrap();
-        assert_eq!(q.conditions, vec![MediaCondition::MinWidth(80)]);
+        assert_eq!(q.alternatives, vec![alt(false, [MediaCondition::MinWidth(80)])]);
     }
 
     #[test]
     fn parse_max_width_and_min_height() {
         let q = MediaQuery::parse("(max-width: 120) and (min-height: 24)").unwrap();
         assert_eq!(
-            q.conditions,
-            vec![MediaCondition::MaxWidth(120), MediaCondition::MinHeight(24)]
+            q.alternatives,
+            vec![alt(false, [MediaCondition::MaxWidth(120), MediaCondition::MinHeight(24)])]
         );
     }
 
     #[test]
     fn parse_width_exact() {
         let q = MediaQuery::parse("(width: 80)").unwrap();
-        assert_eq!(q.conditions, vec![MediaCondition::Width(80)]);
+        assert_eq!(q.alternatives, vec![alt(false, [MediaCondition::Width(80)])]);
     }
 
     #[test]
     fn parse_color_bare() {
         let q = MediaQuery::parse("(color)").unwrap();
-        assert_eq!(q.conditions, vec![MediaCondition::Color]);
+        assert_eq!(q.alternatives, vec![alt(false, [MediaCondition::Color])]);
     }
 
     #[test]
     fn parse_monochrome_bare() {
         let q = MediaQuery::parse("(monochrome)").unwrap();
-        assert_eq!(q.conditions, vec![MediaCondition::Monochrome]);
+        assert_eq!(q.alternatives, vec![alt(false, [MediaCondition::Monochrome])]);
     }
 
     #[test]
     fn parse_truecolor_bare() {
         let q = MediaQuery::parse("(truecolor)").unwrap();
-        assert_eq!(q.conditions, vec![MediaCondition::Truecolor]);
+        assert_eq!(q.alternatives, vec![alt(false, [MediaCondition::Truecolor])]);
     }
 
     #[test]
     fn parse_leading_media_type_ignored() {
         let q = MediaQuery::parse("screen and (min-width: 80)").unwrap();
-        assert_eq!(q.conditions, vec![MediaCondition::MinWidth(80)]);
+        assert_eq!(q.alternatives, vec![alt(false, [MediaCondition::MinWidth(80)])]);
 
         let q2 = MediaQuery::parse("all and (max-height: 40)").unwrap();
-        assert_eq!(q2.conditions, vec![MediaCondition::MaxHeight(40)]);
+        assert_eq!(q2.alternatives, vec![alt(false, [MediaCondition::MaxHeight(40)])]);
     }
 
     #[test]
     fn parse_empty_query_matches_all() {
         let q = MediaQuery::parse("").unwrap();
-        assert!(q.conditions.is_empty());
+        assert!(q.alternatives.is_empty());
         assert!(q.matches(&MediaContext::default()));
     }
 
@@ -417,7 +578,94 @@ mod tests {
     fn parse_uppercase_features() {
         // Case-insensitive: features get lowercased internally.
         let q = MediaQuery::parse("(MIN-WIDTH: 80)").unwrap();
-        assert_eq!(q.conditions, vec![MediaCondition::MinWidth(80)]);
+        assert_eq!(q.alternatives, vec![alt(false, [MediaCondition::MinWidth(80)])]);
+    }
+
+    // --- parse: not / comma / and --------------------------------------------
+
+    #[test]
+    fn parse_comma_or_two_alternatives() {
+        let q = MediaQuery::parse("(min-width: 80), (max-width: 120)").unwrap();
+        assert_eq!(
+            q.alternatives,
+            vec![
+                alt(false, [MediaCondition::MinWidth(80)]),
+                alt(false, [MediaCondition::MaxWidth(120)]),
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_not_prefix_single() {
+        let q = MediaQuery::parse("not (min-width: 80)").unwrap();
+        assert_eq!(q.alternatives, vec![alt(true, [MediaCondition::MinWidth(80)])]);
+    }
+
+    #[test]
+    fn parse_comma_three_alternatives() {
+        let q = MediaQuery::parse("(min-width: 80), (max-width: 120), (color)").unwrap();
+        assert_eq!(
+            q.alternatives,
+            vec![
+                alt(false, [MediaCondition::MinWidth(80)]),
+                alt(false, [MediaCondition::MaxWidth(120)]),
+                alt(false, [MediaCondition::Color]),
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_not_screen_media_type_ignored() {
+        // `not` negates the alternative; media type `screen` is ignored.
+        let q = MediaQuery::parse("not screen and (min-width: 80)").unwrap();
+        assert_eq!(q.alternatives, vec![alt(true, [MediaCondition::MinWidth(80)])]);
+    }
+
+    #[test]
+    fn parse_comma_with_not_second_alt() {
+        let q = MediaQuery::parse("(min-width: 80), not (color)").unwrap();
+        assert_eq!(
+            q.alternatives,
+            vec![
+                alt(false, [MediaCondition::MinWidth(80)]),
+                alt(true, [MediaCondition::Color]),
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_and_chain_one_alternative_regression() {
+        // Existing AND behavior: one alternative, two conditions.
+        let q = MediaQuery::parse("(min-width: 80) and (max-height: 40)").unwrap();
+        assert_eq!(
+            q.alternatives,
+            vec![alt(
+                false,
+                [MediaCondition::MinWidth(80), MediaCondition::MaxHeight(40)]
+            )]
+        );
+    }
+
+    #[test]
+    fn parse_not_is_whole_word() {
+        // `notable` must NOT be parsed as `not`.
+        assert!(MediaQuery::parse("notable").is_err());
+    }
+
+    #[test]
+    fn parse_bare_media_type_matches_all() {
+        // Bare media type, no conditions → one alternative with zero conditions
+        // (matches everything before negation).
+        let q = MediaQuery::parse("screen").unwrap();
+        assert_eq!(q.alternatives, vec![MediaAlternative { negated: false, conditions: vec![] }]);
+        assert!(q.matches(&MediaContext::default()));
+    }
+
+    #[test]
+    fn parse_empty_alternative_errors() {
+        // Stray trailing comma → empty alternative is a structural error.
+        assert!(MediaQuery::parse("(min-width: 80),").is_err());
+        assert!(MediaQuery::parse(", (min-width: 80)").is_err());
     }
 
     // --- parse errors --------------------------------------------------------
@@ -497,11 +745,79 @@ mod tests {
         assert!(!q.matches(&MediaContext::default()));
     }
 
+    // --- matches: not / comma / and -----------------------------------------
+
+    #[test]
+    fn comma_or_matches_either_alternative() {
+        // (min-width: 100), (max-width: 50)
+        let q = MediaQuery::parse("(min-width: 100), (max-width: 50)").unwrap();
+        // First alt: cols >= 100.
+        assert!(q.matches(&ctx(100, 24)));
+        assert!(q.matches(&ctx(150, 24)));
+        // Second alt: cols <= 50.
+        assert!(q.matches(&ctx(40, 24)));
+        assert!(q.matches(&ctx(50, 24)));
+        // Neither: cols = 70.
+        assert!(!q.matches(&ctx(70, 24)));
+    }
+
+    #[test]
+    fn not_prefix_inverts_single_condition() {
+        // not (min-width: 80): matches when cols < 80.
+        let q = MediaQuery::parse("not (min-width: 80)").unwrap();
+        assert!(q.matches(&ctx(60, 24))); // condition false → negated true
+        assert!(q.matches(&ctx(79, 24)));
+        assert!(!q.matches(&ctx(100, 24))); // condition true → negated false
+        assert!(!q.matches(&ctx(80, 24)));
+    }
+
+    #[test]
+    fn and_chain_matches_only_when_all_hold() {
+        // (min-width: 80) and (max-width: 120)
+        let q = MediaQuery::parse("(min-width: 80) and (max-width: 120)").unwrap();
+        assert!(q.matches(&ctx(100, 24)));
+        assert!(q.matches(&ctx(80, 24)));
+        assert!(q.matches(&ctx(120, 24)));
+        assert!(!q.matches(&ctx(60, 24))); // below min
+        assert!(!q.matches(&ctx(200, 24))); // above max
+    }
+
+    #[test]
+    fn comma_with_not_second_alt() {
+        // (min-width: 200), not (color) against a no_color ctx → second alt.
+        let q = MediaQuery::parse("(min-width: 200), not (color)").unwrap();
+        // no_color ctx: (color) is false, so `not (color)` is true → matches.
+        assert!(q.matches(&no_color_ctx()));
+        // A color ctx with cols < 200: (min-width: 200) false, (color) true so
+        // `not (color)` false → neither alt matches.
+        assert!(!q.matches(&ctx(100, 24)));
+        // Color ctx with cols >= 200: first alt matches.
+        assert!(q.matches(&ctx(200, 24)));
+    }
+
+    #[test]
+    fn not_all_conditions_in_one_alternative() {
+        // not ((min-width: 80) and (color)): negates the whole conjunction.
+        let q = MediaQuery::parse("not (min-width: 80) and (color)").unwrap();
+        // cols=100 + color → conjunction true → negated false.
+        assert!(!q.matches(&ctx(100, 24)));
+        // cols=60 + color → conjunction false → negated true.
+        assert!(q.matches(&ctx(60, 24)));
+        // no_color: (color) false → conjunction false → negated true.
+        assert!(q.matches(&no_color_ctx()));
+    }
+
     // --- Display -------------------------------------------------------------
 
     #[test]
     fn display_roundtrip() {
         let q = MediaQuery::parse("(min-width: 80) and (color)").unwrap();
         assert_eq!(q.to_string(), "(min-width: 80) and (color)");
+    }
+
+    #[test]
+    fn display_roundtrip_comma_and_not() {
+        let q = MediaQuery::parse("(min-width: 80), not (color)").unwrap();
+        assert_eq!(q.to_string(), "(min-width: 80), not (color)");
     }
 }

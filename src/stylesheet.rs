@@ -51,6 +51,16 @@ pub struct Stylesheet {
     /// ancestor-identity stack. Stays `false` for the common (combinator-free)
     /// case so that path pays zero added cost.
     has_combinators: bool,
+    /// Invalidation generation counter. Bumped (wrapping) at the START of every
+    /// mutation that can change compute output (`add`, `add_rule`, `extend`,
+    /// `tokens_mut`). A [`ComputeCache`](crate::cache::ComputeCache) detects a
+    /// generation mismatch on lookup and clears entirely, so a stylesheet edit
+    /// after a cached walk automatically invalidates every prior entry.
+    ///
+    /// Parsing methods (`parse`/`parse_with_origin`) build a fresh `Stylesheet`,
+    /// so they leave this at 0 — a freshly parsed sheet is uncached relative to
+    /// any pre-existing cache.
+    generation_gen: u64,
 }
 
 impl Stylesheet {
@@ -60,13 +70,18 @@ impl Stylesheet {
 
     /// Construct with a token table (CSS custom properties).
     pub fn with_tokens(tokens: ThemeTokens) -> Self {
-        Self { rules: Vec::new(), tokens, has_combinators: false }
+        Self { rules: Vec::new(), tokens, has_combinators: false, generation_gen: 0 }
     }
 
     pub fn tokens(&self) -> &ThemeTokens {
         &self.tokens
     }
+    /// Hand out a mutable borrow of the token table. Bumps [`generation`](Self::generation)
+    /// first because the caller can mutate tokens through the returned `&mut`,
+    /// and any token change can alter a downstream `var()` resolution — so the
+    /// conservative bump invalidates the whole [`ComputeCache`](crate::cache::ComputeCache).
     pub fn tokens_mut(&mut self) -> &mut ThemeTokens {
+        self.bump_gen();
         &mut self.tokens
     }
     pub fn rules(&self) -> &[RuleEntry] {
@@ -81,8 +96,24 @@ impl Stylesheet {
         self.has_combinators
     }
 
+    /// The invalidation generation. Bumped on every mutation that can change
+    /// compute output; a [`ComputeCache`](crate::cache::ComputeCache) clears
+    /// itself when it sees a generation different from the one it was populated
+    /// under.
+    pub fn generation(&self) -> u64 {
+        self.generation_gen
+    }
+
+    /// Bump the generation counter (wrapping). Called at the START of every
+    /// cache-relevant mutation so a concurrent [`ComputeCache`](crate::cache::ComputeCache)
+    /// sees a mismatch on its next access.
+    fn bump_gen(&mut self) {
+        self.generation_gen = self.generation_gen.wrapping_add(1);
+    }
+
     /// Add a rule from a selector string (may be a comma list) + style.
     pub fn add(&mut self, selectors: &str, style: CssStyle, origin: Origin) -> Result<&mut Self> {
+        self.bump_gen();
         let order_base = self.rules.len();
         for sel in Selector::parse_list(selectors)? {
             if sel.ancestor.is_some() {
@@ -102,6 +133,7 @@ impl Stylesheet {
 
     /// Add a single pre-parsed rule.
     pub fn add_rule(&mut self, selector: Selector, style: CssStyle, origin: Origin) -> &mut Self {
+        self.bump_gen();
         if selector.ancestor.is_some() {
             self.has_combinators = true;
         }
@@ -113,6 +145,7 @@ impl Stylesheet {
 
     /// Merge another stylesheet's rules and tokens into this one.
     pub fn extend(&mut self, other: &Stylesheet) {
+        self.bump_gen();
         self.tokens.merge(&other.tokens);
         self.has_combinators |= other.has_combinators;
         let offset = self.rules.len();
@@ -147,14 +180,15 @@ impl Stylesheet {
     /// comments, and `@media (query) { … }` conditional blocks. Declarations use
     /// [`apply_decl`]'s property names.
     ///
-    /// **`@media` support (v1):**
+    /// **`@media` support:**
     /// - Element rules inside an `@media` block are tagged with the parsed
     ///   [`MediaQuery`] and only apply when the active
     ///   [`MediaContext`](crate::media::MediaContext) matches. The block body is
     ///   itself a CSS fragment parsed recursively.
-    /// - **`:root` inside `@media` is allowed but the tokens are inserted
-    ///   GLOBALLY** (not media-gated) — `ThemeTokens` is a flat map, so there is
-    ///   no per-query token namespace in v1.
+    /// - **`:root` inside `@media`** declares a **media-gated override** — the
+    ///   token is resolved against the active [`MediaContext`] at compute time
+    ///   (last matching query wins, with the default `:root` value as fallback).
+    ///   See [`ThemeTokens::get_color_with`](crate::token::ThemeTokens::get_color_with).
     /// - **Nested `@media` inside `@media` is rejected** with a structural error;
     ///   combine conditions into one query instead.
     ///
@@ -205,12 +239,13 @@ impl Stylesheet {
         parse_rule_loop(&cleaned, cleaned.as_str(), 0, strict, None, &mut sheet)?;
 
         if strict {
-            // Any `var(--name)` with no fallback whose name is not in the token
-            // table is an error. We scan every rule's declared colors …
+            // Any `var(--name)` with no fallback whose name is not declared
+            // anywhere in the token table (default map OR a media-gated
+            // override) is an error. We scan every rule's declared colors …
             for rule in &sheet.rules {
                 for color in color_refs(&rule.style) {
                     if let Some(Color::Var { name, fallback: None }) = color {
-                        if sheet.tokens.get(name).is_none() {
+                        if !sheet.tokens.is_defined(name) {
                             return Err(CssError::undefined_variable(name.as_str()));
                         }
                     }
@@ -221,7 +256,7 @@ impl Stylesheet {
                 // strict check above.
                 for length in length_refs(&rule.style) {
                     if let Some(Length::Var { name, fallback: None }) = length {
-                        if sheet.tokens.get(name).is_none() {
+                        if !sheet.tokens.is_defined(name) {
                             return Err(CssError::undefined_variable(name.as_str()));
                         }
                     }
@@ -347,14 +382,11 @@ fn parse_rule_loop(
             continue;
         }
 
-        // `:root { --x: … }` declares tokens.
-        //
-        // v1 limitation: a `:root` INSIDE an `@media` block inserts its tokens
-        // GLOBALLY (not media-gated) — `ThemeTokens` is a flat map with no
-        // per-query namespace. We deliberately do NOT error here: tokens are
-        // environment-wide facts (a `--accent` color doesn't change with
-        // terminal width), and erroring would surprise users. The `media` tag
-        // is ignored on this path.
+        // `:root { --x: … }` declares tokens. When inside an `@media` block
+        // (`media` is `Some`), the token is a media-gated override stored against
+        // the enclosing query and only participates when the query matches the
+        // active `MediaContext`. At the top level (`media == None`) it goes into
+        // the default map as before.
         let is_root = selector_part.split(',').all(|s| s.trim() == ":root");
         if is_root {
             for decl in split_declarations(body, body_offset) {
@@ -362,7 +394,10 @@ fn parse_rule_loop(
                     let loc = line_col(cleaned, decl.value_offset);
                     let token =
                         parse_token_value(decl.value).map_err(|e| e.at(loc.line, loc.column))?;
-                    sheet.tokens.insert(name.trim(), token);
+                    match media {
+                        Some(q) => sheet.tokens.insert_media(q.clone(), name.trim(), token),
+                        None => sheet.tokens.insert(name.trim(), token),
+                    }
                 }
             }
             continue;
@@ -719,6 +754,7 @@ fn push_decl<'a>(chunk: &'a str, chunk_offset: usize, out: &mut Vec<Decl<'a>>) {
 mod tests {
     use super::*;
     use crate::error::CssErrorKind;
+    use crate::media::MediaContext;
     use crate::node::OwnedNode;
     use ratatui::style::Color as RColor;
 
@@ -1011,8 +1047,11 @@ mod tests {
         assert_eq!(button_rules.len(), 1, "exactly one Button rule");
         let media = button_rules[0].media.as_ref().expect("rule is media-gated");
         assert_eq!(
-            media.conditions,
-            vec![crate::media::MediaCondition::MinWidth(80)]
+            media.alternatives,
+            vec![crate::media::MediaAlternative {
+                negated: false,
+                conditions: vec![crate::media::MediaCondition::MinWidth(80)],
+            }]
         );
     }
 
@@ -1029,7 +1068,13 @@ mod tests {
         assert_eq!(tagged, 2, "both inner rules carry the media query");
         for r in sheet.rules() {
             if let Some(m) = &r.media {
-                assert_eq!(m.conditions, vec![crate::media::MediaCondition::MinWidth(80)]);
+                assert_eq!(
+                    m.alternatives,
+                    vec![crate::media::MediaAlternative {
+                        negated: false,
+                        conditions: vec![crate::media::MediaCondition::MinWidth(80)],
+                    }]
+                );
             }
         }
     }
@@ -1068,16 +1113,27 @@ mod tests {
     }
 
     #[test]
-    fn root_inside_media_inserts_tokens_globally() {
-        // v1 limitation: :root inside @media inserts tokens GLOBALLY (not
-        // media-gated). `ThemeTokens` is a flat map; there is no per-query token
-        // namespace in v1.
+    fn root_inside_media_inserts_media_gated_token() {
+        // P4-3: :root inside @media now declares a MEDIA-GATED override, not a
+        // global one. The default `get_color` (no media ctx) does NOT see it;
+        // `get_color_with` against a matching context does.
         let sheet = Stylesheet::parse("@media (min-width:1){ :root { --x: #fff; } }").unwrap();
+        // Default map: the override is NOT present.
         assert_eq!(
             sheet.tokens().get_color("x"),
-            Some(&Color::literal(RColor::Rgb(0xff, 0xff, 0xff))),
-            "tokens declared inside @media must be globally available (v1)"
+            None,
+            "media-gated :root must NOT land in the default token map"
         );
+        // Matching context: resolves to the override.
+        let large = MediaContext { cols: 80, ..Default::default() };
+        assert_eq!(
+            sheet.tokens().get_color_with("x", &large),
+            Some(Color::literal(RColor::Rgb(0xff, 0xff, 0xff))),
+            "media-gated :root resolves under a matching context"
+        );
+        // Non-matching context: no value.
+        let small = MediaContext { cols: 0, ..Default::default() };
+        assert_eq!(sheet.tokens().get_color_with("x", &small), None);
     }
 
     #[test]
@@ -1107,5 +1163,105 @@ mod tests {
         let err2 = Stylesheet::parse(css2).unwrap_err();
         let loc2 = err2.loc.expect("error has a location");
         assert_eq!(loc2.line, 5);
+    }
+
+    // ---------------------------------------------------------------------
+    // Media-gated :root tokens (P4-3)
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn parses_root_inside_media_into_media_gated_override() {
+        // :root { --accent: red } @media (min-width: 80) { :root { --accent: blue } }
+        // → default has red, a media entry has blue.
+        let css = ":root { --accent: red } @media (min-width: 80) { :root { --accent: blue } }";
+        let sheet = Stylesheet::parse(css).unwrap();
+        // Default map = red.
+        assert_eq!(
+            sheet.tokens().get_color("accent"),
+            Some(&Color::literal(RColor::Red))
+        );
+        // Matching context = blue.
+        let large = MediaContext { cols: 100, ..Default::default() };
+        assert_eq!(
+            sheet.tokens().get_color_with("accent", &large),
+            Some(Color::literal(RColor::Blue))
+        );
+        // Non-matching = red (default fallback).
+        let small = MediaContext { cols: 60, ..Default::default() };
+        assert_eq!(
+            sheet.tokens().get_color_with("accent", &small),
+            Some(Color::literal(RColor::Red))
+        );
+    }
+
+    #[test]
+    fn strict_accepts_var_defined_only_in_media() {
+        // var(--x) used in a rule, --x defined only inside an @media block →
+        // strict parse must NOT error (it's defined somewhere).
+        let css = "@media (min-width: 80) { :root { --x: red; } }\n.a { color: var(--x); }";
+        Stylesheet::parse_strict(css).expect("var defined only in @media is 'defined'");
+    }
+
+    #[test]
+    fn strict_still_errors_on_truly_undefined_var() {
+        // Regression: a var with no definition anywhere still errors in strict.
+        Stylesheet::parse_strict(".a { color: var(--nope); }").unwrap_err();
+        // And a width-length var that's undefined.
+        Stylesheet::parse_strict(".a { width: var(--nope); }").unwrap_err();
+    }
+
+    // ---------------------------------------------------------------------
+    // Generation counter (P4-4 cache invalidation backbone)
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn generation_starts_at_zero() {
+        // Every constructor path yields a fresh gen of 0.
+        assert_eq!(Stylesheet::new().generation(), 0);
+        assert_eq!(Stylesheet::with_tokens(ThemeTokens::new()).generation(), 0);
+        // A freshly parsed sheet is also 0 — parse builds via `Stylesheet::new`.
+        let parsed = Stylesheet::parse("Button { color: red; }").unwrap();
+        assert_eq!(parsed.generation(), 0);
+        let with_origin = Stylesheet::parse_with_origin("Button { color: red; }", Origin::Theme).unwrap();
+        assert_eq!(with_origin.generation(), 0);
+    }
+
+    #[test]
+    fn generation_bumps_on_add() {
+        let mut s = Stylesheet::new();
+        let g0 = s.generation();
+        s.add("Button", CssStyle::new().color(RColor::Red), Origin::User)
+            .unwrap();
+        assert_ne!(s.generation(), g0);
+        // Each subsequent add bumps again.
+        let g1 = s.generation();
+        s.add("Text", CssStyle::new(), Origin::User).unwrap();
+        assert_ne!(s.generation(), g1);
+    }
+
+    #[test]
+    fn generation_bumps_on_add_rule() {
+        let mut s = Stylesheet::new();
+        let g0 = s.generation();
+        let sel = Selector::parse_compound("Button").unwrap();
+        s.add_rule(sel, CssStyle::new(), Origin::User);
+        assert_ne!(s.generation(), g0);
+    }
+
+    #[test]
+    fn generation_bumps_on_extend() {
+        let mut a = Stylesheet::new();
+        let other = Stylesheet::parse("Text { color: blue; }").unwrap();
+        let g0 = a.generation();
+        a.extend(&other);
+        assert_ne!(a.generation(), g0);
+    }
+
+    #[test]
+    fn generation_bumps_on_tokens_mut() {
+        let mut s = Stylesheet::new();
+        let g0 = s.generation();
+        let _ = s.tokens_mut();
+        assert_ne!(s.generation(), g0, "tokens_mut must bump (covers token changes)");
     }
 }

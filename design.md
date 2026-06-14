@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | Implemented through P3 (combinators + structural pseudo-classes + `@media`) |
+| **Status** | Implemented through P4 (sibling combinators + `@media` not/comma + media-scoped tokens + LRU cache) |
 | **Version** | 0.2.0 |
 | **Authors** | Liangdi `<wu@liangdi.me>` |
 | **Depends on** | `ratatui` 0.30 (core types: `Style` / `Color` / `Modifier` / `Rect` / `Block`) |
@@ -250,7 +250,8 @@ Hard dependency: `ratatui` 0.30. Optional: `serde` (default), `serde_json` (`jso
 | **P1** | `Stylesheet` + selectors (type/class/id/compound) + specificity cascade + `:focus`/`:disabled`/`:checked`/`:hover`/`:active` + `StyledNode` | ✅ Done |
 | **P2** | inheritance + `var()` tokens + themekit interop | ✅ Done |
 | **P3** | descendant/child combinators, `:nth-child`, `@media` (terminal size + color capability) | ✅ Done |
-| **P4** | `ComputedStyle` LRU cache; adjacent `+` / general sibling `~` combinators; `@media` `not`/`or`/comma; media-scoped `:root` tokens | ☐ Future |
+| **P4** | adjacent `+` / general sibling `~` combinators; `@media` `not`/comma/`and`; media-scoped `:root` tokens; `ComputedStyle` LRU cache | ✅ Done |
+| **P5** | nested sibling chains (`A + B + C`); access-order LRU (vs current FIFO); media-query specificity cascade for tokens; `@media` nesting; `:nth-of-type` | ☐ Future |
 
 ## 11. Resolved Design Questions
 

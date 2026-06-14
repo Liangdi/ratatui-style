@@ -28,6 +28,7 @@
 #![forbid(unsafe_code)]
 
 pub mod box_model;
+pub mod cache;
 pub mod cascade;
 pub mod color;
 pub mod css_macro;
@@ -53,10 +54,11 @@ pub use grass;
 
 // Re-exports — the primary public surface.
 pub use box_model::{BorderSpec, BorderStyle, BoxEdges, IntoBorderSpec, IntoBoxEdges, Length};
+pub use cache::ComputeCache;
 pub use cascade::{render_computed, CascadeContext, ComputedStyle, ComputeScratch};
 pub use color::Color;
 pub use error::{CssError, CssErrorKind, Loc, Result};
-pub use media::{MediaCondition, MediaContext, MediaQuery};
+pub use media::{MediaAlternative, MediaCondition, MediaContext, MediaQuery};
 pub use node::{Classes, NodeRef, OwnedNode, Position, State, StyledNode};
 pub use runtime::RuntimeStyle;
 pub use selector::{Combinator, NthExpr, Pseudo, PseudoClass, Selector};
@@ -81,10 +83,11 @@ pub use token::ThemeTokens;
 /// ```
 pub mod prelude {
     pub use crate::box_model::{BorderSpec, BorderStyle, BoxEdges, IntoBorderSpec, IntoBoxEdges, Length};
+    pub use crate::cache::ComputeCache;
     pub use crate::cascade::{render_computed, CascadeContext, ComputedStyle, ComputeScratch};
     pub use crate::color::Color;
     pub use crate::error::{CssError, CssErrorKind, Loc, Result};
-    pub use crate::media::{MediaCondition, MediaContext, MediaQuery};
+    pub use crate::media::{MediaAlternative, MediaCondition, MediaContext, MediaQuery};
     pub use crate::node::{Classes, NodeRef, OwnedNode, Position, State, StyledNode};
     pub use crate::runtime::RuntimeStyle;
     pub use crate::selector::{Combinator, NthExpr, Pseudo, PseudoClass, Selector};

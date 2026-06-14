@@ -1,8 +1,8 @@
 ## [0.2.0] - 2026-06-15
 
-A breaking release: the P3 roadmap lands (structural pseudo-classes, descendant/child
-combinators, `@media` queries) alongside a serde cross-format overhaul and cascade
-performance work.
+A breaking release: the P3 + P4 roadmaps land — structural pseudo-classes, all four
+combinators, `@media` queries with `not`/`or`/comma + media-scoped tokens, a `ComputedStyle`
+LRU cache — alongside a serde cross-format overhaul and cascade performance work.
 
 ### 🚀 Features
 
@@ -26,6 +26,26 @@ performance work.
 - *(bench)* Criterion benchmark suite (`benches/cascade.rs`) covering the hot
   path — `compute` vs `compute_with`, `OwnedNode` vs `NodeRef`, parent
   inheritance, `var()` resolution, `CascadeContext` tree walk.
+- *(selector)* Sibling combinators — adjacent (`A + B`) and general (`A ~ B`).
+  `CascadeContext` tracks previous-sibling identities per depth (gated by
+  `has_combinators()`, zero cost when unused). One-level siblings; nested
+  sibling chains (`A + B + C`) are not fully resolved.
+- *(media)* `@media` `not` (whole-alternative negation), comma-OR, and `and`.
+  `MediaQuery` is now `alternatives: Vec<MediaAlternative>` (each alternative:
+  `negated` + `and`-joined conditions). New public `MediaAlternative`.
+- *(token)* Media-scoped custom properties — `:root { --x }` inside `@media`
+  defines a media-gated override resolved against the active `MediaContext`
+  (last-matching-override wins, default fallback). New `ThemeTokens` methods
+  `insert_media` / `set_media` / `get_color_with` / `get_length_with` /
+  `is_defined`; resolve fns gain `_with_media` variants (old ones are
+  default-media wrappers). Lifts the prior v1 ":root inside @media is global"
+  limitation.
+- *(cache)* Opt-in `ComputedStyle` LRU cache (new `cache` module,
+  `ComputeCache`). `CascadeContext::with_cache(capacity)` memoizes compute
+  results across frames; keys fold node identity + ancestor-chain signature +
+  sibling identities + media. Auto-invalidated via a `Stylesheet::generation()`
+  counter bumped on every mutation (`add`/`add_rule`/`extend`/`tokens_mut`).
+  Off by default — the no-cache path is unchanged.
 
 ### 🚜 Refactor
 
@@ -45,6 +65,9 @@ performance work.
 
 - *(build)* Examples `01_values` and `14_data_driven` now declare
   `required-features = ["serde"]`, fixing `cargo build --no-default-features`.
+- *(box-model)* Gate the `length_to_css` helper behind `#[cfg(feature =
+  "serde")]` — it was dead code under `--no-default-features` after the serde
+  rewrite (introduced in this release cycle).
 
 ### [breaking]
 
@@ -55,8 +78,14 @@ performance work.
 - One-shot `compute` / `compute_with` use a default (empty) `MediaContext` —
   `@media`-gated rules do not apply via these entry points; use
   `compute_with_media`, `CascadeContext::with_media`, or `RuntimeStyle::with_media`.
-- Combinator selectors (`A B`, `A > B`) require `CascadeContext` to resolve
-  (the one-shot path has no ancestor-identity information).
+- Combinator selectors (`A B`, `A > B`, `A + B`, `A ~ B`) require
+  `CascadeContext` to resolve (the one-shot path has no ancestor/sibling
+  identity).
+- `MediaQuery.conditions` → `MediaQuery.alternatives: Vec<MediaAlternative>`
+  (`not`/comma/`and` support). Callers reading `query.conditions` must adapt.
+- `ThemeTokens` resolve/getter calls that need media awareness use the new
+  `_with_media` / `_with` variants; the cascade threads the active context
+  through var resolution.
 
 ### 📚 Documentation
 

@@ -16,6 +16,7 @@ use ratatui::{
 };
 
 use crate::box_model::Length;
+use crate::cache::{node_signature, ComputeCache};
 use crate::color::Color;
 use crate::media::MediaContext;
 use crate::node::{Classes, StyledNode};
@@ -216,12 +217,29 @@ pub struct CascadeContext<'s> {
     /// the ancestor chain. Empty and untouched for combinator-free stylesheets,
     /// so that path stays allocation-free.
     identity_stack: Vec<NodeIdentity>,
+    /// Previous-sibling identities keyed by tree depth, kept ONLY when
+    /// `sheet.has_combinators()`. `siblings[D]` is the list of prior siblings
+    /// of a node at depth `D` (number of ancestors = D), within the current
+    /// parent, oldest-first. Cleared at `siblings[D+1]` on `enter` (a node's
+    /// children start with no prior siblings) and appended to at `siblings[D]`
+    /// on `leave` (the departed node becomes a prior sibling for the next one).
+    /// Empty and untouched for combinator-free stylesheets.
+    siblings: Vec<Vec<NodeIdentity>>,
     /// The active terminal context used to gate `@media` rules. Defaults to
     /// all-zero / all-false (no media info), in which case media-gated rules
     /// with any condition do NOT match. Set via [`set_media`](Self::set_media)
     /// / [`with_media`](Self::with_media) before `enter`ing nodes whose rules
     /// depend on it.
     media: MediaContext,
+    /// Opt-in compute cache. `None` (the default) means no caching: `enter` /
+    /// `leave` behave byte-for-byte identically to the uncached baseline. When
+    /// `Some`, every `enter` consults the cache and stores the result; the
+    /// cache auto-invalidates on stylesheet mutation via the generation check.
+    cache: Option<ComputeCache>,
+    /// The signature of each `enter`ed node, mirroring `stack` 1:1. Maintained
+    /// ONLY when `cache.is_some()` — used as the next child's `parent_sig` so
+    /// the ancestor chain is transitively folded into each child's signature.
+    sig_stack: Vec<u64>,
 }
 
 impl<'s> CascadeContext<'s> {
@@ -233,7 +251,10 @@ impl<'s> CascadeContext<'s> {
             scratch: ComputeScratch::new(),
             stack: Vec::new(),
             identity_stack: Vec::new(),
+            siblings: Vec::new(),
             media: MediaContext::default(),
+            cache: None,
+            sig_stack: Vec::new(),
         }
     }
 
@@ -249,6 +270,33 @@ impl<'s> CascadeContext<'s> {
     pub fn with_media(mut self, media: MediaContext) -> Self {
         self.media = media;
         self
+    }
+
+    /// Attach an opt-in [`ComputeCache`] with the given hard capacity, enabling
+    /// memoization across `enter` calls. `capacity == 0` attaches a cache that
+    /// never stores (effectively disabled, but `cache` is `Some`); the typical
+    /// choice is a small bound sized to the tree's working set.
+    ///
+    /// Once attached, every `enter` consults the cache before computing and
+    /// stores the result on a miss. The cache auto-invalidates on stylesheet
+    /// mutation: a `sheet.add(...)` / `tokens_mut()` / etc. bumps the sheet's
+    /// generation, which the cache detects on its next access and clears.
+    ///
+    /// **Combinator handling**: when the stylesheet `has_combinators()`, the
+    /// cached path uses the ancestors-aware compute ([combinators match]).
+    /// When it does not, the cheaper one-shot path is used. Both paths share
+    /// the same cache, so caching works regardless.
+    ///
+    /// [combinators match]: Stylesheet::compute_cached_ancestors
+    pub fn with_cache(mut self, capacity: usize) -> Self {
+        self.cache = Some(ComputeCache::new(capacity));
+        self
+    }
+
+    /// A reference to the attached cache, if any. Useful for tests that assert
+    /// on cache state (e.g. that a warm walk populated entries).
+    pub fn cache(&self) -> Option<&ComputeCache> {
+        self.cache.as_ref()
     }
 
     /// The currently active [`MediaContext`].
@@ -271,31 +319,98 @@ impl<'s> CascadeContext<'s> {
     pub fn enter(&mut self, node: &dyn StyledNode) -> ComputedStyle {
         let parent = self.stack.last();
         let has_comb = self.sheet.has_combinators();
-        let computed = if has_comb {
-            self.sheet.compute_with_ancestors_media(
-                node,
-                parent,
-                &mut self.scratch,
-                &self.identity_stack,
-                &self.media,
-            )
+        // D = the depth this node will sit at once pushed.
+        let depth = self.stack.len();
+
+        let (computed, sig) = if let Some(cache) = self.cache.as_mut() {
+            // Cached path. Build the parent's signature from the sig stack (the
+            // last pushed sig is this node's parent's sig, transitive).
+            let parent_sig = self.sig_stack.last().copied();
+            if has_comb {
+                let prev_sibs: &[NodeIdentity] = self
+                    .siblings
+                    .get(depth)
+                    .map(Vec::as_slice)
+                    .unwrap_or(&[]);
+                self.sheet.compute_cached_ancestors(
+                    node,
+                    parent,
+                    parent_sig,
+                    &self.identity_stack,
+                    prev_sibs,
+                    &self.media,
+                    &mut self.scratch,
+                    cache,
+                )
+            } else {
+                self.sheet.compute_cached(
+                    node,
+                    parent,
+                    parent_sig,
+                    &self.media,
+                    &mut self.scratch,
+                    cache,
+                )
+            }
         } else {
-            self.sheet
-                .compute_with_media(node, parent, &mut self.scratch, &self.media)
+            // Uncached path: byte-for-byte identical to the pre-cache baseline.
+            let c = if has_comb {
+                let prev_sibs: &[NodeIdentity] = self
+                    .siblings
+                    .get(depth)
+                    .map(Vec::as_slice)
+                    .unwrap_or(&[]);
+                self.sheet.compute_with_ancestors_media(
+                    node,
+                    parent,
+                    &mut self.scratch,
+                    &self.identity_stack,
+                    prev_sibs,
+                    &self.media,
+                )
+            } else {
+                self.sheet
+                    .compute_with_media(node, parent, &mut self.scratch, &self.media)
+            };
+            (c, 0)
         };
+
         self.stack.push(computed.clone());
+        if self.cache.is_some() {
+            self.sig_stack.push(sig);
+        }
         if has_comb {
             self.identity_stack.push(NodeIdentity::from_node(node));
+            // The node's children start with no previous siblings: ensure the
+            // slot at depth+1 exists and clear it.
+            let child_depth = depth + 1;
+            if self.siblings.len() <= child_depth {
+                self.siblings.resize_with(child_depth + 1, Vec::new);
+            }
+            self.siblings[child_depth].clear();
         }
         computed
     }
 
     /// Pop the most recently `enter`ed node (leaving its subtree).
     pub fn leave(&mut self) -> Option<ComputedStyle> {
-        // Keep the two stacks in sync: pop the identity stack iff it is
-        // maintained (i.e. only when the stylesheet has combinators).
+        // Keep the stacks in sync: pop the identity stack iff it is
+        // maintained (i.e. only when the stylesheet has combinators); pop the
+        // sig stack iff caching is on.
         if self.sheet.has_combinators() && !self.identity_stack.is_empty() {
-            self.identity_stack.pop();
+            let popped = self.identity_stack.pop().expect("identity stack non-empty");
+            // The departed node sat at depth D == self.stack.len() AFTER the
+            // style-stack pop below; but we read it before popping the style
+            // stack, so its depth is the current stack length minus 1. Record
+            // it as a previous sibling for the NEXT sibling at the same depth.
+            let depth = self.stack.len() - 1;
+            if self.siblings.len() <= depth {
+                self.siblings.resize_with(depth + 1, Vec::new);
+            }
+            self.siblings[depth].push(popped);
+        }
+        if self.cache.is_some() && !self.sig_stack.is_empty() {
+            self.sig_stack.pop();
         }
         self.stack.pop()
     }
@@ -433,13 +548,13 @@ impl Stylesheet {
     ) -> ComputedStyle {
         // `None` → cheap raw-args matching path (no NodeIdentity allocation).
         // Combinator selectors never match here; they need a CascadeContext.
-        self.compute_inner(node, parent, scratch, None, media)
+        self.compute_inner(node, parent, scratch, None, None, media)
     }
 
     /// Combinator- + media-aware compute: the full-featured entry point used by
     /// [`CascadeContext::enter`] when the stylesheet `has_combinators()`.
-    /// Evaluates selectors against `ancestors` and `@media` rules against
-    /// `media`.
+    /// Evaluates selectors against `ancestors` and `siblings` (for `+`/`~`)
+    /// and `@media` rules against `media`.
     ///
     /// [`CascadeContext::enter`]: crate::CascadeContext::enter
     pub(crate) fn compute_with_ancestors_media(
@@ -448,9 +563,74 @@ impl Stylesheet {
         parent: Option<&ComputedStyle>,
         scratch: &mut ComputeScratch,
         ancestors: &[NodeIdentity],
+        siblings: &[NodeIdentity],
         media: &MediaContext,
     ) -> ComputedStyle {
-        self.compute_inner(node, parent, scratch, Some(ancestors), media)
+        self.compute_inner(node, parent, scratch, Some(ancestors), Some(siblings), media)
+    }
+
+    /// Cached one-shot compute: like [`compute_with_media`](Self::compute_with_media)
+    /// but consults `cache` first. The returned `u64` is the node's signature —
+    /// pass it as the next child's `parent_sig` so the ancestor chain is
+    /// transitively captured by the signature fold.
+    ///
+    /// **Combinator limitation**: this one-shot path has no ancestor context
+    /// (same as [`compute_with_media`](Self::compute_with_media)), so
+    /// combinator selectors do NOT match here. For combinator-aware caching use
+    /// [`compute_cached_ancestors`](Self::compute_cached_ancestors) (which
+    /// [`CascadeContext::enter`](crate::CascadeContext::enter) picks
+    /// automatically when the stylesheet `has_combinators()`).
+    pub fn compute_cached(
+        &self,
+        node: &dyn StyledNode,
+        parent: Option<&ComputedStyle>,
+        parent_sig: Option<u64>,
+        media: &MediaContext,
+        scratch: &mut ComputeScratch,
+        cache: &mut ComputeCache,
+    ) -> (ComputedStyle, u64) {
+        let node_id = NodeIdentity::from_node(node);
+        let sig = node_signature(&node_id, parent_sig, &[], media);
+        if let Some(hit) = cache.get(sig, self.generation()) {
+            return (hit, sig);
+        }
+        let computed = self.compute_with_media(node, parent, scratch, media);
+        cache.insert(sig, computed.clone(), self.generation());
+        (computed, sig)
+    }
+
+    /// Cached combinator-aware compute: like
+    /// [`compute_with_ancestors_media`](Self::compute_with_ancestors_media) but
+    /// consults `cache` first. Used by
+    /// [`CascadeContext::enter`](crate::CascadeContext::enter) when the
+    /// stylesheet `has_combinators()` AND a cache is attached.
+    ///
+    /// The signature captures the ancestor chain via `parent_sig` (each
+    /// ancestor's sig folds its own parent's sig), so this is correct: a hit
+    /// against a signature built from the full ancestor stack yields the same
+    /// `ComputedStyle` as a fresh compute through
+    /// [`compute_with_ancestors_media`](Self::compute_with_ancestors_media).
+    #[allow(clippy::too_many_arguments)] // threading all combinator + cache context
+    pub(crate) fn compute_cached_ancestors(
+        &self,
+        node: &dyn StyledNode,
+        parent: Option<&ComputedStyle>,
+        parent_sig: Option<u64>,
+        ancestors: &[NodeIdentity],
+        siblings: &[NodeIdentity],
+        media: &MediaContext,
+        scratch: &mut ComputeScratch,
+        cache: &mut ComputeCache,
+    ) -> (ComputedStyle, u64) {
+        let node_id = NodeIdentity::from_node(node);
+        let sig = node_signature(&node_id, parent_sig, siblings, media);
+        if let Some(hit) = cache.get(sig, self.generation()) {
+            return (hit, sig);
+        }
+        let computed =
+            self.compute_with_ancestors_media(node, parent, scratch, ancestors, siblings, media);
+        cache.insert(sig, computed.clone(), self.generation());
+        (computed, sig)
     }
 
     /// Shared compute body. `ancestors` selects the matching path:
@@ -459,8 +639,9 @@ impl Stylesheet {
     ///   [`NodeIdentity`] is built; combinator selectors never match. This
     ///   preserves the no-combinator hot path's zero-allocation property.
     /// - `Some(stack)` — combinator-aware path: builds one `NodeIdentity` for
-    ///   the node and matches via [`Selector::matches_chain`] against `stack`.
-    ///   Used only when the stylesheet `has_combinators()`.
+    ///   the node and matches via [`Selector::matches_chain`] against `stack`
+    ///   and the `siblings` slice (empty when `siblings` is `None`, as on the
+    ///   one-shot paths). Used only when the stylesheet `has_combinators()`.
     ///
     /// `media` gates `@media`-tagged rules: a rule whose query does not match
     /// `media` is skipped. The check is `Option::is_some()`-fast for
@@ -471,6 +652,7 @@ impl Stylesheet {
         parent: Option<&ComputedStyle>,
         scratch: &mut ComputeScratch,
         ancestors: Option<&[NodeIdentity]>,
+        siblings: Option<&[NodeIdentity]>,
         media: &MediaContext,
     ) -> ComputedStyle {
         let rules = self.rules();
@@ -500,8 +682,9 @@ impl Stylesheet {
                 // Combinator-aware path: build one NodeIdentity for the node,
                 // then match every selector (combinator or not) via matches_chain.
                 let node_id = NodeIdentity::from_node(node);
+                let sibs: &[NodeIdentity] = siblings.unwrap_or(&[]);
                 for (i, r) in rules.iter().enumerate() {
-                    if r.selector.matches_chain(&node_id, stack)
+                    if r.selector.matches_chain(&node_id, stack, sibs)
                         && rule_media_matches(&r.media, media)
                     {
                         scratch.matching.push(i);
@@ -525,8 +708,10 @@ impl Stylesheet {
             own.inherit_from(&parent.style);
         }
 
-        // 4. var() resolution against the stylesheet's token table.
-        resolve_vars_in_place(&mut own, self.tokens());
+        // 4. var() resolution against the stylesheet's token table. The active
+        //    `MediaContext` is threaded in so `:root { --x }` overrides declared
+        //    inside a matching `@media` block participate.
+        resolve_vars_in_place(&mut own, self.tokens(), media);
 
         ComputedStyle::new(own)
     }
@@ -563,27 +748,33 @@ fn resolve_explicit_inherit(own: &mut CssStyle, parent: &CssStyle) {
 /// to a literal — including the `Color` nested inside a `border` spec. Color
 /// fields degrade to `Reset` on failure; length fields degrade to `Auto` —
 /// both lenient, neither panics.
-fn resolve_vars_in_place(style: &mut CssStyle, tokens: &ThemeTokens) {
-    resolve_color_field(&mut style.color, tokens);
-    resolve_color_field(&mut style.background, tokens);
-    resolve_color_field(&mut style.underline_color, tokens);
+///
+/// `media` gates `:root { --x }` overrides declared inside `@media` blocks: a
+/// matching query's overrides win over the default map (last-matching wins),
+/// with the default map always consulted as fallback. Pass
+/// [`MediaContext::default`] on the one-shot paths where media-gated tokens are
+/// documented not to apply.
+fn resolve_vars_in_place(style: &mut CssStyle, tokens: &ThemeTokens, media: &MediaContext) {
+    resolve_color_field(&mut style.color, tokens, media);
+    resolve_color_field(&mut style.background, tokens, media);
+    resolve_color_field(&mut style.underline_color, tokens, media);
     // The border color is a `Color` nested inside `Option<BorderSpec>`, so it is
     // not covered by the top-level field passes above. Resolve it here too, or a
     // `border: rounded var(--dim)` survives the cascade as a `Var` and `paint`
     // drops it — the border then draws with no explicit color.
     if let Some(border) = style.border.as_mut() {
-        resolve_color_field(&mut border.color, tokens);
+        resolve_color_field(&mut border.color, tokens, media);
     }
-    resolve_length_field(&mut style.width, tokens);
-    resolve_length_field(&mut style.height, tokens);
+    resolve_length_field(&mut style.width, tokens, media);
+    resolve_length_field(&mut style.height, tokens, media);
 }
 
-fn resolve_color_field(field: &mut Option<Color>, tokens: &ThemeTokens) {
+fn resolve_color_field(field: &mut Option<Color>, tokens: &ThemeTokens, media: &MediaContext) {
     if let Some(inner) = field {
         match inner {
             Color::Literal(_) | Color::Reset => {} // already concrete
             Color::Var { .. } | Color::Inherit => {
-                *field = Some(Color::Literal(token::resolve(inner, tokens)));
+                *field = Some(Color::Literal(token::resolve_with_media(inner, tokens, media)));
             }
         }
     }
@@ -594,10 +785,10 @@ fn resolve_color_field(field: &mut Option<Color>, tokens: &ThemeTokens) {
 /// untouched. Failures (undefined name, type mismatch, cycle) degrade to
 /// [`Length::Auto`] — consistent with the lenient color path degrading to
 /// `Reset`.
-fn resolve_length_field(field: &mut Option<Length>, tokens: &ThemeTokens) {
+fn resolve_length_field(field: &mut Option<Length>, tokens: &ThemeTokens, media: &MediaContext) {
     if let Some(inner) = field {
         if let Length::Var { .. } = inner {
-            *field = Some(token::resolve_length(inner, tokens));
+            *field = Some(token::resolve_length_with_media(inner, tokens, media));
         }
     }
 }
@@ -1452,6 +1643,176 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------
+    // Sibling combinators (`A + B`, `A ~ B`) via CascadeContext
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn adjacent_combinator_matches_preceding_sibling() {
+        // `Item + Item { color: red }` — three sibling Items under one parent.
+        // The 2nd and 3rd each have a preceding Item sibling; the 1st does not.
+        let mut sheet = Stylesheet::new();
+        sheet
+            .add("Item + Item", CssStyle::new().color(RC::Red), Origin::User)
+            .unwrap();
+        assert!(sheet.has_combinators());
+
+        let mut ctx = CascadeContext::new(&sheet);
+        let _root = ctx.enter(&OwnedNode::new("Root"));
+
+        let first = ctx.enter(&OwnedNode::new("Item"));
+        assert_eq!(first.style.color, None, "first Item has no preceding sibling");
+        ctx.leave();
+
+        let second = ctx.enter(&OwnedNode::new("Item"));
+        assert_eq!(
+            second.style.color,
+            Some(Color::literal(RC::Red)),
+            "second Item follows a sibling Item"
+        );
+        ctx.leave();
+
+        let third = ctx.enter(&OwnedNode::new("Item"));
+        assert_eq!(
+            third.style.color,
+            Some(Color::literal(RC::Red)),
+            "third Item follows a sibling Item"
+        );
+    }
+
+    #[test]
+    fn general_sibling_combinator_matches_any_preceding() {
+        // `Item ~ Item { color: blue }` — same three-item layout: 2nd and 3rd
+        // have at least one prior Item sibling.
+        let mut sheet = Stylesheet::new();
+        sheet
+            .add("Item ~ Item", CssStyle::new().color(RC::Blue), Origin::User)
+            .unwrap();
+
+        let mut ctx = CascadeContext::new(&sheet);
+        let _root = ctx.enter(&OwnedNode::new("Root"));
+
+        let first = ctx.enter(&OwnedNode::new("Item"));
+        assert_eq!(first.style.color, None);
+        ctx.leave();
+
+        let second = ctx.enter(&OwnedNode::new("Item"));
+        assert_eq!(second.style.color, Some(Color::literal(RC::Blue)));
+        ctx.leave();
+
+        let third = ctx.enter(&OwnedNode::new("Item"));
+        assert_eq!(third.style.color, Some(Color::literal(RC::Blue)));
+    }
+
+    #[test]
+    fn adjacent_combinator_requires_immediate_predecessor_type() {
+        // `Header + Content` — Content matches only when its immediately
+        // preceding sibling is Header. A Sidebar predecessor must NOT trigger.
+        let mut sheet = Stylesheet::new();
+        sheet
+            .add("Header + Content", CssStyle::new().color(RC::Green), Origin::User)
+            .unwrap();
+
+        let mut ctx = CascadeContext::new(&sheet);
+        let _root = ctx.enter(&OwnedNode::new("Root"));
+
+        // Sidebar then Content — immediate predecessor is Sidebar, not Header.
+        let _sidebar = ctx.enter(&OwnedNode::new("Sidebar"));
+        ctx.leave();
+        let content = ctx.enter(&OwnedNode::new("Content"));
+        assert_eq!(content.style.color, None);
+
+        ctx.leave();
+        // Now Header then Content — match.
+        let _header = ctx.enter(&OwnedNode::new("Header"));
+        ctx.leave();
+        let content2 = ctx.enter(&OwnedNode::new("Content"));
+        assert_eq!(content2.style.color, Some(Color::literal(RC::Green)));
+    }
+
+    #[test]
+    fn sibling_plus_descendant_combinator() {
+        // `Panel Item + Item` — an Item that follows an Item sibling, both
+        // inside Panel (Panel as ancestor). Exercises the sibling + descendant
+        // combination through the full CascadeContext path.
+        let mut sheet = Stylesheet::new();
+        sheet
+            .add("Panel Item + Item", CssStyle::new().color(RC::Red), Origin::User)
+            .unwrap();
+
+        let mut ctx = CascadeContext::new(&sheet);
+        let _root = ctx.enter(&OwnedNode::new("Root"));
+        let _panel = ctx.enter(&OwnedNode::new("Panel"));
+
+        let first = ctx.enter(&OwnedNode::new("Item"));
+        assert_eq!(first.style.color, None);
+        ctx.leave();
+
+        let second = ctx.enter(&OwnedNode::new("Item"));
+        assert_eq!(second.style.color, Some(Color::literal(RC::Red)));
+    }
+
+    #[test]
+    fn sibling_lists_reset_on_new_parent() {
+        // Items under ParentA, then items under ParentB: a ParentB item must
+        // NOT see ParentA's items as siblings. Verifies the `siblings[D+1]`
+        // clear on enter resets the children context.
+        let mut sheet = Stylesheet::new();
+        sheet
+            .add("Item + Item", CssStyle::new().color(RC::Red), Origin::User)
+            .unwrap();
+
+        let mut ctx = CascadeContext::new(&sheet);
+        let _root = ctx.enter(&OwnedNode::new("Root"));
+
+        // ParentA: Item, Item (the second matches `Item + Item`).
+        let _pa = ctx.enter(&OwnedNode::new("ParentA"));
+        let _pa_first = ctx.enter(&OwnedNode::new("Item"));
+        ctx.leave();
+        let _pa_second = ctx.enter(&OwnedNode::new("Item"));
+        assert_eq!(_pa_second.style.color, Some(Color::literal(RC::Red)));
+        ctx.leave();
+        ctx.leave(); // leave ParentA
+
+        // ParentB: first Item must NOT see ParentA's second Item as a sibling.
+        let _pb = ctx.enter(&OwnedNode::new("ParentB"));
+        let pb_first = ctx.enter(&OwnedNode::new("Item"));
+        assert_eq!(pb_first.style.color, None, "ParentB's first item has no prior sibling");
+    }
+
+    #[test]
+    fn sibling_combinator_does_not_match_one_shot() {
+        // Documented limitation: the one-shot compute() path has no sibling
+        // context, so a `+`/`~` selector does NOT apply there.
+        let mut sheet = Stylesheet::new();
+        sheet
+            .add("Item + Item", CssStyle::new().color(RC::Red), Origin::User)
+            .unwrap();
+
+        let node = OwnedNode::new("Item");
+        let c = sheet.compute(&node, None);
+        assert_eq!(c.style.color, None);
+    }
+
+    #[test]
+    fn descendant_combinator_still_matches_via_context() {
+        // Regression: existing descendant/child combinators keep working after
+        // the sibling-tracking plumbing lands.
+        let mut sheet = Stylesheet::new();
+        sheet
+            .add("Panel Button", CssStyle::new().color(RC::Yellow), Origin::User)
+            .unwrap();
+        sheet
+            .add("Panel > Button", CssStyle::new().bold(), Origin::User)
+            .unwrap();
+
+        let mut ctx = CascadeContext::new(&sheet);
+        let _panel = ctx.enter(&OwnedNode::new("Panel"));
+        let btn = ctx.enter(&OwnedNode::new("Button"));
+        assert_eq!(btn.style.color, Some(Color::literal(RC::Yellow)));
+        assert!(btn.style.weight.is_some());
+    }
+
+    // ---------------------------------------------------------------------
     // @media queries
     // ---------------------------------------------------------------------
 
@@ -1550,5 +1911,378 @@ mod tests {
         let _panel2 = ctx.enter(&OwnedNode::new("Panel"));
         let btn2 = ctx.enter(&OwnedNode::new("Button"));
         assert_eq!(btn2.style.color, None);
+    }
+
+    // ---------------------------------------------------------------------
+    // Media-gated :root token resolution end-to-end (P4-3)
+    // ---------------------------------------------------------------------
+
+    fn media_token_sheet() -> Stylesheet {
+        // :root default = red; @media (min-width: 80) override = blue.
+        Stylesheet::parse(
+            ":root { --accent: red } @media (min-width: 80) { :root { --accent: blue } } .a { color: var(--accent); }",
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn media_gated_token_resolves_blue_under_matching_context() {
+        let sheet = media_token_sheet();
+        let mut ctx = CascadeContext::new(&sheet).with_media(MediaContext {
+            cols: 100,
+            ..Default::default()
+        });
+        let a = ctx.enter(&OwnedNode::new("Div").with_classes(["a"]));
+        assert_eq!(a.style.color, Some(Color::literal(RC::Blue)));
+    }
+
+    #[test]
+    fn media_gated_token_resolves_red_under_non_matching_context() {
+        let sheet = media_token_sheet();
+        let mut ctx = CascadeContext::new(&sheet).with_media(MediaContext {
+            cols: 60,
+            ..Default::default()
+        });
+        let a = ctx.enter(&OwnedNode::new("Div").with_classes(["a"]));
+        assert_eq!(a.style.color, Some(Color::literal(RC::Red)));
+    }
+
+    #[test]
+    fn media_gated_token_resolves_default_via_one_shot_compute() {
+        // The one-shot compute path uses a default MediaContext, so the
+        // media-gated override does NOT apply — only the default (red) does.
+        let sheet = media_token_sheet();
+        let a = sheet.compute(&OwnedNode::new("Div").with_classes(["a"]), None);
+        assert_eq!(a.style.color, Some(Color::literal(RC::Red)));
+    }
+
+    #[test]
+    fn media_gated_token_via_compute_with_media() {
+        let sheet = media_token_sheet();
+        let mut scratch = ComputeScratch::new();
+        let node = OwnedNode::new("Div").with_classes(["a"]);
+        // Matching → blue.
+        let large = MediaContext { cols: 100, ..Default::default() };
+        let c_large = sheet.compute_with_media(&node, None, &mut scratch, &large);
+        assert_eq!(c_large.style.color, Some(Color::literal(RC::Blue)));
+        // Non-matching → red.
+        let small = MediaContext { cols: 60, ..Default::default() };
+        let c_small = sheet.compute_with_media(&node, None, &mut scratch, &small);
+        assert_eq!(c_small.style.color, Some(Color::literal(RC::Red)));
+    }
+
+    #[test]
+    fn non_media_tokens_still_resolve_as_before() {
+        // Regression: a plain :root token (no @media) resolves exactly as before
+        // under both the one-shot and context paths.
+        let sheet = Stylesheet::parse(
+            ":root { --c: #abcdef } .x { color: var(--c); }",
+        )
+        .unwrap();
+        let node = OwnedNode::new("Div").with_classes(["x"]);
+        let one_shot = sheet.compute(&node, None);
+        assert_eq!(
+            one_shot.style.color,
+            Some(Color::literal(RC::Rgb(0xab, 0xcd, 0xef)))
+        );
+        let mut ctx = CascadeContext::new(&sheet);
+        let via_ctx = ctx.enter(&node);
+        assert_eq!(via_ctx.style.color, one_shot.style.color);
+    }
+
+    // ---------------------------------------------------------------------
+    // ComputeCache via CascadeContext (P4-4)
+    // ---------------------------------------------------------------------
+
+    /// Walk a 3-level tree (Root → Panel → Text) once through `ctx`, capturing
+    /// each node's `ComputedStyle` into `out` in enter order.
+    fn walk_tree_cached(ctx: &mut CascadeContext<'_>, out: &mut Vec<ComputedStyle>) {
+        out.push(ctx.enter(&OwnedNode::new("Root")));
+        out.push(ctx.enter(&OwnedNode::new("Panel")));
+        out.push(ctx.enter(&OwnedNode::new("Text")));
+        ctx.leave();
+        ctx.leave();
+        ctx.leave();
+    }
+
+    #[test]
+    fn cache_warm_walk_produces_identical_styles() {
+        // First (cold) walk misses; second (warm) walk hits on every node.
+        // Correctness invariant: the warm walk's results are byte-identical to
+        // the cold walk's.
+        let mut sheet = Stylesheet::new();
+        sheet.add("Root", CssStyle::new().color(RC::Red), Origin::User).unwrap();
+        sheet.add("Panel", CssStyle::new().padding("1"), Origin::User).unwrap();
+        sheet.add("Text", CssStyle::new().bold(), Origin::User).unwrap();
+
+        let mut ctx = CascadeContext::new(&sheet).with_cache(16);
+        let mut cold = Vec::new();
+        walk_tree_cached(&mut ctx, &mut cold);
+        // After the cold walk the cache holds 3 distinct signatures.
+        assert_eq!(ctx.cache().unwrap().len(), 3);
+
+        // Second walk — should be served entirely from the cache.
+        let mut warm = Vec::new();
+        walk_tree_cached(&mut ctx, &mut warm);
+
+        // Correctness: warm == cold.
+        assert_eq!(warm.len(), cold.len());
+        for (i, (w, c)) in warm.iter().zip(cold.iter()).enumerate() {
+            assert_eq!(w, c, "warm walk node {i} differs from cold walk");
+        }
+        // The cache size is unchanged (no new inserts on a warm walk).
+        assert_eq!(ctx.cache().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn cache_invalidated_by_stylesheet_mutation() {
+        // After sheet.add(...), the generation bumps and the next compute must
+        // recompute (cache cleared). The new rule's effect must show up.
+        //
+        // We use the one-shot compute_cached API directly because CascadeContext
+        // borrows the sheet immutably for its whole lifetime — a real host
+        // drops the context, mutates the sheet, then rebuilds it. The cache
+        // here stands in for a cache the host carries across frames.
+        let mut sheet = Stylesheet::new();
+        sheet.add("Text", CssStyle::new().color(RC::Red), Origin::User).unwrap();
+
+        let mut scratch = ComputeScratch::new();
+        let mut cache = ComputeCache::new(8);
+        let media = MediaContext::default();
+        let node = OwnedNode::new("Text");
+
+        let (text1, sig1) = sheet.compute_cached(&node, None, None, &media, &mut scratch, &mut cache);
+        assert_eq!(text1.style.color, Some(Color::literal(RC::Red)));
+        assert_eq!(cache.len(), 1);
+
+        // Mutate the sheet — generation bumps, cache auto-invalidates on next access.
+        sheet.add("Text", CssStyle::new().color(RC::Blue), Origin::User).unwrap();
+
+        // Re-compute: the cache detects the gen mismatch and clears; the new
+        // (later, same-specificity) rule wins → Blue.
+        let (text2, sig2) = sheet.compute_cached(&node, None, None, &media, &mut scratch, &mut cache);
+        assert_eq!(
+            text2.style.color,
+            Some(Color::literal(RC::Blue)),
+            "mutation must invalidate the cache"
+        );
+        // The signature is the same (same node, same media, same parent), but
+        // the cache was cleared by the gen mismatch and repopulated.
+        assert_eq!(sig1, sig2);
+        assert_eq!(cache.len(), 1);
+    }
+
+    #[test]
+    fn cache_invalidated_by_tokens_mut() {
+        // tokens_mut bumps gen, so a downstream var() resolution changes.
+        let mut sheet = Stylesheet::with_tokens(
+            crate::token::ThemeTokens::new().set("accent", Color::literal(RC::Red)),
+        );
+        sheet.add(".a", CssStyle::new().color(Color::var("accent")), Origin::User).unwrap();
+
+        let mut scratch = ComputeScratch::new();
+        let mut cache = ComputeCache::new(8);
+        let media = MediaContext::default();
+        let node = OwnedNode::new("Div").with_classes(["a"]);
+
+        let (a1, _) = sheet.compute_cached(&node, None, None, &media, &mut scratch, &mut cache);
+        assert_eq!(a1.style.color, Some(Color::literal(RC::Red)));
+
+        // Mutate the token via tokens_mut — gen bumps.
+        sheet.tokens_mut().insert("accent", Color::literal(RC::Blue));
+
+        let (a2, _) = sheet.compute_cached(&node, None, None, &media, &mut scratch, &mut cache);
+        assert_eq!(
+            a2.style.color,
+            Some(Color::literal(RC::Blue)),
+            "tokens_mut must invalidate the cache so the var re-resolves"
+        );
+    }
+
+    #[test]
+    fn cache_invalidated_by_media_change() {
+        // Media is part of the signature, so changing the active media context
+        // produces different signatures and naturally recomputes.
+        let sheet = Stylesheet::parse(
+            "@media (min-width: 80) { Button { color: red; } }",
+        )
+        .unwrap();
+
+        let mut ctx = CascadeContext::new(&sheet).with_cache(8).with_media(MediaContext {
+            cols: 100,
+            ..Default::default()
+        });
+        let big = ctx.enter(&OwnedNode::new("Button"));
+        assert_eq!(big.style.color, Some(Color::literal(RC::Red)));
+        ctx.leave();
+
+        // Switch to a non-matching context: the signature differs (media is
+        // folded in), so the cache misses and the rule no longer applies.
+        ctx.set_media(MediaContext { cols: 40, ..Default::default() });
+        let small = ctx.enter(&OwnedNode::new("Button"));
+        assert_eq!(small.style.color, None);
+    }
+
+    #[test]
+    fn cache_parent_dependency_different_parents() {
+        // Two nodes with identical identity but different parents inherit
+        // differently → different signatures → different results.
+        let mut sheet = Stylesheet::new();
+        sheet.add("Red", CssStyle::new().color(RC::Red), Origin::User).unwrap();
+        sheet.add("Blue", CssStyle::new().color(RC::Blue), Origin::User).unwrap();
+        // Child has no color of its own — inherits.
+        sheet.add("Child", CssStyle::new(), Origin::User).unwrap();
+
+        let mut ctx = CascadeContext::new(&sheet).with_cache(8);
+
+        // Branch A: Red → Child
+        let _red = ctx.enter(&OwnedNode::new("Red"));
+        let child_a = ctx.enter(&OwnedNode::new("Child"));
+        assert_eq!(child_a.style.color, Some(Color::literal(RC::Red)));
+        ctx.leave();
+        ctx.leave();
+
+        // Branch B: Blue → Child
+        let _blue = ctx.enter(&OwnedNode::new("Blue"));
+        let child_b = ctx.enter(&OwnedNode::new("Child"));
+        assert_eq!(
+            child_b.style.color,
+            Some(Color::literal(RC::Blue)),
+            "identical Child node with a different parent must produce a different result"
+        );
+    }
+
+    #[test]
+    fn cache_works_with_combinator_sheet_descendant() {
+        // A sheet with a descendant combinator (`Panel Text`) walked via
+        // with_cache must still match — the cached-ancestors path is used.
+        let mut sheet = Stylesheet::new();
+        sheet.add("Panel Text", CssStyle::new().color(RC::Green), Origin::User).unwrap();
+        assert!(sheet.has_combinators());
+
+        let mut ctx = CascadeContext::new(&sheet).with_cache(8);
+        let _root = ctx.enter(&OwnedNode::new("Root"));
+        let _panel = ctx.enter(&OwnedNode::new("Panel"));
+        let text = ctx.enter(&OwnedNode::new("Text"));
+        assert_eq!(text.style.color, Some(Color::literal(RC::Green)));
+
+        // Second walk — the cached result is served and still matches.
+        ctx.leave();
+        ctx.leave();
+        ctx.leave();
+        let _root = ctx.enter(&OwnedNode::new("Root"));
+        let _panel = ctx.enter(&OwnedNode::new("Panel"));
+        let text2 = ctx.enter(&OwnedNode::new("Text"));
+        assert_eq!(text2.style.color, Some(Color::literal(RC::Green)));
+        assert_eq!(text2, text, "warm cached walk == cold walk for combinators");
+    }
+
+    #[test]
+    fn cache_works_with_combinator_sheet_child() {
+        // Child combinator + cache.
+        let mut sheet = Stylesheet::new();
+        sheet.add("Panel > Text", CssStyle::new().color(RC::Blue), Origin::User).unwrap();
+        assert!(sheet.has_combinators());
+
+        let mut ctx = CascadeContext::new(&sheet).with_cache(8);
+        let _root = ctx.enter(&OwnedNode::new("Root"));
+        let _panel = ctx.enter(&OwnedNode::new("Panel"));
+        let text = ctx.enter(&OwnedNode::new("Text"));
+        assert_eq!(text.style.color, Some(Color::literal(RC::Blue)));
+    }
+
+    #[test]
+    fn cache_works_with_sibling_combinator() {
+        // `Item + Item` + cache: the sibling identities are folded into the
+        // parent signature transitively... actually they are NOT directly in
+        // the signature, so we assert this carefully: the cached-ancestors
+        // path is used, and the rule applies on the cold walk. On a warm walk
+        // with the SAME sibling structure, the result is stable.
+        let mut sheet = Stylesheet::new();
+        sheet.add("Item + Item", CssStyle::new().color(RC::Red), Origin::User).unwrap();
+        assert!(sheet.has_combinators());
+
+        let mut ctx = CascadeContext::new(&sheet).with_cache(16);
+        let _root = ctx.enter(&OwnedNode::new("Root"));
+
+        let first = ctx.enter(&OwnedNode::new("Item"));
+        assert_eq!(first.style.color, None);
+        ctx.leave();
+        let second = ctx.enter(&OwnedNode::new("Item"));
+        assert_eq!(second.style.color, Some(Color::literal(RC::Red)));
+        ctx.leave();
+        ctx.leave();
+
+        // Warm walk with the same structure.
+        let _root = ctx.enter(&OwnedNode::new("Root"));
+        let first2 = ctx.enter(&OwnedNode::new("Item"));
+        assert_eq!(first2.style.color, None);
+        ctx.leave();
+        let second2 = ctx.enter(&OwnedNode::new("Item"));
+        assert_eq!(second2.style.color, Some(Color::literal(RC::Red)));
+    }
+
+    #[test]
+    fn cache_off_context_behaves_identically() {
+        // Regression: a CascadeContext WITHOUT with_cache is byte-for-byte
+        // identical to the uncached baseline. We assert by comparing against
+        // the manual compute() chain for a 3-level tree.
+        let mut sheet = Stylesheet::new();
+        sheet.add("Root", CssStyle::new().color(RC::Red), Origin::User).unwrap();
+        sheet.add("Panel", CssStyle::new().padding("1"), Origin::User).unwrap();
+        sheet.add("Text", CssStyle::new().bold(), Origin::User).unwrap();
+
+        // Context path (no cache).
+        let mut ctx = CascadeContext::new(&sheet);
+        let ctx_root = ctx.enter(&OwnedNode::new("Root"));
+        let ctx_panel = ctx.enter(&OwnedNode::new("Panel"));
+        let ctx_text = ctx.enter(&OwnedNode::new("Text"));
+
+        // Manual threading.
+        let man_root = sheet.compute(&OwnedNode::new("Root"), None);
+        let man_panel = sheet.compute(&OwnedNode::new("Panel"), Some(&man_root));
+        let man_text = sheet.compute(&OwnedNode::new("Text"), Some(&man_panel));
+
+        assert_eq!(ctx_root, man_root);
+        assert_eq!(ctx_panel, man_panel);
+        assert_eq!(ctx_text, man_text);
+
+        // No cache attached.
+        assert!(ctx.cache().is_none());
+    }
+
+    #[test]
+    fn cache_recomputes_correctly_after_mixed_tree_walks() {
+        // Stress: walk a tree with siblings, leave, walk a different shape,
+        // then re-walk the first. The cache must stay correct — every signature
+        // is built fresh from the current ancestor chain, so identical subtrees
+        // share entries.
+        let mut sheet = Stylesheet::new();
+        sheet.add("A", CssStyle::new().color(RC::Red), Origin::User).unwrap();
+        sheet.add("B", CssStyle::new().color(RC::Blue), Origin::User).unwrap();
+
+        let mut ctx = CascadeContext::new(&sheet).with_cache(32);
+
+        // Walk A → B.
+        let _ = ctx.enter(&OwnedNode::new("A"));
+        let b1 = ctx.enter(&OwnedNode::new("B"));
+        assert_eq!(b1.style.color, Some(Color::literal(RC::Blue)));
+        ctx.leave();
+        ctx.leave();
+
+        // Walk B → A (different structure).
+        let _ = ctx.enter(&OwnedNode::new("B"));
+        let a1 = ctx.enter(&OwnedNode::new("A"));
+        // A has its own color (Red), does not inherit Blue from B (color is
+        // inheritable but A's rule sets Red explicitly).
+        assert_eq!(a1.style.color, Some(Color::literal(RC::Red)));
+        ctx.leave();
+        ctx.leave();
+
+        // Re-walk A → B — identical to the first, should be served from cache.
+        let _ = ctx.enter(&OwnedNode::new("A"));
+        let b2 = ctx.enter(&OwnedNode::new("B"));
+        assert_eq!(b2.style.color, Some(Color::literal(RC::Blue)));
+        assert_eq!(b2, b1, "re-walked subtree is identical to the first");
     }
 }
