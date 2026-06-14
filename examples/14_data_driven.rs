@@ -23,7 +23,6 @@ use ratatui::{
     text::Line,
     widgets::{Block, ListItem, Paragraph},
 };
-use serde_json;
 use ratatui_style::{CascadeContext, ComputeScratch, CssStyle, OwnedNode, Stylesheet};
 
 type Term = Terminal<CrosstermBackend<Stdout>>;

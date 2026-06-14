@@ -14,7 +14,7 @@ use ratatui::{
     widgets::Block,
 };
 
-use crate::box_model::{BorderStyle, BorderSpec, BoxEdges, IntoBorderSpec, IntoBoxEdges, Length};
+use crate::box_model::{BorderSpec, BorderStyle, BoxEdges, IntoBorderSpec, IntoBoxEdges, Length};
 use crate::color::Color;
 use crate::error::{CssError, Result};
 
@@ -113,7 +113,9 @@ impl TextDecoration {
     pub fn parse(s: &str) -> Result<Self> {
         let lower = s.trim().to_ascii_lowercase();
         let u = lower.split_whitespace().any(|t| t == "underline");
-        let l = lower.split_whitespace().any(|t| t == "line-through" || t == "strikethrough");
+        let l = lower
+            .split_whitespace()
+            .any(|t| t == "line-through" || t == "strikethrough");
         Ok(match (u, l) {
             (false, false) => Self::None,
             (true, false) => Self::Underline,
@@ -405,8 +407,16 @@ impl CssStyle {
         if self.width.is_none() && self.height.is_none() {
             return None;
         }
-        let w = self.width.as_ref().map(|l| l.to_constraint()).unwrap_or(Constraint::Min(0));
-        let h = self.height.as_ref().map(|l| l.to_constraint()).unwrap_or(Constraint::Min(0));
+        let w = self
+            .width
+            .as_ref()
+            .map(|l| l.to_constraint())
+            .unwrap_or(Constraint::Min(0));
+        let h = self
+            .height
+            .as_ref()
+            .map(|l| l.to_constraint())
+            .unwrap_or(Constraint::Min(0));
         Some((w, h))
     }
 
@@ -436,16 +446,30 @@ impl From<ratatui::style::Color> for Color {
 #[cfg(feature = "serde")]
 mod serde_impl {
     use super::{Align, BorderStyle, CssStyle, FontStyle, TextDecoration, Weight};
-    use serde::de::Error as DeError;
-    use serde::ser::Error as SerError;
-    use serde::{de::DeserializeOwned, Deserialize, Deserializer, Serialize, Serializer};
-    use serde_json::{Map, Value};
+    use crate::color::Color;
+    use serde::de::{self, MapAccess, Visitor};
+    use serde::ser::SerializeMap;
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+    use std::fmt;
 
-    // --- keyword enums ---
+    // --- keyword enums (format-agnostic str visitors) ---
 
     impl<'de> Deserialize<'de> for Align {
         fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-            Align::parse(&String::deserialize(d)?).map_err(DeError::custom)
+            struct AlignVisitor;
+            impl<'de> Visitor<'de> for AlignVisitor {
+                type Value = Align;
+                fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                    f.write_str("a text-align keyword")
+                }
+                fn visit_str<E: de::Error>(self, v: &str) -> Result<Align, E> {
+                    Align::parse(v).map_err(E::custom)
+                }
+                fn visit_string<E: de::Error>(self, v: String) -> Result<Align, E> {
+                    Align::parse(&v).map_err(E::custom)
+                }
+            }
+            d.deserialize_str(AlignVisitor)
         }
     }
     impl Serialize for Align {
@@ -456,7 +480,20 @@ mod serde_impl {
 
     impl<'de> Deserialize<'de> for FontStyle {
         fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-            FontStyle::parse(&String::deserialize(d)?).map_err(DeError::custom)
+            struct FontStyleVisitor;
+            impl<'de> Visitor<'de> for FontStyleVisitor {
+                type Value = FontStyle;
+                fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                    f.write_str("a font-style keyword")
+                }
+                fn visit_str<E: de::Error>(self, v: &str) -> Result<FontStyle, E> {
+                    FontStyle::parse(v).map_err(E::custom)
+                }
+                fn visit_string<E: de::Error>(self, v: String) -> Result<FontStyle, E> {
+                    FontStyle::parse(&v).map_err(E::custom)
+                }
+            }
+            d.deserialize_str(FontStyleVisitor)
         }
     }
     impl Serialize for FontStyle {
@@ -465,30 +502,22 @@ mod serde_impl {
         }
     }
 
-    impl<'de> Deserialize<'de> for Weight {
-        fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-            match Value::deserialize(d)? {
-                // JSON may carry a bare number (≥600 → bold); everything else
-                // funnels through the shared string parser.
-                Value::Number(n) => Ok(if n.as_i64().map(|i| i >= 600).unwrap_or(false) {
-                    Weight::Bold
-                } else {
-                    Weight::Normal
-                }),
-                Value::String(s) => Weight::parse(&s).map_err(DeError::custom),
-                other => Err(DeError::custom(format!("invalid font-weight: {other}"))),
-            }
-        }
-    }
-    impl Serialize for Weight {
-        fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
-            s.serialize_str(self.as_str())
-        }
-    }
-
     impl<'de> Deserialize<'de> for TextDecoration {
         fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-            TextDecoration::parse(&String::deserialize(d)?).map_err(DeError::custom)
+            struct TextDecorationVisitor;
+            impl<'de> Visitor<'de> for TextDecorationVisitor {
+                type Value = TextDecoration;
+                fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                    f.write_str("a text-decoration keyword")
+                }
+                fn visit_str<E: de::Error>(self, v: &str) -> Result<TextDecoration, E> {
+                    TextDecoration::parse(v).map_err(E::custom)
+                }
+                fn visit_string<E: de::Error>(self, v: String) -> Result<TextDecoration, E> {
+                    TextDecoration::parse(&v).map_err(E::custom)
+                }
+            }
+            d.deserialize_str(TextDecorationVisitor)
         }
     }
     impl Serialize for TextDecoration {
@@ -497,76 +526,199 @@ mod serde_impl {
         }
     }
 
-    // --- CssStyle as a property map ---
-
-    fn parse_opt<T: DeserializeOwned>(v: Value) -> Result<Option<T>, serde_json::Error> {
-        if v.is_null() {
-            return Ok(None);
+    impl<'de> Deserialize<'de> for Weight {
+        fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+            // A font-weight may be a keyword ("bold"/"normal") or a numeric
+            // weight (≥600 → bold). `deserialize_any` lets the same impl accept
+            // a TOML/YAML/JSON integer or string with no intermediate Value.
+            struct WeightVisitor;
+            impl<'de> Visitor<'de> for WeightVisitor {
+                type Value = Weight;
+                fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                    f.write_str("a font-weight keyword or number")
+                }
+                fn visit_i64<E: de::Error>(self, v: i64) -> Result<Weight, E> {
+                    Ok(if v >= 600 {
+                        Weight::Bold
+                    } else {
+                        Weight::Normal
+                    })
+                }
+                fn visit_u64<E: de::Error>(self, v: u64) -> Result<Weight, E> {
+                    Ok(if v >= 600 {
+                        Weight::Bold
+                    } else {
+                        Weight::Normal
+                    })
+                }
+                fn visit_f64<E: de::Error>(self, v: f64) -> Result<Weight, E> {
+                    Ok(if v >= 600.0 {
+                        Weight::Bold
+                    } else {
+                        Weight::Normal
+                    })
+                }
+                fn visit_str<E: de::Error>(self, v: &str) -> Result<Weight, E> {
+                    Weight::parse(v).map_err(E::custom)
+                }
+                fn visit_string<E: de::Error>(self, v: String) -> Result<Weight, E> {
+                    Weight::parse(&v).map_err(E::custom)
+                }
+            }
+            d.deserialize_any(WeightVisitor)
         }
-        serde_json::from_value(v).map(Some)
     }
+    impl Serialize for Weight {
+        fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+            s.serialize_str(self.as_str())
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // CssStyle — deserialize a property map keyed by CSS property names.
+    //
+    // Format-agnostic: a `Visitor` whose `visit_map` walks entries and
+    // dispatches each key to the typed leaf's own Deserialize via
+    // `next_value::<T>()`. No `serde_json::Value` is materialized, so the same
+    // path serves JSON objects, TOML tables, and YAML mappings. Null values
+    // are handled by deserializing each field as `Option<T>` (serde's Option
+    // visitor maps null/nil/unit to None and anything else to Some).
+    // -------------------------------------------------------------------------
 
     impl<'de> Deserialize<'de> for CssStyle {
         fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-            let map = Map::<String, Value>::deserialize(d)?;
-            let mut s = CssStyle::default();
-            for (key, val) in map {
-                let res: Result<(), &str> = match key.to_ascii_lowercase().as_str() {
-                    "color" => parse_opt(val).map(|v| s.color = v).map_err(|_| "color"),
-                    "background" | "background-color" => {
-                        parse_opt(val).map(|v| s.background = v).map_err(|_| "background")
+            struct CssStyleVisitor;
+
+            impl<'de> Visitor<'de> for CssStyleVisitor {
+                type Value = CssStyle;
+
+                fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                    f.write_str("a CSS style declaration map")
+                }
+
+                fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<CssStyle, A::Error> {
+                    let mut s = CssStyle::default();
+                    while let Some(key) = map.next_key::<String>()? {
+                        match key.to_ascii_lowercase().as_str() {
+                            "color" => {
+                                s.color = map.next_value()?;
+                            }
+                            "background" | "background-color" => {
+                                s.background = map.next_value()?;
+                            }
+                            "font-weight" => {
+                                s.weight = map.next_value()?;
+                            }
+                            "font-style" => {
+                                s.font_style = map.next_value()?;
+                            }
+                            "text-decoration" => {
+                                s.decoration = map.next_value()?;
+                            }
+                            "underline-color" => {
+                                s.underline_color = map.next_value()?;
+                            }
+                            "padding" => {
+                                s.padding = map.next_value()?;
+                            }
+                            "margin" => {
+                                s.margin = map.next_value()?;
+                            }
+                            "border" => {
+                                s.border = map.next_value()?;
+                            }
+                            "border-style" => {
+                                let v: Option<BorderStyle> = map.next_value()?;
+                                s.border_mut().style = v.unwrap_or_default();
+                            }
+                            "border-color" => {
+                                let v: Option<Color> = map.next_value()?;
+                                if let Some(c) = v {
+                                    s.border_mut().color = Some(c);
+                                }
+                            }
+                            "text-align" => {
+                                s.text_align = map.next_value()?;
+                            }
+                            "width" => {
+                                s.width = map.next_value()?;
+                            }
+                            "height" => {
+                                s.height = map.next_value()?;
+                            }
+                            // Unknown property → read & discard (forward-compat).
+                            _ => {
+                                let _: de::IgnoredAny = map.next_value()?;
+                            }
+                        }
                     }
-                    "font-weight" => parse_opt(val).map(|v| s.weight = v).map_err(|_| "font-weight"),
-                    "font-style" => parse_opt(val).map(|v| s.font_style = v).map_err(|_| "font-style"),
-                    "text-decoration" => {
-                        parse_opt(val).map(|v| s.decoration = v).map_err(|_| "text-decoration")
-                    }
-                    "underline-color" => {
-                        parse_opt(val).map(|v| s.underline_color = v).map_err(|_| "underline-color")
-                    }
-                    "padding" => parse_opt(val).map(|v| s.padding = v).map_err(|_| "padding"),
-                    "margin" => parse_opt(val).map(|v| s.margin = v).map_err(|_| "margin"),
-                    "border" => parse_opt(val).map(|v| s.border = v).map_err(|_| "border"),
-                    "border-style" => parse_opt::<BorderStyle>(val)
-                        .map(|v| s.border_mut().style = v.unwrap_or_default())
-                        .map_err(|_| "border-style"),
-                    "border-color" => parse_opt(val)
-                        .map(|v| s.border_mut().color = v)
-                        .map_err(|_| "border-color"),
-                    "text-align" => parse_opt(val).map(|v| s.text_align = v).map_err(|_| "text-align"),
-                    "width" => parse_opt(val).map(|v| s.width = v).map_err(|_| "width"),
-                    "height" => parse_opt(val).map(|v| s.height = v).map_err(|_| "height"),
-                    _ => continue, // unknown property → ignored (forward-compat)
-                };
-                res.map_err(|name| DeError::custom(format!("invalid {name} value")))?;
+                    Ok(s)
+                }
             }
-            Ok(s)
+
+            d.deserialize_map(CssStyleVisitor)
         }
     }
 
     impl Serialize for CssStyle {
         fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
-            let mut map = Map::new();
-            macro_rules! put {
-                ($key:expr, $field:expr) => {
-                    if let Some(v) = $field {
-                        map.insert($key.into(), serde_json::to_value(v).map_err(SerError::custom)?);
-                    }
-                };
+            // Count present fields so the serializer can pre-size the map.
+            let count = [
+                self.color.is_some(),
+                self.background.is_some(),
+                self.weight.is_some(),
+                self.font_style.is_some(),
+                self.decoration.is_some(),
+                self.underline_color.is_some(),
+                self.padding.is_some(),
+                self.margin.is_some(),
+                self.border.is_some(),
+                self.text_align.is_some(),
+                self.width.is_some(),
+                self.height.is_some(),
+            ]
+            .iter()
+            .filter(|&&b| b)
+            .count();
+
+            let mut map = s.serialize_map(Some(count))?;
+            if let Some(v) = self.color.as_ref() {
+                map.serialize_entry("color", v)?;
             }
-            put!("color", self.color.as_ref());
-            put!("background-color", self.background.as_ref());
-            put!("font-weight", self.weight);
-            put!("font-style", self.font_style);
-            put!("text-decoration", self.decoration);
-            put!("underline-color", self.underline_color.as_ref());
-            put!("padding", self.padding);
-            put!("margin", self.margin);
-            put!("border", self.border.as_ref());
-            put!("text-align", self.text_align);
-            put!("width", self.width.as_ref());
-            put!("height", self.height.as_ref());
-            map.serialize(s)
+            if let Some(v) = self.background.as_ref() {
+                map.serialize_entry("background-color", v)?;
+            }
+            if let Some(v) = self.weight {
+                map.serialize_entry("font-weight", &v)?;
+            }
+            if let Some(v) = self.font_style {
+                map.serialize_entry("font-style", &v)?;
+            }
+            if let Some(v) = self.decoration {
+                map.serialize_entry("text-decoration", &v)?;
+            }
+            if let Some(v) = self.underline_color.as_ref() {
+                map.serialize_entry("underline-color", v)?;
+            }
+            if let Some(v) = self.padding {
+                map.serialize_entry("padding", &v)?;
+            }
+            if let Some(v) = self.margin {
+                map.serialize_entry("margin", &v)?;
+            }
+            if let Some(v) = self.border.as_ref() {
+                map.serialize_entry("border", v)?;
+            }
+            if let Some(v) = self.text_align {
+                map.serialize_entry("text-align", &v)?;
+            }
+            if let Some(v) = self.width.as_ref() {
+                map.serialize_entry("width", v)?;
+            }
+            if let Some(v) = self.height.as_ref() {
+                map.serialize_entry("height", v)?;
+            }
+            map.end()
         }
     }
 }
@@ -578,7 +730,11 @@ mod tests {
 
     #[test]
     fn to_style_maps_decoration() {
-        let s = CssStyle::new().color(RC::Red).background(RC::Blue).bold().italic();
+        let s = CssStyle::new()
+            .color(RC::Red)
+            .background(RC::Blue)
+            .bold()
+            .italic();
         let rs = s.to_style();
         assert_eq!(rs.fg, Some(RC::Red));
         assert_eq!(rs.bg, Some(RC::Blue));
@@ -653,7 +809,10 @@ mod tests {
 
     #[test]
     fn padding_string_still_works() {
-        assert_eq!(CssStyle::new().padding("0 2").padding, CssStyle::new().padding((0u16, 2u16)).padding);
+        assert_eq!(
+            CssStyle::new().padding("0 2").padding,
+            CssStyle::new().padding((0u16, 2u16)).padding
+        );
     }
 
     #[test]
@@ -676,12 +835,16 @@ mod tests {
     fn border_string_still_works() {
         let typed = CssStyle::new().border(BorderStyle::Single).border;
         let from_str = CssStyle::new().border("single").border;
-        assert_eq!(typed.map(|b| (b.style, b.color)), from_str.map(|b| (b.style, b.color)));
+        assert_eq!(
+            typed.map(|b| (b.style, b.color)),
+            from_str.map(|b| (b.style, b.color))
+        );
     }
 
     #[test]
     #[cfg(feature = "serde")]
-    fn serde_border_style_and_color_compose() {        // Two atomic border declarations deserialize into one merged spec —
+    fn serde_border_style_and_color_compose() {
+        // Two atomic border declarations deserialize into one merged spec —
         // the same Tailwind idiom the cascade exercises, but via the serde
         // path (which now funnels through `border_mut`).
         let json = r##"{ "border-style": "rounded", "border-color": "#334155" }"##;
@@ -707,7 +870,10 @@ mod tests {
             edges: Some(ratatui::widgets::Borders::BOTTOM),
         });
         let json = serde_json::to_string(&original).unwrap();
-        assert!(json.contains("\"edges\":\"bottom\""), "edges serialized as keyword: {json}");
+        assert!(
+            json.contains("\"edges\":\"bottom\""),
+            "edges serialized as keyword: {json}"
+        );
         let back: CssStyle = serde_json::from_str(&json).unwrap();
         let border = back.border.expect("border present");
         assert_eq!(border.edges, Some(ratatui::widgets::Borders::BOTTOM));
@@ -723,5 +889,123 @@ mod tests {
         let spec: crate::box_model::BorderSpec = serde_json::from_str(json).unwrap();
         assert_eq!(spec.edges, None);
         assert_eq!(spec.borders(), ratatui::widgets::Borders::ALL);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Cross-format serde round-trips (JSON / TOML / YAML).
+// The crate advertises (design.md §1/§2, Cargo.toml feature comment) that
+// styles can come from JSON, TOML, or YAML. These tests verify that promise
+// holds for a fully-populated CssStyle: serialize to each format's string,
+// deserialize back, and assert equality with the original.
+// ---------------------------------------------------------------------------
+
+#[cfg(all(test, feature = "serde"))]
+mod cross_format_tests {
+    use super::*;
+    use crate::box_model::{BorderSpec, BorderStyle, Length};
+    use ratatui::style::Color as RC;
+
+    /// A CssStyle exercising every leaf type that has a custom Deserialize:
+    /// `Color` (color/background), `BoxEdges` (padding), `BorderSpec` (border
+    /// with an explicit edges set), `Length` (width), `Weight`, and `Align`.
+    fn populated_style() -> CssStyle {
+        let mut s = CssStyle::new()
+            .color(RC::Red)
+            .background(RC::Rgb(0x33, 0x41, 0x55))
+            .bold()
+            .padding((1u16, 2u16, 3u16, 4u16))
+            .border(BorderSpec {
+                style: BorderStyle::Rounded,
+                color: Some(Color::literal(RC::Blue)),
+                edges: Some(ratatui::widgets::Borders::BOTTOM),
+            });
+        // `width` and `text_align` are plain fields (no builder).
+        s.width = Some(Length::Cells(10));
+        s.text_align = Some(Align::Center);
+        s
+    }
+
+    #[test]
+    fn json_roundtrip() {
+        let original = populated_style();
+        let json = serde_json::to_string(&original).expect("serialize to JSON");
+        let back: CssStyle = serde_json::from_str(&json).expect("deserialize from JSON");
+        assert_eq!(back, original, "JSON round-trip mismatch\n{json}");
+    }
+
+    #[test]
+    fn toml_roundtrip() {
+        let original = populated_style();
+        let s = toml::to_string(&original).expect("serialize to TOML");
+        let back: CssStyle = toml::from_str(&s).expect("deserialize from TOML");
+        assert_eq!(back, original, "TOML round-trip mismatch\n{s}");
+    }
+
+    #[test]
+    fn yaml_roundtrip() {
+        let original = populated_style();
+        let s = serde_yaml::to_string(&original).expect("serialize to YAML");
+        let back: CssStyle = serde_yaml::from_str(&s).expect("deserialize from YAML");
+        assert_eq!(back, original, "YAML round-trip mismatch\n{s}");
+    }
+
+    /// Deserializing a hand-written TOML document (not just a re-serialized
+    /// one) — this is the realistic "styles in a config file" path and the
+    /// place where JSON-coupled Deserialize impls actually break.
+    #[test]
+    fn toml_from_literal_doc() {
+        // r##"..."## — double-hash delimiter so the "#334155" hex value
+        // inside doesn't terminate a single-hash raw string.
+        let doc = r##"
+color = "red"
+background-color = "#334155"
+font-weight = "bold"
+padding = "1 2 3 4"
+width = "10px"
+text-align = "center"
+
+[border]
+style = "rounded"
+color = "blue"
+edges = "bottom"
+"##;
+        let parsed: CssStyle = toml::from_str(doc).expect("deserialize TOML doc");
+        assert_eq!(parsed, populated_style(), "TOML doc mismatch");
+    }
+
+    #[test]
+    fn yaml_from_literal_doc() {
+        let doc = r##"
+color: red
+background-color: "#334155"
+font-weight: bold
+padding: "1 2 3 4"
+width: "10px"
+text-align: center
+border:
+  style: rounded
+  color: blue
+  edges: bottom
+"##;
+        let parsed: CssStyle = serde_yaml::from_str(doc).expect("deserialize YAML doc");
+        assert_eq!(parsed, populated_style(), "YAML doc mismatch");
+    }
+
+    /// The realistic config-file case that exposes JSON-coupling: a TOML doc
+    /// that uses a **bare integer** for `width` and `padding` (not the string
+    /// forms `"10px"` / `"1 2 3 4"` that re-serialization always emits). The
+    /// `Length`/`BoxEdges` Deserialize impls accept either a number or a
+    /// string in JSON; this verifies they also do so through the TOML
+    /// deserializer.
+    #[test]
+    fn toml_bare_integers_for_length_and_padding() {
+        let doc = r#"
+width = 10
+padding = 4
+"#;
+        let parsed: CssStyle = toml::from_str(doc).expect("deserialize TOML doc");
+        assert_eq!(parsed.width, Some(Length::Cells(10)));
+        assert_eq!(parsed.padding, Some(crate::box_model::BoxEdges::uniform(4)));
     }
 }

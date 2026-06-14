@@ -41,7 +41,10 @@ impl Color {
 
     /// Shortcut for `var(--name)` with no fallback.
     pub fn var(name: impl Into<String>) -> Self {
-        Self::Var { name: name.into(), fallback: None }
+        Self::Var {
+            name: name.into(),
+            fallback: None,
+        }
     }
 
     /// Parse a CSS color expression.
@@ -62,7 +65,10 @@ impl Color {
             let c = parse_hex(rest).ok_or_else(|| CssError::invalid_color(s))?;
             return Ok(literal_or_reset(c));
         }
-        if let Some(rest) = lower.strip_prefix("rgba(").or_else(|| lower.strip_prefix("rgb(")) {
+        if let Some(rest) = lower
+            .strip_prefix("rgba(")
+            .or_else(|| lower.strip_prefix("rgb("))
+        {
             let c = parse_rgb(rest).ok_or_else(|| CssError::invalid_color(s))?;
             return Ok(literal_or_reset(c));
         }
@@ -80,7 +86,9 @@ impl Color {
         let (name_part, fallback_part) = split_top_comma(inner);
         let name = name_part.trim().trim_start_matches('-').trim().to_string();
         if name.is_empty() {
-            return Err(CssError::invalid_color(format!("var(): empty name in {inner}")));
+            return Err(CssError::invalid_color(format!(
+                "var(): empty name in {inner}"
+            )));
         }
         let fallback = match fallback_part.trim() {
             "" => None,
@@ -135,7 +143,7 @@ fn literal_or_reset(c: RColor) -> Color {
 }
 
 /// Split on the first comma that is not nested inside parentheses.
-fn split_top_comma(s: &str) -> (&str, &str) {
+pub(crate) fn split_top_comma(s: &str) -> (&str, &str) {
     let mut depth: u32 = 0;
     for (i, ch) in s.char_indices() {
         match ch {
@@ -198,7 +206,9 @@ fn parse_rgb(inner: &str) -> Option<RColor> {
             (pct.parse::<f32>().ok()? / 100.0 * 255.0).round() as u8
         } else {
             // tolerate "0.5" alpha — only integer rgb channels matter.
-            tok.parse::<u8>().ok().or_else(|| tok.split('.').next().and_then(|s| s.parse::<u8>().ok()))?
+            tok.parse::<u8>()
+                .ok()
+                .or_else(|| tok.split('.').next().and_then(|s| s.parse::<u8>().ok()))?
         };
         nums.push(n);
     }
@@ -292,11 +302,34 @@ fn format_literal(c: &RColor) -> String {
 #[cfg(feature = "serde")]
 mod serde_impl {
     use super::Color;
+    use serde::de::{self, Visitor};
+    use std::fmt;
 
     impl<'de> serde::Deserialize<'de> for Color {
         fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-            let s = String::deserialize(d)?;
-            Color::parse(&s).map_err(serde::de::Error::custom)
+            // A color is always a CSS color *string* (e.g. "#ff0000", "red",
+            // "var(--accent)"). Driving the deserializer with `deserialize_str`
+            // is format-agnostic: JSON/TOML/YAML all hand a string to the
+            // visitor here, with no intermediate `serde_json::Value`.
+            struct ColorVisitor;
+
+            impl<'de> Visitor<'de> for ColorVisitor {
+                type Value = Color;
+
+                fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                    f.write_str("a CSS color string")
+                }
+
+                fn visit_str<E: de::Error>(self, v: &str) -> Result<Color, E> {
+                    Color::parse(v).map_err(E::custom)
+                }
+
+                fn visit_string<E: de::Error>(self, v: String) -> Result<Color, E> {
+                    Color::parse(&v).map_err(E::custom)
+                }
+            }
+
+            d.deserialize_str(ColorVisitor)
         }
     }
 
@@ -313,17 +346,32 @@ mod tests {
 
     #[test]
     fn hex_3_4_6_8() {
-        assert_eq!(Color::parse("#fff").unwrap(), Color::literal(RColor::Rgb(255, 255, 255)));
+        assert_eq!(
+            Color::parse("#fff").unwrap(),
+            Color::literal(RColor::Rgb(255, 255, 255))
+        );
         assert_eq!(Color::parse("#0000").unwrap(), Color::Reset); // alpha 0
-        assert_eq!(Color::parse("#ff8800").unwrap(), Color::literal(RColor::Rgb(255, 136, 0)));
+        assert_eq!(
+            Color::parse("#ff8800").unwrap(),
+            Color::literal(RColor::Rgb(255, 136, 0))
+        );
         assert_eq!(Color::parse("#ff880000").unwrap(), Color::Reset);
-        assert_eq!(Color::parse("#ff8800ff").unwrap(), Color::literal(RColor::Rgb(255, 136, 0)));
+        assert_eq!(
+            Color::parse("#ff8800ff").unwrap(),
+            Color::literal(RColor::Rgb(255, 136, 0))
+        );
     }
 
     #[test]
     fn rgb_fn() {
-        assert_eq!(Color::parse("rgb(0,255,0)").unwrap(), Color::literal(RColor::Rgb(0, 255, 0)));
-        assert_eq!(Color::parse("rgb(1 2 3)").unwrap(), Color::literal(RColor::Rgb(1, 2, 3)));
+        assert_eq!(
+            Color::parse("rgb(0,255,0)").unwrap(),
+            Color::literal(RColor::Rgb(0, 255, 0))
+        );
+        assert_eq!(
+            Color::parse("rgb(1 2 3)").unwrap(),
+            Color::literal(RColor::Rgb(1, 2, 3))
+        );
         assert_eq!(Color::parse("rgba(10,20,30,0)").unwrap(), Color::Reset);
     }
 
@@ -331,7 +379,10 @@ mod tests {
     fn named() {
         assert_eq!(Color::parse("red").unwrap(), Color::literal(RColor::Red));
         assert_eq!(Color::parse("CYAN").unwrap(), Color::literal(RColor::Cyan));
-        assert_eq!(Color::parse("orange").unwrap(), Color::literal(RColor::Rgb(255, 165, 0)));
+        assert_eq!(
+            Color::parse("orange").unwrap(),
+            Color::literal(RColor::Rgb(255, 165, 0))
+        );
     }
 
     #[test]
@@ -343,11 +394,17 @@ mod tests {
     #[test]
     fn var_refs() {
         match Color::parse("var(--accent)") {
-            Ok(Color::Var { name, fallback: None }) => assert_eq!(name, "accent"),
+            Ok(Color::Var {
+                name,
+                fallback: None,
+            }) => assert_eq!(name, "accent"),
             other => panic!("{other:?}"),
         }
         match Color::parse("var(--text, #fff)") {
-            Ok(Color::Var { name, fallback: Some(fb) }) => {
+            Ok(Color::Var {
+                name,
+                fallback: Some(fb),
+            }) => {
                 assert_eq!(name, "text");
                 assert_eq!(*fb, Color::literal(RColor::Rgb(255, 255, 255)));
             }
