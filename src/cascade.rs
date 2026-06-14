@@ -15,7 +15,7 @@ use ratatui::{
     widgets::Block,
 };
 
-use crate::box_model::Length;
+use crate::box_model::{BorderStyle, BorderStyleValue, BoxEdges, BoxEdgesValue, Length};
 use crate::cache::{node_signature, ComputeCache};
 use crate::color::Color;
 use crate::media::MediaContext;
@@ -673,6 +673,7 @@ impl Stylesheet {
                 for (i, r) in rules.iter().enumerate() {
                     if r.selector.matches_values(type_name, id, &classes, state, &position)
                         && rule_media_matches(&r.media, media)
+                        && rule_supports_matches(&r.supports, media)
                     {
                         scratch.matching.push(i);
                     }
@@ -686,6 +687,7 @@ impl Stylesheet {
                 for (i, r) in rules.iter().enumerate() {
                     if r.selector.matches_chain(&node_id, stack, sibs)
                         && rule_media_matches(&r.media, media)
+                        && rule_supports_matches(&r.supports, media)
                     {
                         scratch.matching.push(i);
                     }
@@ -729,6 +731,19 @@ fn rule_media_matches(query: &Option<crate::media::MediaQuery>, ctx: &MediaConte
     }
 }
 
+/// The supports-matching predicate for a rule: `true` when the rule is untagged
+/// (`supports: None`) or its query matches `ctx` (capability conditions evaluate
+/// against the [`MediaContext`] flags, property conditions against the engine's
+/// known-property set). Inlined into the hot rule loop; for `None` rules this
+/// collapses to a single `is_some()` check with no query evaluation.
+#[inline]
+fn rule_supports_matches(query: &Option<crate::supports::SupportsQuery>, ctx: &MediaContext) -> bool {
+    match query {
+        None => true,
+        Some(q) => q.matches(ctx),
+    }
+}
+
 /// Replace explicit `inherit` keyword colors with the parent's value, for all
 /// three color fields (CSS `inherit` forces inheritance even for
 /// non-inheritable properties like `background`).
@@ -745,9 +760,11 @@ fn resolve_explicit_inherit(own: &mut CssStyle, parent: &CssStyle) {
 }
 
 /// Resolve every `var()` / leftover `inherit` in the color and length fields
-/// to a literal — including the `Color` nested inside a `border` spec. Color
-/// fields degrade to `Reset` on failure; length fields degrade to `Auto` —
-/// both lenient, neither panics.
+/// to a literal — including the `Color` nested inside a `border` spec, the
+/// `BoxEdgesValue` in padding/margin, and the `BorderStyleValue` in the border
+/// style. Color fields degrade to `Reset` on failure; length fields degrade to
+/// `Auto`; box-edges fields degrade to zero edges; border-style degrades to
+/// `None` — all lenient, none panic.
 ///
 /// `media` gates `:root { --x }` overrides declared inside `@media` blocks: a
 /// matching query's overrides win over the default map (last-matching wins),
@@ -758,15 +775,18 @@ fn resolve_vars_in_place(style: &mut CssStyle, tokens: &ThemeTokens, media: &Med
     resolve_color_field(&mut style.color, tokens, media);
     resolve_color_field(&mut style.background, tokens, media);
     resolve_color_field(&mut style.underline_color, tokens, media);
-    // The border color is a `Color` nested inside `Option<BorderSpec>`, so it is
-    // not covered by the top-level field passes above. Resolve it here too, or a
-    // `border: rounded var(--dim)` survives the cascade as a `Var` and `paint`
-    // drops it — the border then draws with no explicit color.
+    // The border color / style are nested inside `Option<BorderSpec>`, so they
+    // are not covered by the top-level field passes above. Resolve them here
+    // too, or a `border: rounded var(--dim)` survives the cascade as a `Var`
+    // and `paint` drops it — the border then draws with no explicit color.
     if let Some(border) = style.border.as_mut() {
         resolve_color_field(&mut border.color, tokens, media);
+        resolve_border_style_field(&mut border.style, tokens, media);
     }
     resolve_length_field(&mut style.width, tokens, media);
     resolve_length_field(&mut style.height, tokens, media);
+    resolve_box_edges_field(&mut style.padding, tokens, media);
+    resolve_box_edges_field(&mut style.margin, tokens, media);
 }
 
 fn resolve_color_field(field: &mut Option<Color>, tokens: &ThemeTokens, media: &MediaContext) {
@@ -789,6 +809,88 @@ fn resolve_length_field(field: &mut Option<Length>, tokens: &ThemeTokens, media:
     if let Some(inner) = field {
         if let Length::Var { .. } = inner {
             *field = Some(token::resolve_length_with_media(inner, tokens, media));
+        }
+    }
+}
+
+/// Resolve a padding/margin `BoxEdgesValue` field in place. A `Var` is
+/// resolved against the token table (following chains and the `var()` fallback
+/// recursively); on failure (undefined name, type mismatch, cycle) the fallback
+/// is tried, and if there is none it degrades to [`BoxEdges::zero`]
+/// (`BoxEdgesValue::Edges(BoxEdges::zero())`). A concrete `Edges` is left
+/// untouched.
+fn resolve_box_edges_field(
+    field: &mut Option<BoxEdgesValue>,
+    tokens: &ThemeTokens,
+    media: &MediaContext,
+) {
+    if let Some(inner) = field.take() {
+        *field = Some(resolve_box_edges_value(inner, tokens, media, 0));
+    }
+}
+
+/// Recursive resolver for [`BoxEdgesValue`]. A depth cap (32) guards against
+/// cycles; the fallback (`var(--x, expr)`) is tried when the name is undefined.
+/// On total failure this returns `Edges(BoxEdges::zero())` — lenient, no panic.
+fn resolve_box_edges_value(
+    value: BoxEdgesValue,
+    tokens: &ThemeTokens,
+    media: &MediaContext,
+    depth: u8,
+) -> BoxEdgesValue {
+    if depth > 32 {
+        return BoxEdgesValue::Edges(BoxEdges::zero());
+    }
+    match value {
+        BoxEdgesValue::Edges(_) => value,
+        BoxEdgesValue::Var { name, fallback } => {
+            match tokens.get_box_edges_with(&name, media) {
+                Some(edges) => BoxEdgesValue::Edges(edges),
+                None => match fallback {
+                    Some(fb) => resolve_box_edges_value(*fb, tokens, media, depth + 1),
+                    None => BoxEdgesValue::Edges(BoxEdges::zero()),
+                },
+            }
+        }
+    }
+}
+
+/// Resolve the border-style `BorderStyleValue` field in place. A `Var` is
+/// resolved against the token table (following chains and the `var()` fallback
+/// recursively); on failure the fallback is tried, and if there is none it
+/// degrades to [`BorderStyle::None`] (`BorderStyleValue::Fixed(None)`). A
+/// concrete `Fixed` is left untouched.
+fn resolve_border_style_field(
+    field: &mut BorderStyleValue,
+    tokens: &ThemeTokens,
+    media: &MediaContext,
+) {
+    let owned = std::mem::take(field);
+    *field = resolve_border_style_value(owned, tokens, media, 0);
+}
+
+/// Recursive resolver for [`BorderStyleValue`]. A depth cap (32) guards against
+/// cycles; the fallback is tried when the name is undefined. On total failure
+/// this returns `Fixed(BorderStyle::None)` — lenient, no panic.
+fn resolve_border_style_value(
+    value: BorderStyleValue,
+    tokens: &ThemeTokens,
+    media: &MediaContext,
+    depth: u8,
+) -> BorderStyleValue {
+    if depth > 32 {
+        return BorderStyleValue::Fixed(BorderStyle::None);
+    }
+    match value {
+        BorderStyleValue::Fixed(_) => value,
+        BorderStyleValue::Var { name, fallback } => {
+            match tokens.get_border_style_with(&name, media) {
+                Some(style) => BorderStyleValue::Fixed(style),
+                None => match fallback {
+                    Some(fb) => resolve_border_style_value(*fb, tokens, media, depth + 1),
+                    None => BorderStyleValue::Fixed(BorderStyle::None),
+                },
+            }
         }
     }
 }
@@ -927,7 +1029,10 @@ mod tests {
         let n = OwnedNode::new("Div").with_classes(["panel"]);
         let c = sheet.compute(&n, None);
         let border = c.style.border.expect("border present");
-        assert_eq!(border.style, crate::box_model::BorderStyle::Rounded);
+        assert_eq!(
+            border.style,
+            crate::box_model::BorderStyleValue::Fixed(crate::box_model::BorderStyle::Rounded)
+        );
         assert_eq!(
             border.color,
             Some(Color::literal(RC::Rgb(0x00, 0x32, 0x37)))
@@ -1466,6 +1571,180 @@ mod tests {
         let node = OwnedNode::new("Div").with_classes(["x"]);
         let c = sheet.compute(&node, None);
         assert_eq!(c.style.width, Some(crate::box_model::Length::Cells(7)));
+    }
+
+    // ---------------------------------------------------------------------
+    // Box-edges / border-style var() resolution (P6-4)
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn padding_var_resolves_from_token() {
+        let sheet = Stylesheet::parse(
+            ":root{--pad: 1 2} .x { padding: var(--pad); }",
+        )
+        .unwrap();
+        let node = OwnedNode::new("Div").with_classes(["x"]);
+        let c = sheet.compute(&node, None);
+        // 1 2 → top=1, right=2, bottom=1, left=2 (two-value shorthand).
+        assert_eq!(
+            c.style.padding,
+            Some(crate::box_model::BoxEdgesValue::Edges(BoxEdges {
+                top: 1,
+                right: 2,
+                bottom: 1,
+                left: 2,
+            }))
+        );
+    }
+
+    #[test]
+    fn padding_var_resolved_into_block() {
+        // to_block() projects the resolved padding onto the Block — verify via
+        // block.inner(area), which shrinks the area by the padding on each side.
+        let sheet = Stylesheet::parse(
+            ":root{--pad: 1 2} .x { padding: var(--pad); }",
+        )
+        .unwrap();
+        let node = OwnedNode::new("Div").with_classes(["x"]);
+        let c = sheet.compute(&node, None);
+        let block = c.to_block();
+        // Edges{top:1,right:2,bottom:1,left:2} on a 10x10 area → inner is
+        // (x=2, y=1, width=6, height=8).
+        let area = Rect::new(0, 0, 10, 10);
+        let inner = block.inner(area);
+        assert_eq!(inner, Rect::new(2, 1, 6, 8));
+    }
+
+    #[test]
+    fn margin_var_resolves_from_token() {
+        let sheet = Stylesheet::parse(
+            ":root{--m: 3} .x { margin: var(--m); }",
+        )
+        .unwrap();
+        let node = OwnedNode::new("Div").with_classes(["x"]);
+        let c = sheet.compute(&node, None);
+        assert_eq!(
+            c.style.margin,
+            Some(crate::box_model::BoxEdgesValue::Edges(BoxEdges::uniform(3)))
+        );
+        // apply_margin shrinks the area by the resolved edges.
+        let area = Rect::new(0, 0, 10, 10);
+        let shrunk = c.apply_margin(area);
+        assert_eq!((shrunk.x, shrunk.y, shrunk.width, shrunk.height), (3, 3, 4, 4));
+    }
+
+    #[test]
+    fn border_style_var_resolves() {
+        let sheet = Stylesheet::parse(
+            ":root{--bs: rounded} .x { border-style: var(--bs); }",
+        )
+        .unwrap();
+        let node = OwnedNode::new("Div").with_classes(["x"]);
+        let c = sheet.compute(&node, None);
+        let border = c.style.border.expect("border present");
+        assert_eq!(
+            border.style,
+            crate::box_model::BorderStyleValue::Fixed(crate::box_model::BorderStyle::Rounded)
+        );
+    }
+
+    #[test]
+    fn border_style_var_via_shorthand_resolves() {
+        // `border: var(--bs)` — the var is the style component.
+        let sheet = Stylesheet::parse(
+            ":root{--bs: double} .x { border: var(--bs); }",
+        )
+        .unwrap();
+        let node = OwnedNode::new("Div").with_classes(["x"]);
+        let c = sheet.compute(&node, None);
+        let border = c.style.border.expect("border present");
+        assert_eq!(
+            border.style,
+            crate::box_model::BorderStyleValue::Fixed(crate::box_model::BorderStyle::Double)
+        );
+    }
+
+    #[test]
+    fn padding_var_undefined_degrades_to_zero() {
+        // Lenient: an undefined padding var with no fallback → zero edges.
+        let sheet = Stylesheet::parse(".x { padding: var(--nope); }").unwrap();
+        let node = OwnedNode::new("Div").with_classes(["x"]);
+        let c = sheet.compute(&node, None);
+        assert_eq!(
+            c.style.padding,
+            Some(crate::box_model::BoxEdgesValue::Edges(BoxEdges::zero()))
+        );
+        // to_block produces no-op padding (zero edges): block.inner(area) == area.
+        let block = c.to_block();
+        let area = Rect::new(0, 0, 10, 10);
+        assert_eq!(block.inner(area), area);
+    }
+
+    #[test]
+    fn padding_var_undefined_uses_fallback() {
+        // An undefined padding var WITH a fallback resolves to the fallback.
+        let sheet = Stylesheet::parse(".x { padding: var(--nope, 3); }").unwrap();
+        let node = OwnedNode::new("Div").with_classes(["x"]);
+        let c = sheet.compute(&node, None);
+        assert_eq!(
+            c.style.padding,
+            Some(crate::box_model::BoxEdgesValue::Edges(BoxEdges::uniform(3)))
+        );
+    }
+
+    #[test]
+    fn border_style_var_undefined_degrades_to_none() {
+        // Lenient: an undefined border-style var → None style.
+        let sheet = Stylesheet::parse(".x { border-style: var(--nope); }").unwrap();
+        let node = OwnedNode::new("Div").with_classes(["x"]);
+        let c = sheet.compute(&node, None);
+        let border = c.style.border.expect("border present");
+        assert_eq!(
+            border.style,
+            crate::box_model::BorderStyleValue::Fixed(crate::box_model::BorderStyle::None)
+        );
+    }
+
+    #[test]
+    fn box_edges_var_mistype_degrades() {
+        // A name bound to a Color is a type mismatch on the box-edges path →
+        // degrades to zero edges.
+        let sheet = Stylesheet::parse(
+            ":root{--c:#fff} .x { padding: var(--c); }",
+        )
+        .unwrap();
+        let node = OwnedNode::new("Div").with_classes(["x"]);
+        let c = sheet.compute(&node, None);
+        assert_eq!(
+            c.style.padding,
+            Some(crate::box_model::BoxEdgesValue::Edges(BoxEdges::zero()))
+        );
+    }
+
+    #[test]
+    fn box_edges_media_gated_token_resolves() {
+        // A media-gated :root override for a box-edges token resolves under a
+        // matching context.
+        let sheet = Stylesheet::parse(
+            ":root{--pad:1} @media (min-width:80){:root{--pad:2}} .x{padding:var(--pad)}",
+        )
+        .unwrap();
+        let node = OwnedNode::new("Div").with_classes(["x"]);
+        let mut scratch = ComputeScratch::new();
+        // Matching → 2.
+        let large = MediaContext { cols: 100, ..Default::default() };
+        let c = sheet.compute_with_media(&node, None, &mut scratch, &large);
+        assert_eq!(
+            c.style.padding,
+            Some(crate::box_model::BoxEdgesValue::Edges(BoxEdges::uniform(2)))
+        );
+        // Non-matching → default 1.
+        let small = MediaContext { cols: 40, ..Default::default() };
+        let c = sheet.compute_with_media(&node, None, &mut scratch, &small);
+        assert_eq!(
+            c.style.padding,
+            Some(crate::box_model::BoxEdgesValue::Edges(BoxEdges::uniform(1)))
+        );
     }
 
     // ---------------------------------------------------------------------
@@ -2284,5 +2563,136 @@ mod tests {
         let b2 = ctx.enter(&OwnedNode::new("B"));
         assert_eq!(b2.style.color, Some(Color::literal(RC::Blue)));
         assert_eq!(b2, b1, "re-walked subtree is identical to the first");
+    }
+
+    // ---------------------------------------------------------------------
+    // @supports queries
+    // ---------------------------------------------------------------------
+
+    fn supports_sheet() -> Stylesheet {
+        Stylesheet::parse("@supports (truecolor) { Button { color: red; } }").unwrap()
+    }
+
+    #[test]
+    fn supports_rule_applies_when_capability_matches() {
+        let sheet = supports_sheet();
+        let mut scratch = ComputeScratch::new();
+        let media = MediaContext { truecolor: true, ..Default::default() };
+        let c = sheet.compute_with_media(&OwnedNode::new("Button"), None, &mut scratch, &media);
+        assert_eq!(c.style.color, Some(Color::literal(RC::Red)));
+    }
+
+    #[test]
+    fn supports_rule_skipped_when_capability_does_not_match() {
+        let sheet = supports_sheet();
+        let mut scratch = ComputeScratch::new();
+        let media = MediaContext { truecolor: false, ..Default::default() };
+        let c = sheet.compute_with_media(&OwnedNode::new("Button"), None, &mut scratch, &media);
+        assert_eq!(c.style.color, None, "supports-gated rule must not apply when truecolor is off");
+    }
+
+    #[test]
+    fn supports_rule_skipped_by_default_context() {
+        // The default context (truecolor=false) must NOT satisfy (truecolor).
+        let sheet = supports_sheet();
+        let c = sheet.compute(&OwnedNode::new("Button"), None);
+        assert_eq!(c.style.color, None, "default-context compute does not apply supports-gated rules");
+    }
+
+    #[test]
+    fn supports_property_known_applies() {
+        // (border-style) is a known engine property → applies regardless of ctx.
+        let sheet = Stylesheet::parse("@supports (border-style) { .x { border-style: rounded; } }").unwrap();
+        let mut scratch = ComputeScratch::new();
+        let media = MediaContext::default();
+        let c = sheet.compute_with_media(&OwnedNode::new("Div").with_classes(["x"]), None, &mut scratch, &media);
+        let border = c.style.border.expect("border present");
+        assert_eq!(
+            border.style,
+            crate::box_model::BorderStyleValue::Fixed(crate::box_model::BorderStyle::Rounded)
+        );
+    }
+
+    #[test]
+    fn supports_property_unknown_does_not_apply() {
+        // (future-thing) is NOT a known engine property → rule skipped.
+        let sheet = Stylesheet::parse("@supports (future-thing) { .x { color: red; } }").unwrap();
+        let mut scratch = ComputeScratch::new();
+        let media = MediaContext::default();
+        let c = sheet.compute_with_media(&OwnedNode::new("Div").with_classes(["x"]), None, &mut scratch, &media);
+        assert_eq!(c.style.color, None, "supports rule with unknown property must not apply");
+    }
+
+    #[test]
+    fn supports_combined_with_media_requires_both() {
+        // A rule gated by BOTH @media (min-width:80) AND @supports (truecolor)
+        // applies only when BOTH match.
+        let sheet = Stylesheet::parse(
+            "@media (min-width: 80) { @supports (truecolor) { Button { color: green; } } }",
+        )
+        .unwrap();
+
+        let mut scratch = ComputeScratch::new();
+        let node = OwnedNode::new("Button");
+
+        // Both match → applies.
+        let both = MediaContext { cols: 100, truecolor: true, ..Default::default() };
+        let c = sheet.compute_with_media(&node, None, &mut scratch, &both);
+        assert_eq!(c.style.color, Some(Color::literal(RC::Green)), "both match → applies");
+
+        // Media matches, supports does not → skip.
+        let media_only = MediaContext { cols: 100, truecolor: false, ..Default::default() };
+        let c = sheet.compute_with_media(&node, None, &mut scratch, &media_only);
+        assert_eq!(c.style.color, None, "supports fails → no apply");
+
+        // Supports matches, media does not → skip.
+        let supports_only = MediaContext { cols: 40, truecolor: true, ..Default::default() };
+        let c = sheet.compute_with_media(&node, None, &mut scratch, &supports_only);
+        assert_eq!(c.style.color, None, "media fails → no apply");
+    }
+
+    #[test]
+    fn supports_inside_media_applies_when_both_match_via_context() {
+        // Same nesting through CascadeContext (the combinator-aware path).
+        let sheet = Stylesheet::parse(
+            "@media (min-width: 80) { @supports (truecolor) { Button { color: green; } } }",
+        )
+        .unwrap();
+        let mut ctx = CascadeContext::new(&sheet).with_media(MediaContext {
+            cols: 100,
+            truecolor: true,
+            ..Default::default()
+        });
+        let btn = ctx.enter(&OwnedNode::new("Button"));
+        assert_eq!(btn.style.color, Some(Color::literal(RC::Green)));
+
+        // Drop supports → no longer applies.
+        ctx.set_media(MediaContext { cols: 100, truecolor: false, ..Default::default() });
+        ctx.leave();
+        let btn2 = ctx.enter(&OwnedNode::new("Button"));
+        assert_eq!(btn2.style.color, None);
+    }
+
+    #[test]
+    fn plain_and_supports_rules_coexist() {
+        // A sheet with BOTH a plain (always-applies) rule and a supports-gated
+        // rule. The supports-gated rule has later source order, so it wins when
+        // it applies.
+        let sheet = Stylesheet::parse(
+            "Button { color: blue; } @supports (truecolor) { Button { color: red; } }",
+        )
+        .unwrap();
+        let mut scratch = ComputeScratch::new();
+        let node = OwnedNode::new("Button");
+
+        // truecolor off: only the plain rule applies → blue.
+        let tc_off = MediaContext { truecolor: false, ..Default::default() };
+        let c = sheet.compute_with_media(&node, None, &mut scratch, &tc_off);
+        assert_eq!(c.style.color, Some(Color::literal(RC::Blue)));
+
+        // truecolor on: supports rule wins (later source order) → red.
+        let tc_on = MediaContext { truecolor: true, ..Default::default() };
+        let c = sheet.compute_with_media(&node, None, &mut scratch, &tc_on);
+        assert_eq!(c.style.color, Some(Color::literal(RC::Red)));
     }
 }

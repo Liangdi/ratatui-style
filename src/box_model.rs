@@ -147,7 +147,7 @@ impl BorderStyle {
 ///   the full `border` shorthand (which forces `Some(Borders::ALL)`).
 #[derive(Debug, Clone, PartialEq)]
 pub struct BorderSpec {
-    pub style: BorderStyle,
+    pub style: BorderStyleValue,
     pub color: Option<Color>,
     pub edges: Option<Borders>,
 }
@@ -155,7 +155,7 @@ pub struct BorderSpec {
 impl Default for BorderSpec {
     fn default() -> Self {
         Self {
-            style: BorderStyle::None,
+            style: BorderStyleValue::Fixed(BorderStyle::None),
             color: None,
             edges: None,
         }
@@ -233,8 +233,12 @@ impl BorderSpec {
     /// (the legacy "style set without a per-edge declaration draws all four
     /// sides" semantics, kept so existing `.rounded { border-style: rounded }`
     /// rules keep drawing a full box).
+    ///
+    /// A `BorderStyleValue::Var` that has not yet been resolved counts as
+    /// "not None" (the edges are kept) — after cascade resolution no `Var`
+    /// should survive, but this keeps the pre-resolution `borders()` sensible.
     pub fn borders(&self) -> Borders {
-        if self.style == BorderStyle::None {
+        if matches!(self.style.as_fixed(), Some(BorderStyle::None)) {
             Borders::NONE
         } else {
             self.edges.unwrap_or(Borders::ALL)
@@ -242,22 +246,95 @@ impl BorderSpec {
     }
 
     pub fn border_type(&self) -> BorderType {
-        self.style.to_border_type().unwrap_or(BorderType::Plain)
+        self.style
+            .as_fixed()
+            .and_then(|s| s.to_border_type())
+            .unwrap_or(BorderType::Plain)
     }
 
-    /// Parse a CSS shorthand: `none` / `single` / `rounded` / `double` / `thick`,
-    /// optionally with a width (`1px`) and a color (`rounded #f00`).
+    /// Parse a CSS shorthand: `none` / `single` / `rounded` / `double` / `thick`
+    /// (or a `var(--name)` reference), optionally with a width (`1px`) and a
+    /// color (`rounded #f00`, `var(--bs) #f00`).
+    ///
+    /// A token starting with `var(` (case-insensitive) becomes a
+    /// [`BorderStyleValue::Var`]; to support `var(--name, fallback)` with a
+    /// fallback that may contain spaces, a `var(` token is re-joined with the
+    /// remaining tokens up to the matching `)`. Otherwise the token is parsed
+    /// as a [`BorderStyle`] keyword, and anything that is neither a keyword nor
+    /// a `px` width becomes the color.
     pub fn parse_shorthand(s: &str) -> Result<Self> {
-        let mut style = BorderStyle::None;
+        let mut style: BorderStyleValue = BorderStyleValue::Fixed(BorderStyle::None);
         let mut color_tokens: Vec<&str> = Vec::new();
-        for tok in s.split_whitespace() {
-            if tok.ends_with("px") {
-                // width — present-but-ignored (terminal borders are always 1 cell).
-                continue;
+        let lowered = s.to_ascii_lowercase();
+        let bytes = s.as_bytes();
+        let mut i = 0;
+        // Track consumed byte ranges so we can slice the original `s` for color
+        // tokens that the whitespace split also visits.
+        let mut consumed: Vec<(usize, usize)> = Vec::new();
+        while i < bytes.len() {
+            // Skip whitespace.
+            while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+                i += 1;
             }
-            if let Some(parsed) = BorderStyle::parse_keyword(tok) {
-                style = parsed;
+            if i >= bytes.len() {
+                break;
+            }
+            let start = i;
+            // Find the end of this token (next whitespace).
+            while i < bytes.len() && !bytes[i].is_ascii_whitespace() {
+                i += 1;
+            }
+            let tok = &s[start..i];
+            // Case-insensitive `var(` prefix check on the lowered source.
+            if lowered[start..i].starts_with("var(") {
+                // Re-join tokens until the matching ')'. The `)` may be on a
+                // later token, so consume forward.
+                let mut joined = String::from(tok);
+                // If this token doesn't end with ')', pull in more.
+                while !joined.ends_with(')') && i < bytes.len() {
+                    // Skip exactly one whitespace run and append it + next token.
+                    let ws_start = i;
+                    while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+                        i += 1;
+                    }
+                    if i >= bytes.len() {
+                        break;
+                    }
+                    let t2_start = i;
+                    while i < bytes.len() && !bytes[i].is_ascii_whitespace() {
+                        i += 1;
+                    }
+                    // Append the whitespace we skipped + the token.
+                    joined.push_str(&s[ws_start..i]);
+                    let _ = t2_start; // for clarity; the slice already covers it
+                }
+                // Ambiguity: a `var()` token could be either the style or the
+                // color component of the shorthand. We treat it as a style ONLY
+                // when no style has been set yet (neither a keyword nor a prior
+                // var-style); once a style is set, a later `var()` is the color.
+                // This makes both `var(--bs) #f00` (var as style) and
+                // `rounded var(--rim)` (var as color) parse correctly.
+                let style_already_set =
+                    !matches!(style, BorderStyleValue::Fixed(BorderStyle::None));
+                if style_already_set {
+                    // Treat as a color token — push the FULL rejoined var(...)
+                    // expression (which may span multiple whitespace-separated
+                    // tokens) so a fallback like `var(--nope, #00ff00)` survives.
+                    // `[start..i]` is a slice of the original `s` that covers the
+                    // whole expression, so it satisfies the `&str` borrow.
+                    color_tokens.push(&s[start..i]);
+                } else {
+                    consumed.push((start, i));
+                    style = BorderStyleValue::parse(&joined)?;
+                }
+            } else if tok.ends_with("px") {
+                // width — present-but-ignored (terminal borders are always 1 cell).
+                consumed.push((start, start + tok.len()));
+            } else if let Some(parsed) = BorderStyle::parse_keyword(tok) {
+                consumed.push((start, start + tok.len()));
+                style = BorderStyleValue::Fixed(parsed);
             } else {
+                // Color token — handled in the second pass below.
                 color_tokens.push(tok);
             }
         }
@@ -291,9 +368,14 @@ impl BorderSpec {
     /// the cascade that lets two atomic rules — e.g. `.rounded` (style only)
     /// and `.border-slate-700` (color only) — compose into one border instead
     /// of one clobbering the other.
+    ///
+    /// A `BorderStyleValue::Var` counts as declared (it may resolve to a
+    /// non-`None` style), so it overrides any existing style.
     pub fn merge(&mut self, other: &BorderSpec) {
-        if other.style != BorderStyle::None {
-            self.style = other.style;
+        let other_declares_style =
+            !matches!(other.style, BorderStyleValue::Fixed(BorderStyle::None));
+        if other_declares_style {
+            self.style = other.style.clone();
         }
         if other.color.is_some() {
             self.color = other.color.clone();
@@ -327,6 +409,194 @@ impl BorderStyle {
             Self::Rounded => "rounded",
             Self::Double => "double",
             Self::Thick => "thick",
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// var()-carrying wrappers: BoxEdgesValue / BorderStyleValue
+// ---------------------------------------------------------------------------
+
+/// A `BoxEdges` value **or** a `var(--name)` reference, for `padding`/`margin`.
+///
+/// `BoxEdges` itself is `Copy` (4× `u16`) and cannot carry a heap `String`, so
+/// the var name lives in this wrapper enum. The cascade
+/// ([`crate::cascade`]) resolves `Var` against the token table; an unresolved
+/// `Var` degrades to zero edges (mirroring how an unresolved color `Var`
+/// degrades to `Reset`).
+#[derive(Debug, Clone, PartialEq)]
+pub enum BoxEdgesValue {
+    /// A concrete set of edges.
+    Edges(BoxEdges),
+    /// A `var(--name[, fallback])` reference, resolved during the cascade.
+    Var {
+        name: String,
+        fallback: Option<Box<BoxEdgesValue>>,
+    },
+}
+
+impl BoxEdgesValue {
+    /// Parse a CSS shorthand that may be a `var(--name)` reference.
+    ///
+    /// If `s` starts with `var(` (case-insensitive), the name and optional
+    /// fallback are split on the first top-level comma (mirroring `Length::parse`
+    /// / `Color::parse_var`); the fallback recurses via
+    /// [`BoxEdgesValue::parse`]. Otherwise `s` is parsed as a concrete
+    /// [`BoxEdges`] shorthand.
+    pub fn parse(s: &str) -> Result<Self> {
+        let s = s.trim();
+        let lower = s.to_ascii_lowercase();
+        if let Some(rest) = lower.strip_prefix("var(") {
+            // `rest` still has the trailing ')'.
+            let inner = rest.strip_suffix(')').unwrap_or(rest);
+            let (name_part, fallback_part) = split_top_comma(inner);
+            let name = name_part.trim().trim_start_matches('-').trim().to_string();
+            if name.is_empty() {
+                return Err(CssError::invalid_length(format!(
+                    "var(): empty name in {s}"
+                )));
+            }
+            let fallback = match fallback_part.trim() {
+                "" => None,
+                expr => Some(Box::new(Self::parse(expr)?)),
+            };
+            return Ok(Self::Var { name, fallback });
+        }
+        BoxEdges::parse(s).map(Self::Edges)
+    }
+
+    /// `true` if this is a `var()` reference that needs token resolution.
+    pub fn is_var(&self) -> bool {
+        matches!(self, Self::Var { .. })
+    }
+
+    /// Shortcut for `var(--name)` with no fallback.
+    pub fn var(name: impl Into<String>) -> Self {
+        Self::Var {
+            name: name.into(),
+            fallback: None,
+        }
+    }
+}
+
+impl From<BoxEdges> for BoxEdgesValue {
+    fn from(e: BoxEdges) -> Self {
+        Self::Edges(e)
+    }
+}
+
+impl std::fmt::Display for BoxEdgesValue {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Edges(e) => {
+                let e = *e;
+                if e.top == e.right && e.right == e.bottom && e.bottom == e.left {
+                    write!(f, "{}", e.top)
+                } else {
+                    write!(f, "{} {} {} {}", e.top, e.right, e.bottom, e.left)
+                }
+            }
+            Self::Var { name, fallback } => match fallback {
+                Some(fb) => write!(f, "var(--{name}, {fb})"),
+                None => write!(f, "var(--{name})"),
+            },
+        }
+    }
+}
+
+/// A `BorderStyle` value **or** a `var(--name)` reference, for `border-style`.
+///
+/// `BorderStyle` itself is `Copy` and cannot carry a heap `String`, so the var
+/// name lives in this wrapper enum. The cascade resolves `Var` against the
+/// token table; an unresolved `Var` degrades to `BorderStyle::None`.
+#[derive(Debug, Clone, PartialEq)]
+pub enum BorderStyleValue {
+    /// A concrete border style.
+    Fixed(BorderStyle),
+    /// A `var(--name[, fallback])` reference, resolved during the cascade.
+    Var {
+        name: String,
+        fallback: Option<Box<BorderStyleValue>>,
+    },
+}
+
+impl BorderStyleValue {
+    /// Parse a keyword or a `var(--name)` reference.
+    ///
+    /// If `s` starts with `var(` (case-insensitive), the name and optional
+    /// fallback are split on the first top-level comma (mirroring
+    /// [`BoxEdgesValue::parse`]); the fallback recurses via
+    /// [`BorderStyleValue::parse`]. Otherwise `s` must be a valid
+    /// [`BorderStyle`] keyword (error if not — mirroring the current
+    /// `border-style` declaration behavior).
+    pub fn parse(s: &str) -> Result<Self> {
+        let s = s.trim();
+        let lower = s.to_ascii_lowercase();
+        if let Some(rest) = lower.strip_prefix("var(") {
+            let inner = rest.strip_suffix(')').unwrap_or(rest);
+            let (name_part, fallback_part) = split_top_comma(inner);
+            let name = name_part.trim().trim_start_matches('-').trim().to_string();
+            if name.is_empty() {
+                return Err(CssError::invalid_length(format!(
+                    "var(): empty name in {s}"
+                )));
+            }
+            let fallback = match fallback_part.trim() {
+                "" => None,
+                expr => Some(Box::new(Self::parse(expr)?)),
+            };
+            return Ok(Self::Var { name, fallback });
+        }
+        match BorderStyle::parse_keyword(s) {
+            Some(b) => Ok(Self::Fixed(b)),
+            None => Err(CssError::invalid_length(format!("border-style: {s}"))),
+        }
+    }
+
+    /// `true` if this is a `var()` reference that needs token resolution.
+    pub fn is_var(&self) -> bool {
+        matches!(self, Self::Var { .. })
+    }
+
+    /// Return the concrete [`BorderStyle`] if this is `Fixed`, else `None`
+    /// (for an unresolved `Var`). Used by projections that need a concrete
+    /// style; a `Var` degrades to `None` (treated as `BorderStyle::None`).
+    pub fn as_fixed(&self) -> Option<BorderStyle> {
+        match self {
+            Self::Fixed(b) => Some(*b),
+            Self::Var { .. } => None,
+        }
+    }
+
+    /// Shortcut for `var(--name)` with no fallback.
+    pub fn var(name: impl Into<String>) -> Self {
+        Self::Var {
+            name: name.into(),
+            fallback: None,
+        }
+    }
+}
+
+impl From<BorderStyle> for BorderStyleValue {
+    fn from(b: BorderStyle) -> Self {
+        Self::Fixed(b)
+    }
+}
+
+impl Default for BorderStyleValue {
+    fn default() -> Self {
+        Self::Fixed(BorderStyle::None)
+    }
+}
+
+impl std::fmt::Display for BorderStyleValue {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Fixed(b) => f.write_str(b.as_keyword()),
+            Self::Var { name, fallback } => match fallback {
+                Some(fb) => write!(f, "var(--{name}, {fb})"),
+                None => write!(f, "var(--{name})"),
+            },
         }
     }
 }
@@ -469,50 +739,59 @@ fn length_to_css(length: &Length) -> String {
 /// - `&str` → CSS shorthand (`"1"`, `"1 2"`, `"1 2 3"`, `"1 2 3 4"`); a bad
 ///   literal **panics**. Only use the string form for compile-time-known
 ///   literals — pass a `u16` or tuple for infallible construction.
+/// - [`BoxEdges`] / [`BoxEdgesValue`] → passed through (identity). A
+///   `BoxEdgesValue::Var` can be passed to declare a `var()` padding/margin
+///   programmatically.
 pub trait IntoBoxEdges {
-    fn into_edges(self) -> BoxEdges;
+    fn into_edges(self) -> BoxEdgesValue;
 }
 
 impl IntoBoxEdges for u16 {
-    fn into_edges(self) -> BoxEdges {
-        BoxEdges::uniform(self)
+    fn into_edges(self) -> BoxEdgesValue {
+        BoxEdgesValue::Edges(BoxEdges::uniform(self))
     }
 }
 
 impl IntoBoxEdges for (u16, u16) {
-    fn into_edges(self) -> BoxEdges {
+    fn into_edges(self) -> BoxEdgesValue {
         let (a, b) = self;
-        BoxEdges {
+        BoxEdgesValue::Edges(BoxEdges {
             top: a,
             bottom: a,
             left: b,
             right: b,
-        }
+        })
     }
 }
 
 impl IntoBoxEdges for (u16, u16, u16, u16) {
-    fn into_edges(self) -> BoxEdges {
+    fn into_edges(self) -> BoxEdgesValue {
         let (top, right, bottom, left) = self;
-        BoxEdges {
+        BoxEdgesValue::Edges(BoxEdges {
             top,
             right,
             bottom,
             left,
-        }
+        })
     }
 }
 
 impl IntoBoxEdges for &str {
-    fn into_edges(self) -> BoxEdges {
-        BoxEdges::parse(self).expect(
+    fn into_edges(self) -> BoxEdgesValue {
+        BoxEdgesValue::parse(self).expect(
             "invalid padding/margin shorthand — pass a u16 or tuple for infallible construction",
         )
     }
 }
 
 impl IntoBoxEdges for BoxEdges {
-    fn into_edges(self) -> BoxEdges {
+    fn into_edges(self) -> BoxEdgesValue {
+        BoxEdgesValue::Edges(self)
+    }
+}
+
+impl IntoBoxEdges for BoxEdgesValue {
+    fn into_edges(self) -> BoxEdgesValue {
         self
     }
 }
@@ -535,7 +814,7 @@ impl IntoBorderSpec for BorderStyle {
     fn into_spec(self) -> BorderSpec {
         // edges: None → borders() falls back to ALL (legacy behavior).
         BorderSpec {
-            style: self,
+            style: BorderStyleValue::Fixed(self),
             color: None,
             edges: None,
         }
@@ -546,7 +825,7 @@ impl<C: Into<Color>> IntoBorderSpec for (BorderStyle, C) {
     fn into_spec(self) -> BorderSpec {
         let (style, color) = self;
         BorderSpec {
-            style,
+            style: BorderStyleValue::Fixed(style),
             color: Some(color.into()),
             edges: None,
         }
@@ -576,28 +855,28 @@ mod tests {
         // `.rounded` (style only) + `.border-blue` (color only) compose into
         // one spec rather than one clobbering the other.
         let mut a = BorderSpec {
-            style: BorderStyle::Rounded,
+            style: BorderStyleValue::Fixed(BorderStyle::Rounded),
             color: None,
             edges: None,
         };
         let b = BorderSpec {
-            style: BorderStyle::None,
+            style: BorderStyleValue::Fixed(BorderStyle::None),
             color: Some(Color::literal(RC::Blue)),
             edges: None,
         };
         a.merge(&b);
-        assert_eq!(a.style, BorderStyle::Rounded); // survived
+        assert_eq!(a.style, BorderStyleValue::Fixed(BorderStyle::Rounded)); // survived
         assert_eq!(a.color, Some(Color::literal(RC::Blue))); // applied
 
         // An all-default other (style=None, no color) declares nothing → merge
         // leaves the existing spec untouched.
         let mut c = BorderSpec {
-            style: BorderStyle::Double,
+            style: BorderStyleValue::Fixed(BorderStyle::Double),
             color: None,
             edges: None,
         };
         c.merge(&BorderSpec::default());
-        assert_eq!(c.style, BorderStyle::Double);
+        assert_eq!(c.style, BorderStyleValue::Fixed(BorderStyle::Double));
     }
 
     #[test]
@@ -689,33 +968,43 @@ mod tests {
 
     #[test]
     fn into_box_edges_uniform() {
-        let e: BoxEdges = 1u16.into_edges();
-        assert_eq!(e, BoxEdges::uniform(1));
+        let e: BoxEdgesValue = 1u16.into_edges();
+        assert_eq!(e, BoxEdgesValue::Edges(BoxEdges::uniform(1)));
     }
 
     #[test]
     fn into_box_edges_pair() {
-        let e: BoxEdges = (0u16, 2u16).into_edges();
-        assert_eq!((e.top, e.right, e.bottom, e.left), (0, 2, 0, 2));
+        let e: BoxEdgesValue = (0u16, 2u16).into_edges();
+        match e {
+            BoxEdgesValue::Edges(e) => {
+                assert_eq!((e.top, e.right, e.bottom, e.left), (0, 2, 0, 2));
+            }
+            other => panic!("expected Edges, got {other:?}"),
+        }
     }
 
     #[test]
     fn into_box_edges_quad() {
-        let e: BoxEdges = (1u16, 2u16, 3u16, 4u16).into_edges();
-        assert_eq!((e.top, e.right, e.bottom, e.left), (1, 2, 3, 4));
+        let e: BoxEdgesValue = (1u16, 2u16, 3u16, 4u16).into_edges();
+        match e {
+            BoxEdgesValue::Edges(e) => {
+                assert_eq!((e.top, e.right, e.bottom, e.left), (1, 2, 3, 4));
+            }
+            other => panic!("expected Edges, got {other:?}"),
+        }
     }
 
     #[test]
     fn into_box_edges_string_matches_pair() {
         let typed = (0u16, 2u16).into_edges();
-        let from_str: BoxEdges = "0 2".into_edges();
+        let from_str: BoxEdgesValue = "0 2".into_edges();
         assert_eq!(typed, from_str);
     }
 
     #[test]
     fn into_border_spec_style_only() {
         let spec = BorderStyle::Rounded.into_spec();
-        assert_eq!(spec.style, BorderStyle::Rounded);
+        assert_eq!(spec.style, BorderStyleValue::Fixed(BorderStyle::Rounded));
         assert_eq!(spec.color, None);
     }
 
@@ -723,7 +1012,7 @@ mod tests {
     fn into_border_spec_with_color() {
         use ratatui::style::Color as RC;
         let spec = (BorderStyle::Double, "#ff0000").into_spec();
-        assert_eq!(spec.style, BorderStyle::Double);
+        assert_eq!(spec.style, BorderStyleValue::Fixed(BorderStyle::Double));
         assert_eq!(spec.color, Some(Color::literal(RC::Rgb(255, 0, 0))));
     }
 
@@ -743,7 +1032,7 @@ mod tests {
     fn border_full_shorthand_all_edges() {
         // The full `border` shorthand declares edges == ALL.
         let spec = BorderSpec::parse_shorthand("rounded").unwrap();
-        assert_eq!(spec.style, BorderStyle::Rounded);
+        assert_eq!(spec.style, BorderStyleValue::Fixed(BorderStyle::Rounded));
         assert_eq!(spec.edges, Some(Borders::ALL));
         assert_eq!(spec.borders(), Borders::ALL);
     }
@@ -753,7 +1042,7 @@ mod tests {
         // A spec built the legacy way (style set, edges == None) still draws
         // all four edges — this is the regression-protected `.rounded` path.
         let spec = BorderSpec {
-            style: BorderStyle::Rounded,
+            style: BorderStyleValue::Fixed(BorderStyle::Rounded),
             color: None,
             edges: None,
         };
@@ -764,7 +1053,7 @@ mod tests {
     fn border_none_style_draws_nothing_even_with_edges() {
         // A None style short-circuits to NONE regardless of edges.
         let spec = BorderSpec {
-            style: BorderStyle::None,
+            style: BorderStyleValue::Fixed(BorderStyle::None),
             color: None,
             edges: Some(Borders::BOTTOM),
         };
@@ -776,17 +1065,17 @@ mod tests {
         // `.border-top` + `.border-bottom` compose into TOP | BOTTOM via merge,
         // mirroring how `.rounded` + `.border-color` compose on style/color.
         let mut a = BorderSpec {
-            style: BorderStyle::Rounded,
+            style: BorderStyleValue::Fixed(BorderStyle::Rounded),
             color: None,
             edges: Some(Borders::TOP),
         };
         let b = BorderSpec {
-            style: BorderStyle::None,
+            style: BorderStyleValue::Fixed(BorderStyle::None),
             color: None,
             edges: Some(Borders::BOTTOM),
         };
         a.merge(&b);
-        assert_eq!(a.style, BorderStyle::Rounded); // survived
+        assert_eq!(a.style, BorderStyleValue::Fixed(BorderStyle::Rounded)); // survived
         assert_eq!(a.edges, Some(Borders::TOP | Borders::BOTTOM));
         assert_eq!(a.borders(), Borders::TOP | Borders::BOTTOM);
     }
@@ -796,12 +1085,12 @@ mod tests {
         // A legacy spec (edges == None) merged into a per-edge spec must NOT
         // clobber the accumulated edges — merge only ORs when other declares.
         let mut a = BorderSpec {
-            style: BorderStyle::Rounded,
+            style: BorderStyleValue::Fixed(BorderStyle::Rounded),
             color: None,
             edges: Some(Borders::TOP),
         };
         let legacy = BorderSpec {
-            style: BorderStyle::None,
+            style: BorderStyleValue::Fixed(BorderStyle::None),
             color: None,
             edges: None,
         };
@@ -815,12 +1104,12 @@ mod tests {
         // declaration: merge ORs ALL | BOTTOM == ALL (no narrowing). And a full
         // shorthand after edges keeps ALL.
         let mut a = BorderSpec {
-            style: BorderStyle::Rounded,
+            style: BorderStyleValue::Fixed(BorderStyle::Rounded),
             color: None,
             edges: Some(Borders::ALL),
         };
         let b = BorderSpec {
-            style: BorderStyle::None,
+            style: BorderStyleValue::Fixed(BorderStyle::None),
             color: None,
             edges: Some(Borders::BOTTOM),
         };
@@ -911,6 +1200,202 @@ mod tests {
             assert_eq!(BorderSpec::parse_edges(kw), Some(edges), "roundtrip {kw}");
         }
     }
+
+    // -----------------------------------------------------------------
+    // BoxEdgesValue / BorderStyleValue (var() wrappers)
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn box_edges_value_parse_var_no_fallback() {
+        assert_eq!(
+            BoxEdgesValue::parse("var(--pad)").unwrap(),
+            BoxEdgesValue::Var {
+                name: "pad".into(),
+                fallback: None,
+            }
+        );
+        // Case-insensitive VAR( prefix.
+        assert_eq!(
+            BoxEdgesValue::parse("VAR(--pad)").unwrap(),
+            BoxEdgesValue::Var {
+                name: "pad".into(),
+                fallback: None,
+            }
+        );
+    }
+
+    #[test]
+    fn box_edges_value_parse_concrete() {
+        let e = BoxEdgesValue::parse("1 2").unwrap();
+        match e {
+            BoxEdgesValue::Edges(e) => {
+                assert_eq!((e.top, e.right, e.bottom, e.left), (1, 2, 1, 2));
+            }
+            other => panic!("expected Edges, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn box_edges_value_parse_var_with_fallback() {
+        let v = BoxEdgesValue::parse("var(--pad, 1)").unwrap();
+        match v {
+            BoxEdgesValue::Var {
+                name,
+                fallback: Some(fb),
+            } => {
+                assert_eq!(name, "pad");
+                assert_eq!(*fb, BoxEdgesValue::Edges(BoxEdges::uniform(1)));
+            }
+            other => panic!("expected Var with fallback, got {other:?}"),
+        }
+        // 4-value fallback parses as a full BoxEdges.
+        let v = BoxEdgesValue::parse("var(--pad, 1 2 3 4)").unwrap();
+        match v {
+            BoxEdgesValue::Var { fallback: Some(fb), .. } => match *fb {
+                BoxEdgesValue::Edges(e) => {
+                    assert_eq!((e.top, e.right, e.bottom, e.left), (1, 2, 3, 4));
+                }
+                other => panic!("expected Edges fallback, got {other:?}"),
+            },
+            other => panic!("expected Var, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn box_edges_value_empty_name_errors() {
+        assert!(BoxEdgesValue::parse("var(--)").is_err());
+    }
+
+    #[test]
+    fn box_edges_value_display_roundtrip() {
+        // Concrete uniform → single number.
+        let v = BoxEdgesValue::Edges(BoxEdges::uniform(3));
+        assert_eq!(v.to_string(), "3");
+        // Concrete multi → "1 2 3 4".
+        let v = BoxEdgesValue::Edges(BoxEdges {
+            top: 1,
+            right: 2,
+            bottom: 3,
+            left: 4,
+        });
+        assert_eq!(v.to_string(), "1 2 3 4");
+        // Var no fallback.
+        let v = BoxEdgesValue::var("pad");
+        assert_eq!(v.to_string(), "var(--pad)");
+        // Var with fallback.
+        let v = BoxEdgesValue::Var {
+            name: "pad".into(),
+            fallback: Some(Box::new(BoxEdgesValue::Edges(BoxEdges::uniform(1)))),
+        };
+        assert_eq!(v.to_string(), "var(--pad, 1)");
+    }
+
+    #[test]
+    fn border_style_value_parse_var() {
+        assert_eq!(
+            BorderStyleValue::parse("var(--bs)").unwrap(),
+            BorderStyleValue::Var {
+                name: "bs".into(),
+                fallback: None,
+            }
+        );
+    }
+
+    #[test]
+    fn border_style_value_parse_keyword() {
+        assert_eq!(
+            BorderStyleValue::parse("rounded").unwrap(),
+            BorderStyleValue::Fixed(BorderStyle::Rounded)
+        );
+        assert_eq!(
+            BorderStyleValue::parse("none").unwrap(),
+            BorderStyleValue::Fixed(BorderStyle::None)
+        );
+    }
+
+    #[test]
+    fn border_style_value_garbage_errors() {
+        assert!(BorderStyleValue::parse("banana").is_err());
+    }
+
+    #[test]
+    fn border_style_value_parse_var_with_fallback() {
+        let v = BorderStyleValue::parse("var(--bs, rounded)").unwrap();
+        match v {
+            BorderStyleValue::Var {
+                name,
+                fallback: Some(fb),
+            } => {
+                assert_eq!(name, "bs");
+                assert_eq!(*fb, BorderStyleValue::Fixed(BorderStyle::Rounded));
+            }
+            other => panic!("expected Var with fallback, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn border_style_value_display_roundtrip() {
+        assert_eq!(
+            BorderStyleValue::Fixed(BorderStyle::Rounded).to_string(),
+            "rounded"
+        );
+        assert_eq!(BorderStyleValue::var("bs").to_string(), "var(--bs)");
+    }
+
+    #[test]
+    fn border_shorthand_accepts_var_style_component() {
+        // `border: var(--bs)` — the style component is a var.
+        let spec = BorderSpec::parse_shorthand("var(--bs)").unwrap();
+        assert_eq!(spec.style, BorderStyleValue::var("bs"));
+        assert_eq!(spec.edges, Some(Borders::ALL));
+        // `border: var(--bs) #f00` — var style + a literal color.
+        let spec = BorderSpec::parse_shorthand("var(--bs) #f00").unwrap();
+        assert_eq!(spec.style, BorderStyleValue::var("bs"));
+        use ratatui::style::Color as RC;
+        assert_eq!(spec.color, Some(Color::literal(RC::Rgb(0xff, 0, 0))));
+    }
+
+    #[test]
+    fn border_shorthand_var_with_fallback_in_style() {
+        // A var with a fallback that is itself a keyword: "var(--bs, rounded)".
+        let spec = BorderSpec::parse_shorthand("var(--bs, rounded) #f00").unwrap();
+        assert_eq!(
+            spec.style,
+            BorderStyleValue::Var {
+                name: "bs".into(),
+                fallback: Some(Box::new(BorderStyleValue::Fixed(BorderStyle::Rounded))),
+            }
+        );
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn box_edges_value_serde_roundtrip() {
+        let v = BoxEdgesValue::Edges(BoxEdges::uniform(2));
+        let json = serde_json::to_string(&v).unwrap();
+        let back: BoxEdgesValue = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, v);
+        // Var form.
+        let v = BoxEdgesValue::var("pad");
+        let json = serde_json::to_string(&v).unwrap();
+        assert!(json.contains("var(--pad)"), "serialize var: {json}");
+        let back: BoxEdgesValue = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, v);
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn border_style_value_serde_roundtrip() {
+        let v = BorderStyleValue::Fixed(BorderStyle::Rounded);
+        let json = serde_json::to_string(&v).unwrap();
+        let back: BorderStyleValue = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, v);
+        let v = BorderStyleValue::var("bs");
+        let json = serde_json::to_string(&v).unwrap();
+        assert!(json.contains("var(--bs)"), "serialize var: {json}");
+        let back: BorderStyleValue = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, v);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -919,7 +1404,9 @@ mod tests {
 
 #[cfg(feature = "serde")]
 mod serde_impl {
-    use super::{length_to_css, BorderSpec, BorderStyle, BoxEdges, Length};
+    use super::{
+        length_to_css, BorderSpec, BorderStyle, BorderStyleValue, BoxEdges, BoxEdgesValue, Length,
+    };
     use crate::color::Color;
     use ratatui::widgets::Borders;
     use serde::{
@@ -1069,6 +1556,94 @@ mod serde_impl {
     }
 
     // -------------------------------------------------------------------------
+    // BoxEdgesValue — a number/shorthand string (→ Edges) OR a `var(...)` /
+    // `"1 2"` string. Mirrors BoxEdges' deserialize_any so an integer uniform
+    // value stays an integer in JSON/TOML/YAML, while a multi-value or var
+    // form is a string.
+    // -------------------------------------------------------------------------
+
+    impl<'de> Deserialize<'de> for BoxEdgesValue {
+        fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+            struct BoxEdgesValueVisitor;
+
+            impl<'de> Visitor<'de> for BoxEdgesValueVisitor {
+                type Value = BoxEdgesValue;
+
+                fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                    f.write_str("a CSS box shorthand or var() string (number or string)")
+                }
+
+                fn visit_i64<E: de::Error>(self, v: i64) -> Result<BoxEdgesValue, E> {
+                    Ok(BoxEdgesValue::Edges(BoxEdges::uniform(v.max(0) as u16)))
+                }
+                fn visit_u64<E: de::Error>(self, v: u64) -> Result<BoxEdgesValue, E> {
+                    Ok(BoxEdgesValue::Edges(BoxEdges::uniform(v as u16)))
+                }
+                fn visit_f64<E: de::Error>(self, v: f64) -> Result<BoxEdgesValue, E> {
+                    Ok(BoxEdgesValue::Edges(BoxEdges::uniform(v.max(0.0) as u16)))
+                }
+                fn visit_str<E: de::Error>(self, v: &str) -> Result<BoxEdgesValue, E> {
+                    BoxEdgesValue::parse(v).map_err(E::custom)
+                }
+                fn visit_string<E: de::Error>(self, v: String) -> Result<BoxEdgesValue, E> {
+                    BoxEdgesValue::parse(&v).map_err(E::custom)
+                }
+            }
+
+            d.deserialize_any(BoxEdgesValueVisitor)
+        }
+    }
+    impl Serialize for BoxEdgesValue {
+        fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+            match self {
+                BoxEdgesValue::Edges(e) => {
+                    if e.top == e.right && e.right == e.bottom && e.bottom == e.left {
+                        s.serialize_u64(e.top as u64)
+                    } else {
+                        s.serialize_str(&format!(
+                            "{} {} {} {}",
+                            e.top, e.right, e.bottom, e.left
+                        ))
+                    }
+                }
+                BoxEdgesValue::Var { .. } => s.serialize_str(&self.to_string()),
+            }
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // BorderStyleValue — a keyword string OR a `var(...)` string.
+    // -------------------------------------------------------------------------
+
+    impl<'de> Deserialize<'de> for BorderStyleValue {
+        fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+            struct BorderStyleValueVisitor;
+
+            impl<'de> Visitor<'de> for BorderStyleValueVisitor {
+                type Value = BorderStyleValue;
+
+                fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                    f.write_str("a border style keyword or var() string")
+                }
+
+                fn visit_str<E: de::Error>(self, v: &str) -> Result<BorderStyleValue, E> {
+                    BorderStyleValue::parse(v).map_err(E::custom)
+                }
+                fn visit_string<E: de::Error>(self, v: String) -> Result<BorderStyleValue, E> {
+                    BorderStyleValue::parse(&v).map_err(E::custom)
+                }
+            }
+
+            d.deserialize_str(BorderStyleValueVisitor)
+        }
+    }
+    impl Serialize for BorderStyleValue {
+        fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+            s.serialize_str(&self.to_string())
+        }
+    }
+
+    // -------------------------------------------------------------------------
     // EdgesInput — accepts either an edges keyword string ("top", "all",
     // "top|left", …) or a raw bit integer. Format-agnostic via deserialize_any.
     // Used by the BorderSpec map branch for the `edges` field.
@@ -1196,7 +1771,7 @@ mod serde_impl {
                 }
 
                 fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<BorderSpec, A::Error> {
-                    let mut style: Option<BorderStyle> = None;
+                    let mut style: Option<BorderStyleValue> = None;
                     let mut color: Option<Color> = None;
                     let mut edges: Option<Borders> = None;
                     while let Some(key) = map.next_key::<String>()? {

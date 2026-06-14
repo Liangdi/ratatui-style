@@ -8,29 +8,32 @@ use std::collections::HashMap;
 
 use ratatui::style::Color as RColor;
 
-use crate::box_model::Length;
+use crate::box_model::{BorderStyle, BoxEdges, Length};
 use crate::color::Color;
 use crate::error::{CssError, Result};
 use crate::media::{MediaContext, MediaQuery};
 
-/// A CSS custom-property value. Currently supports [`Color`] and [`Length`]
-/// (the latter for `width`/`height`). The color fields — `color`,
-/// `background`, `underline-color`, and the `color` nested inside a `border`
-/// spec — are all `var()`-driven and resolved during the cascade. By contrast
-/// `padding`/`margin` and a border's *style*/*edges* cannot yet be driven by
-/// `var()` (their `BoxEdges`/`BorderStyle`/`Borders` representations don't
-/// carry a `Var` variant).
+/// A CSS custom-property value. Supports [`Color`], [`Length`], [`BoxEdges`]
+/// (for `padding`/`margin`), and [`BorderStyle`] (for `border-style`). These
+/// are the value types whose fields carry `var()` references: the color fields
+/// (`color`, `background`, `underline-color`, border color), the length fields
+/// (`width`/`height`), `padding`/`margin`, and a border's *style*. A border's
+/// *edges* (`Borders`) cannot yet be driven by `var()`.
 ///
 /// [`Token::Var`] covers the case where a custom property is itself a bare
-/// `var(--other)` reference: its ultimate type (color vs length) is not knowable
-/// at parse time, so it is stored untyped and resolved by following the chain
-/// via [`ThemeTokens::get_color`] / [`ThemeTokens::get_length`].
+/// `var(--other)` reference: its ultimate type (color vs length vs edges vs
+/// style) is not knowable at parse time, so it is stored untyped and resolved by
+/// following the chain via [`ThemeTokens::get_color`] /
+/// [`ThemeTokens::get_length`] / [`ThemeTokens::get_box_edges`] /
+/// [`ThemeTokens::get_border_style`].
 #[derive(Debug, Clone, PartialEq)]
 pub enum Token {
     Color(Color),
     Length(Length),
+    BoxEdges(BoxEdges),
+    BorderStyle(BorderStyle),
     /// A bare `var(--other)` reference whose type is determined by what `--other`
-    /// ultimately resolves to. Both `get_color` and `get_length` follow the chain.
+    /// ultimately resolves to. Every typed getter follows the chain.
     Var { name: String },
 }
 
@@ -43,6 +46,51 @@ impl From<Color> for Token {
 impl From<Length> for Token {
     fn from(l: Length) -> Self {
         Token::Length(l)
+    }
+}
+
+impl From<BoxEdges> for Token {
+    fn from(e: BoxEdges) -> Self {
+        Token::BoxEdges(e)
+    }
+}
+
+impl From<BorderStyle> for Token {
+    fn from(b: BorderStyle) -> Self {
+        Token::BorderStyle(b)
+    }
+}
+
+/// The typed resolution path through the token table. Used internally by
+/// [`ThemeTokens::best_media_map`] to decide whether a binding is compatible
+/// with the requested path (so that, e.g., a length binding does not shadow a
+/// color reference of the same name).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TokenKind {
+    Color,
+    Length,
+    BoxEdges,
+    BorderStyle,
+}
+
+impl TokenKind {
+    /// `true` if `tok` is usable on this path: a `Var` is always compatible
+    /// (its type is determined by what it resolves to); a concrete token is
+    /// compatible only with its own path. The one coercion: a bare cell count
+    /// (`Length::Cells`) is also usable on the box-edges path (a single integer
+    /// is a valid uniform box shorthand), so `--pad: 2` works for both
+    /// `width: var(--pad)` and `padding: var(--pad)`.
+    fn compatible_with(self, tok: &Token) -> bool {
+        match tok {
+            Token::Var { .. } => true,
+            Token::Color(_) => self == TokenKind::Color,
+            Token::Length(Length::Cells(_)) => {
+                self == TokenKind::Length || self == TokenKind::BoxEdges
+            }
+            Token::Length(_) => self == TokenKind::Length,
+            Token::BoxEdges(_) => self == TokenKind::BoxEdges,
+            Token::BorderStyle(_) => self == TokenKind::BorderStyle,
+        }
     }
 }
 
@@ -184,6 +232,34 @@ impl ThemeTokens {
         None
     }
 
+    /// Convenience: look up a variable as a [`BoxEdges`], if it holds one.
+    /// Follows [`Token::Var`] chains like [`get_color`](Self::get_color).
+    pub fn get_box_edges(&self, name: &str) -> Option<&BoxEdges> {
+        let mut cur = name;
+        for _ in 0..32 {
+            match self.vars.get(cur)? {
+                Token::BoxEdges(e) => return Some(e),
+                Token::Var { name: next } => cur = next,
+                _ => return None,
+            }
+        }
+        None
+    }
+
+    /// Convenience: look up a variable as a [`BorderStyle`], if it holds one.
+    /// Follows [`Token::Var`] chains like [`get_color`](Self::get_color).
+    pub fn get_border_style(&self, name: &str) -> Option<&BorderStyle> {
+        let mut cur = name;
+        for _ in 0..32 {
+            match self.vars.get(cur)? {
+                Token::BorderStyle(b) => return Some(b),
+                Token::Var { name: next } => cur = next,
+                _ => return None,
+            }
+        }
+        None
+    }
+
     /// Media-aware color lookup. Among all `media_vars` entries whose query
     /// [`MediaQuery::matches`] `media` **and** whose map binds `name` (following
     /// [`Token::Var`] chains, themselves resolved media-aware), the **most
@@ -205,6 +281,19 @@ impl ThemeTokens {
         self.resolve_length_with(name, media, 0)
     }
 
+    /// Media-aware box-edges lookup — for `padding`/`margin`. Most-specific
+    /// matching query wins (ties → source order). Returns an owned [`BoxEdges`].
+    pub fn get_box_edges_with(&self, name: &str, media: &MediaContext) -> Option<BoxEdges> {
+        self.resolve_box_edges_with(name, media, 0)
+    }
+
+    /// Media-aware border-style lookup — for `border-style`. Most-specific
+    /// matching query wins (ties → source order). Returns an owned
+    /// [`BorderStyle`].
+    pub fn get_border_style_with(&self, name: &str, media: &MediaContext) -> Option<BorderStyle> {
+        self.resolve_border_style_with(name, media, 0)
+    }
+
     /// Recursive, depth-capped, cycle-guarded color resolver for the
     /// media-aware path. Among all matching media overrides, the most specific
     /// one that binds `name` (to a color, or to a `Var` chain) wins; ties go to
@@ -216,9 +305,9 @@ impl ThemeTokens {
             return None;
         }
         // Pick the most-specific matching media override that binds `name` to a
-        // color-compatible token (a `Color` or a `Var` chain — a `Length` is a
-        // type mismatch and does not count as binding for the color path).
-        if let Some(map) = self.best_media_map(name, media, /* color_path */ true) {
+        // color-compatible token (a `Color` or a `Var` chain — any other type
+        // is a type mismatch and does not count as binding for the color path).
+        if let Some(map) = self.best_media_map(name, media, TokenKind::Color) {
             // SAFETY-free: best_media_map only returns Some(map) when map[name]
             // exists and is Color-or-Var; re-fetch the token.
             match map.get(name).expect("best_media_map guarantees map[name] present") {
@@ -226,15 +315,15 @@ impl ThemeTokens {
                 Token::Var { name: next } => {
                     return self.resolve_color_with(next, media, depth + 1);
                 }
-                // Unreachable: best_media_map rejects Length on the color path.
-                Token::Length(_) => return None,
+                // Unreachable: best_media_map rejects non-color tokens on this path.
+                _ => return None,
             }
         }
         // Default fallback.
         match self.vars.get(name)? {
             Token::Color(c) => Some(c.clone()),
             Token::Var { name: next } => self.resolve_color_with(next, media, depth + 1),
-            Token::Length(_) => None,
+            _ => None,
         }
     }
 
@@ -245,30 +334,85 @@ impl ThemeTokens {
         if depth > 32 {
             return None;
         }
-        if let Some(map) = self.best_media_map(name, media, /* color_path */ false) {
+        if let Some(map) = self.best_media_map(name, media, TokenKind::Length) {
             match map.get(name).expect("best_media_map guarantees map[name] present") {
                 Token::Length(l) => return Some(l.clone()),
                 Token::Var { name: next } => {
                     return self.resolve_length_with(next, media, depth + 1);
                 }
-                // Unreachable: best_media_map rejects Color on the length path.
-                Token::Color(_) => return None,
+                _ => return None,
             }
         }
         match self.vars.get(name)? {
             Token::Length(l) => Some(l.clone()),
             Token::Var { name: next } => self.resolve_length_with(next, media, depth + 1),
-            Token::Color(_) => None,
+            _ => None,
+        }
+    }
+
+    /// Recursive, depth-capped box-edges resolver for the media-aware path.
+    /// A `Length::Cells(n)` terminal is coerced to `BoxEdges::uniform(n)` (a
+    /// single integer is a valid uniform box shorthand).
+    fn resolve_box_edges_with(
+        &self,
+        name: &str,
+        media: &MediaContext,
+        depth: u8,
+    ) -> Option<BoxEdges> {
+        if depth > 32 {
+            return None;
+        }
+        if let Some(map) = self.best_media_map(name, media, TokenKind::BoxEdges) {
+            return match map.get(name).expect("best_media_map guarantees map[name] present") {
+                Token::BoxEdges(e) => Some(*e),
+                Token::Length(Length::Cells(n)) => Some(BoxEdges::uniform(*n)),
+                Token::Var { name: next } => {
+                    self.resolve_box_edges_with(next, media, depth + 1)
+                }
+                _ => None,
+            };
+        }
+        match self.vars.get(name)? {
+            Token::BoxEdges(e) => Some(*e),
+            Token::Length(Length::Cells(n)) => Some(BoxEdges::uniform(*n)),
+            Token::Var { name: next } => self.resolve_box_edges_with(next, media, depth + 1),
+            _ => None,
+        }
+    }
+
+    /// Recursive, depth-capped border-style resolver for the media-aware path.
+    fn resolve_border_style_with(
+        &self,
+        name: &str,
+        media: &MediaContext,
+        depth: u8,
+    ) -> Option<BorderStyle> {
+        if depth > 32 {
+            return None;
+        }
+        if let Some(map) = self.best_media_map(name, media, TokenKind::BorderStyle) {
+            match map.get(name).expect("best_media_map guarantees map[name] present") {
+                Token::BorderStyle(b) => return Some(*b),
+                Token::Var { name: next } => {
+                    return self.resolve_border_style_with(next, media, depth + 1);
+                }
+                _ => return None,
+            }
+        }
+        match self.vars.get(name)? {
+            Token::BorderStyle(b) => Some(*b),
+            Token::Var { name: next } => self.resolve_border_style_with(next, media, depth + 1),
+            _ => None,
         }
     }
 
     /// Find the map of the **most specific** matching media override that binds
-    /// `name` to a token usable on the requested path.
+    /// `name` to a token usable on the requested path (`kind`).
     ///
-    /// - `color_path == true`: a binding counts only if it is a `Color` or a
-    ///   `Var` (a `Length` binding is a type mismatch and is skipped).
-    /// - `color_path == false`: symmetric — `Length` or `Var` counts, `Color`
-    ///   is skipped.
+    /// A `Token::Var` binding is compatible with every path (its type is
+    /// determined by what it resolves to). A concrete-typed binding is
+    /// compatible only with its own path (`Color` → color path, `Length` →
+    /// length path, etc.); anything else is a type mismatch and is skipped.
     ///
     /// Ranking: among entries whose query [`MediaQuery::matches`] `media` AND
     /// whose map binds `name` to a path-compatible token, the winner is the one
@@ -283,7 +427,7 @@ impl ThemeTokens {
         &self,
         name: &str,
         media: &MediaContext,
-        color_path: bool,
+        kind: TokenKind,
     ) -> Option<&HashMap<String, Token>> {
         let mut best: Option<(&HashMap<String, Token>, usize)> = None;
         for (query, map) in &self.media_vars {
@@ -297,12 +441,7 @@ impl ThemeTokens {
                 Some(t) => t,
                 None => continue,
             };
-            let compatible = match tok {
-                Token::Var { .. } => true,
-                Token::Color(_) => color_path,
-                Token::Length(_) => !color_path,
-            };
-            if !compatible {
+            if !kind.compatible_with(tok) {
                 continue;
             }
             // Keep the entry with the highest specificity; on a tie, the LATER
@@ -871,5 +1010,96 @@ mod tests {
             tokens.get_color_with("other", &ctx(100)),
             Some(Color::literal(RColor::Blue))
         );
+    }
+
+    // ---------------------------------------------------------------------
+    // BoxEdges / BorderStyle token paths (P6-4)
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn get_box_edges_resolves_named_token() {
+        let tokens = ThemeTokens::new().set("pad", BoxEdges::uniform(2));
+        assert_eq!(tokens.get_box_edges("pad"), Some(&BoxEdges::uniform(2)));
+        // Default (non-media) getter.
+        assert_eq!(
+            tokens.get_box_edges_with("pad", &MediaContext::default()),
+            Some(BoxEdges::uniform(2))
+        );
+    }
+
+    #[test]
+    fn get_box_edges_follows_var_chain() {
+        let edges = BoxEdges { top: 1, right: 2, bottom: 3, left: 4 };
+        let tokens = ThemeTokens::new()
+            .set("pad", Token::Var { name: "pad2".into() })
+            .set("pad2", edges);
+        assert_eq!(tokens.get_box_edges("pad"), Some(&edges));
+    }
+
+    #[test]
+    fn get_border_style_resolves_named_token() {
+        let tokens = ThemeTokens::new().set("bs", BorderStyle::Rounded);
+        assert_eq!(tokens.get_border_style("bs"), Some(&BorderStyle::Rounded));
+        assert_eq!(
+            tokens.get_border_style_with("bs", &MediaContext::default()),
+            Some(BorderStyle::Rounded)
+        );
+    }
+
+    #[test]
+    fn get_border_style_follows_var_chain() {
+        let tokens = ThemeTokens::new()
+            .set("bs", Token::Var { name: "bs2".into() })
+            .set("bs2", BorderStyle::Double);
+        assert_eq!(tokens.get_border_style("bs"), Some(&BorderStyle::Double));
+    }
+
+    #[test]
+    fn get_box_edges_with_media_specificity_override() {
+        // A more-specific media override wins for a BoxEdges token.
+        let tokens = ThemeTokens::new()
+            .set_media(
+                mq("(min-width: 80)"),
+                "pad",
+                BoxEdges::uniform(1),
+            )
+            .set_media(
+                mq("(min-width: 80) and (color)"),
+                "pad",
+                BoxEdges::uniform(2),
+            );
+        assert_eq!(
+            tokens.get_box_edges_with("pad", &ctx(100)),
+            Some(BoxEdges::uniform(2)),
+            "more-specific media override wins for box-edges"
+        );
+    }
+
+    #[test]
+    fn get_border_style_with_media_override() {
+        let tokens = ThemeTokens::new()
+            .set("bs", BorderStyle::Single)
+            .set_media(mq("(min-width: 80)"), "bs", BorderStyle::Rounded);
+        assert_eq!(
+            tokens.get_border_style_with("bs", &ctx(100)),
+            Some(BorderStyle::Rounded)
+        );
+        assert_eq!(
+            tokens.get_border_style_with("bs", &ctx(40)),
+            Some(BorderStyle::Single)
+        );
+    }
+
+    #[test]
+    fn box_edges_token_is_not_a_color() {
+        // A BoxEdges binding does not satisfy a color reference.
+        let tokens = ThemeTokens::new().set("pad", BoxEdges::uniform(1));
+        assert_eq!(tokens.get_color("pad"), None);
+    }
+
+    #[test]
+    fn border_style_token_is_not_a_length() {
+        let tokens = ThemeTokens::new().set("bs", BorderStyle::Rounded);
+        assert_eq!(tokens.get_length("bs"), None);
     }
 }

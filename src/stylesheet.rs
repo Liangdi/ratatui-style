@@ -3,12 +3,13 @@
 //!
 //! A stylesheet is parsed once and queried many times by the cascade engine.
 
-use crate::box_model::Length;
+use crate::box_model::{BorderStyleValue, BoxEdgesValue, Length};
 use crate::color::Color;
 use crate::error::{CssError, Loc, Result};
 use crate::media::MediaQuery;
 use crate::selector::Selector;
 use crate::style::{Align, CssStyle, FontStyle, TextDecoration, Weight};
+use crate::supports::SupportsQuery;
 use crate::token::{ThemeTokens, Token};
 use ratatui::widgets::Borders;
 
@@ -39,6 +40,12 @@ pub struct RuleEntry {
     /// rule whose query does not match the active
     /// [`MediaContext`](crate::media::MediaContext).
     pub media: Option<MediaQuery>,
+    /// The `@supports` query gating this rule, if it came from inside an
+    /// `@supports` block. `None` for top-level (unconditional) rules. The
+    /// cascade skips a rule whose query does not match the active
+    /// [`MediaContext`](crate::media::MediaContext) (for capability conditions)
+    /// or the engine's known-property set (for property conditions).
+    pub supports: Option<SupportsQuery>,
 }
 
 /// A parsed stylesheet.
@@ -125,6 +132,7 @@ impl Stylesheet {
                 origin,
                 order: order_base,
                 media: None,
+                supports: None,
             });
         }
         self.sort_rules();
@@ -138,7 +146,7 @@ impl Stylesheet {
             self.has_combinators = true;
         }
         let order = self.rules.len();
-        self.rules.push(RuleEntry { selector, style, origin, order, media: None });
+        self.rules.push(RuleEntry { selector, style, origin, order, media: None, supports: None });
         self.sort_rules();
         self
     }
@@ -239,8 +247,8 @@ impl Stylesheet {
         // in the original `css`.
         let cleaned = strip_comments(css);
         let mut sheet = Stylesheet::new();
-        // Top-level rules carry no media query.
-        parse_rule_loop(&cleaned, cleaned.as_str(), 0, strict, None, &mut sheet)?;
+        // Top-level rules carry no media query and no supports query.
+        parse_rule_loop(&cleaned, cleaned.as_str(), 0, strict, None, None, &mut sheet)?;
 
         if strict {
             // Any `var(--name)` with no fallback whose name is not declared
@@ -265,6 +273,22 @@ impl Stylesheet {
                         }
                     }
                 }
+                // … and its declared box-edges (padding/margin BoxEdgesValue::Var) …
+                for edges in box_edges_refs(&rule.style) {
+                    if let Some(BoxEdgesValue::Var { name, fallback: None }) = edges {
+                        if !sheet.tokens.is_defined(name) {
+                            return Err(CssError::undefined_variable(name.as_str()));
+                        }
+                    }
+                }
+                // … and its declared border style (BorderStyleValue::Var).
+                if let Some(BorderStyleValue::Var { name, fallback: None }) =
+                    border_style_ref(&rule.style)
+                {
+                    if !sheet.tokens.is_defined(name) {
+                        return Err(CssError::undefined_variable(name.as_str()));
+                    }
+                }
             }
         }
 
@@ -287,14 +311,19 @@ impl Stylesheet {
     }
 }
 
-/// The per-rule parsing loop, extracted so an `@media` block body can be parsed
-/// by re-entering it with a `media` tag applied to every rule it adds.
+/// The per-rule parsing loop, extracted so an `@media` / `@supports` block body
+/// can be parsed by re-entering it with a `media` / `supports` tag applied to
+/// every rule it adds.
 ///
 /// - `cleaned` — the full comment-stripped source (used for `line_col` offsets).
 /// - `rest` — the slice of `cleaned` being parsed in this call.
 /// - `rest_off` — the byte offset of `rest` within `cleaned`.
 /// - `media` — when `Some`, every element rule parsed here is tagged with this
 ///   query (it came from inside an `@media` block). Top-level calls pass `None`.
+/// - `supports` — when `Some`, every element rule parsed here is tagged with
+///   this query (it came from inside an `@supports` block). Top-level calls
+///   pass `None`. If BOTH `media` and `supports` are `Some`, the inner rule
+///   carries both tags — it applies only when BOTH match.
 ///
 /// # Offset correctness (the key invariant)
 ///
@@ -312,6 +341,7 @@ fn parse_rule_loop(
     rest_off_in: usize,
     strict: bool,
     media: Option<&MediaQuery>,
+    supports: Option<&SupportsQuery>,
     sheet: &mut Stylesheet,
 ) -> Result<()> {
     let mut rest = rest_in;
@@ -383,10 +413,47 @@ fn parse_rule_loop(
             };
             // Recurse: parse the body fragment with the combined query tagging
             // its rules (and :root inserts landing in `media_vars` under it).
+            // The `supports` tag is threaded through unchanged so an outer
+            // `@supports` continues to gate rules inside a nested `@media`.
             // The body lives in
             // `cleaned[body_offset..body_offset + body.len()]`, so offsets stay
             // correct.
-            parse_rule_loop(cleaned, body, body_offset, strict, Some(&combined), sheet)?;
+            parse_rule_loop(cleaned, body, body_offset, strict, Some(&combined), supports, sheet)?;
+            continue;
+        }
+
+        // `@supports (query) { … }` — parse the query and recurse on the body.
+        // Case-insensitive match on the leading `@supports` keyword. The
+        // remainder (trimmed) is the query string. `@supports` blocks nest
+        // braces the same way as `@media`, so the depth-aware `close_rel` scan
+        // already found the correct outer `}`.
+        let lowered_head_9 = selector_part
+            .get(..9)
+            .map(|s| s.to_ascii_lowercase())
+            .unwrap_or_default();
+        let is_supports_at = lowered_head_9 == "@supports";
+        if is_supports_at {
+            let query_str = selector_part[9..].trim();
+            let inner_query = SupportsQuery::parse(query_str).map_err(|mut e| {
+                if e.loc.is_none() {
+                    let loc = line_col(cleaned, sel_off);
+                    e = e.at(loc.line, loc.column);
+                }
+                e
+            })?;
+            // Unlike `@media`, there is no AND-combinator across nested
+            // `@supports` blocks: the inner query is stored verbatim per-rule.
+            // But an OUTER `@supports` must continue to gate the rules inside:
+            // we use the inner query when there is no enclosing supports query,
+            // otherwise the enclosing one takes precedence (the inner rule
+            // carries only one `supports` tag — the outermost `@supports` in
+            // effect). This mirrors how a top-level `@supports` tags rules
+            // directly. An inner `@supports` inside an outer `@supports` is
+            // therefore subsumed by the outer tag for v1 (documented
+            // limitation). The `media` tag is threaded through unchanged so an
+            // outer `@media` continues to gate rules inside a `@supports`.
+            let effective_supports = supports.unwrap_or(&inner_query);
+            parse_rule_loop(cleaned, body, body_offset, strict, media, Some(effective_supports), sheet)?;
             continue;
         }
 
@@ -434,7 +501,7 @@ fn parse_rule_loop(
         }
 
         // Parse the selector list and push each variant, tagging with the media
-        // query when present.
+        // and supports queries when present.
         let sels = match Selector::parse_list(selector_part) {
             Ok(v) => v,
             Err(mut e) => {
@@ -456,6 +523,7 @@ fn parse_rule_loop(
                 origin: Origin::User,
                 order: order_base,
                 media: media.cloned(),
+                supports: supports.cloned(),
             });
         }
         sheet.sort_rules();
@@ -505,27 +573,66 @@ fn length_refs(style: &CssStyle) -> [Option<&Length>; 2] {
     [style.width.as_ref(), style.height.as_ref()]
 }
 
-/// Parse a custom-property value into a [`Token`], trying [`Color`] first then
-/// [`Length`].
+/// All `box-edges`-carrying fields of a [`CssStyle`] (padding/margin), for var
+/// scanning. Like the color/length scans, used by strict-mode parsing.
+fn box_edges_refs(style: &CssStyle) -> [Option<&BoxEdgesValue>; 2] {
+    [style.padding.as_ref(), style.margin.as_ref()]
+}
+
+/// The `border-style` field of a [`CssStyle`], for var scanning.
+fn border_style_ref(style: &CssStyle) -> Option<&BorderStyleValue> {
+    style.border.as_ref().map(|b| &b.style)
+}
+
+/// Parse a custom-property value into a [`Token`], trying [`Color`], then
+/// [`Length`], then [`BoxEdges`], then [`BorderStyle`].
 ///
 /// Color and length *literal* syntaxes don't overlap (`#fff`/`rgb()`/named
 /// colors vs. `10`/`50%`/`auto`/`min(n)`), so for concrete values whichever
 /// parser accepts the value wins. A bare `var(--other)` is the one case that is
-/// syntactically valid in both grammars — its type is not knowable at parse
+/// syntactically valid in every grammar — its type is not knowable at parse
 /// time, so it is stored as [`Token::Var`] and resolved by following the chain
-/// via [`ThemeTokens::get_color`] / [`ThemeTokens::get_length`] at cascade time.
+/// via [`ThemeTokens::get_color`] / [`ThemeTokens::get_length`] /
+/// [`ThemeTokens::get_box_edges`] / [`ThemeTokens::get_border_style`] at
+/// cascade time.
 ///
-/// If both parsers reject the value, the error reported is the length parse
-/// failure (which tends to be more descriptive for non-color garbage like
-/// `width: banana`).
+/// A bare integer (`10`) is accepted by both `Length` and `BoxEdges`; the order
+/// below (Color → Length → BoxEdges → BorderStyle) means bare integers become
+/// `Token::Length`, preserving the existing length-token behavior. A multi-value
+/// box shorthand (`1 2`, `1 2 3 4`) fails the Length parse and falls through to
+/// `BoxEdges`. A border-style keyword (`rounded`, `single`, …) that is not a
+/// color or length lands on `BorderStyle`.
+///
+/// If all parsers reject the value, the error reported is the final parse
+/// failure (BorderStyle, which tends to be descriptive for garbage).
 fn parse_token_value(value: &str) -> Result<Token> {
+    use crate::box_model::{BorderStyleValue, BoxEdgesValue};
     // A bare var() reference defers its type until resolution.
     if let Ok(Color::Var { name, fallback: None }) = Color::parse(value) {
         return Ok(Token::Var { name });
     }
-    match Color::parse(value) {
-        Ok(c) => Ok(Token::Color(c)),
-        Err(_) => Length::parse(value).map(Token::Length),
+    if let Ok(c) = Color::parse(value) {
+        return Ok(Token::Color(c));
+    }
+    if let Ok(l) = Length::parse(value) {
+        return Ok(Token::Length(l));
+    }
+    // BoxEdgesValue::parse returns Edges for concrete shorthands and Var for a
+    // var() — the var() case was already caught above, so here we only accept
+    // a concrete Edges.
+    if let Ok(BoxEdgesValue::Edges(e)) = BoxEdgesValue::parse(value) {
+        return Ok(Token::BoxEdges(e));
+    }
+    // BorderStyleValue::parse returns Fixed for keywords; the var() case was
+    // caught above. A non-keyword errors out (the terminal fallback).
+    match BorderStyleValue::parse(value) {
+        Ok(BorderStyleValue::Fixed(b)) => Ok(Token::BorderStyle(b)),
+        Ok(_) => {
+            // Unreachable: a bare var() was already returned above. Treat as
+            // a parse error to avoid silently storing an untyped Var.
+            Err(CssError::invalid_length(format!("invalid token value: {value}")))
+        }
+        Err(e) => Err(e),
     }
 }
 
@@ -544,8 +651,8 @@ pub fn apply_decl(style: &mut CssStyle, prop: &str, value: &str) -> Result<()> {
         "font-style" => style.font_style = Some(FontStyle::parse(value)?),
         "text-decoration" => style.decoration = Some(TextDecoration::parse(value)?),
         "underline-color" => style.underline_color = Some(Color::parse(value)?),
-        "padding" => style.padding = Some(crate::box_model::BoxEdges::parse(value)?),
-        "margin" => style.margin = Some(crate::box_model::BoxEdges::parse(value)?),
+        "padding" => style.padding = Some(crate::box_model::BoxEdgesValue::parse(value)?),
+        "margin" => style.margin = Some(crate::box_model::BoxEdgesValue::parse(value)?),
         "border" => {
             let mut spec = crate::box_model::BorderSpec::parse_shorthand(value)?;
             // The full shorthand declares a complete border → force all edges.
@@ -553,8 +660,7 @@ pub fn apply_decl(style: &mut CssStyle, prop: &str, value: &str) -> Result<()> {
             style.border = Some(spec);
         }
         "border-style" => {
-            let parsed = crate::box_model::BorderStyle::parse_keyword(value)
-                .ok_or_else(|| CssError::invalid_length(format!("border-style: {value}")))?;
+            let parsed = crate::box_model::BorderStyleValue::parse(value)?;
             style.border_mut().style = parsed;
         }
         "border-color" => {
@@ -607,7 +713,10 @@ fn apply_per_edge(style: &mut CssStyle, value: &str, edges: Borders) -> Result<(
 /// [`apply_decl`] (implicitly, via its match) and [`Stylesheet::parse_strict`]
 /// (explicitly, via this predicate) consult the same list. A `--`-prefixed name
 /// is a custom property and never counts as unknown.
-fn is_known_property(prop: &str) -> bool {
+///
+/// Also consulted by the `@supports` matcher for `(prop)` / `(prop: value)`
+/// conditions — see [`SupportsCondition::matches`](crate::supports::SupportsCondition::matches).
+pub(crate) fn is_known_property(prop: &str) -> bool {
     let p = prop.trim().to_ascii_lowercase();
     matches!(
         p.as_str(),
@@ -821,7 +930,10 @@ mod tests {
         let node = OwnedNode::new("Div").with_classes(["rounded", "border-slate-700"]);
         let computed = sheet.compute(&node, None);
         let border = computed.style.border.expect("border present");
-        assert_eq!(border.style, crate::box_model::BorderStyle::Rounded);
+        assert_eq!(
+            border.style,
+            crate::box_model::BorderStyleValue::Fixed(crate::box_model::BorderStyle::Rounded)
+        );
         assert_eq!(border.color, Some(Color::literal(RColor::Rgb(0x33, 0x41, 0x55))));
     }
 
@@ -836,7 +948,10 @@ mod tests {
         let node = OwnedNode::new("Div").with_classes(["b"]);
         let computed = sheet.compute(&node, None);
         let border = computed.style.border.expect("border present");
-        assert_eq!(border.style, crate::box_model::BorderStyle::Rounded);
+        assert_eq!(
+            border.style,
+            crate::box_model::BorderStyleValue::Fixed(crate::box_model::BorderStyle::Rounded)
+        );
         assert_eq!(border.edges, Some(ratatui::widgets::Borders::BOTTOM));
         assert_eq!(border.borders(), ratatui::widgets::Borders::BOTTOM);
     }
@@ -1057,8 +1172,10 @@ mod tests {
         assert_eq!(
             media.alternatives,
             vec![crate::media::MediaAlternative {
-                negated: false,
-                conditions: vec![crate::media::MediaCondition::MinWidth(80)],
+                terms: vec![crate::media::MediaTerm {
+                    negated: false,
+                    cond: crate::media::MediaCondition::MinWidth(80),
+                }],
             }]
         );
     }
@@ -1079,8 +1196,10 @@ mod tests {
                 assert_eq!(
                     m.alternatives,
                     vec![crate::media::MediaAlternative {
-                        negated: false,
-                        conditions: vec![crate::media::MediaCondition::MinWidth(80)],
+                        terms: vec![crate::media::MediaTerm {
+                            negated: false,
+                            cond: crate::media::MediaCondition::MinWidth(80),
+                        }],
                     }]
                 );
             }
@@ -1159,10 +1278,15 @@ mod tests {
         assert_eq!(
             media.alternatives,
             vec![crate::media::MediaAlternative {
-                negated: false,
-                conditions: vec![
-                    crate::media::MediaCondition::MinWidth(80),
-                    crate::media::MediaCondition::Color,
+                terms: vec![
+                    crate::media::MediaTerm {
+                        negated: false,
+                        cond: crate::media::MediaCondition::MinWidth(80),
+                    },
+                    crate::media::MediaTerm {
+                        negated: false,
+                        cond: crate::media::MediaCondition::Color,
+                    },
                 ],
             }],
             "nested @media AND-combines the queries"
@@ -1205,11 +1329,19 @@ mod tests {
         assert_eq!(
             media.alternatives,
             vec![crate::media::MediaAlternative {
-                negated: false,
-                conditions: vec![
-                    crate::media::MediaCondition::MinWidth(80),
-                    crate::media::MediaCondition::Color,
-                    crate::media::MediaCondition::Truecolor,
+                terms: vec![
+                    crate::media::MediaTerm {
+                        negated: false,
+                        cond: crate::media::MediaCondition::MinWidth(80),
+                    },
+                    crate::media::MediaTerm {
+                        negated: false,
+                        cond: crate::media::MediaCondition::Color,
+                    },
+                    crate::media::MediaTerm {
+                        negated: false,
+                        cond: crate::media::MediaCondition::Truecolor,
+                    },
                 ],
             }],
             "three-deep nesting AND-combines all three queries"
@@ -1372,5 +1504,239 @@ mod tests {
         let g0 = s.generation();
         let _ = s.tokens_mut();
         assert_ne!(s.generation(), g0, "tokens_mut must bump (covers token changes)");
+    }
+
+    // ---------------------------------------------------------------------
+    // @supports query blocks
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn supports_block_tags_one_rule() {
+        let sheet =
+            Stylesheet::parse("@supports (truecolor) { Button { color: red; } }").unwrap();
+        let button_rules: Vec<_> = sheet
+            .rules()
+            .iter()
+            .filter(|r| r.selector.type_name.as_deref() == Some("Button"))
+            .collect();
+        assert_eq!(button_rules.len(), 1, "exactly one Button rule");
+        let supports = button_rules[0].supports.as_ref().expect("rule is supports-gated");
+        assert_eq!(
+            supports.alternatives,
+            vec![crate::supports::SupportsAlternative {
+                terms: vec![crate::supports::SupportsTerm {
+                    negated: false,
+                    cond: crate::supports::SupportsCondition::Truecolor,
+                }],
+            }]
+        );
+        // Untagged for media.
+        assert!(button_rules[0].media.is_none());
+    }
+
+    #[test]
+    fn supports_block_depth_aware_two_rules_tagged() {
+        // TWO element rules inside one @supports block. The depth-aware brace
+        // scan must find the OUTER `}` (after both rules), not the first inner.
+        let sheet = Stylesheet::parse(
+            "@supports (truecolor) { Button { color: red; } .x { padding: 1; } }",
+        )
+        .unwrap();
+        let tagged = sheet.rules().iter().filter(|r| r.supports.is_some()).count();
+        assert_eq!(tagged, 2, "both inner rules carry the supports query");
+    }
+
+    #[test]
+    fn supports_block_trailing_top_level_rule_untagged() {
+        // After the @supports block, a trailing top-level rule must parse with
+        // supports: None. This exercises that the depth-aware scan correctly
+        // resumes `rest` after the matching outer `}`.
+        let sheet = Stylesheet::parse(
+            "@supports (truecolor) { Button { color: red; } } Text { color: blue; }",
+        )
+        .unwrap();
+        let text_rule = sheet
+            .rules()
+            .iter()
+            .find(|r| r.selector.type_name.as_deref() == Some("Text"))
+            .expect("trailing Text rule parsed");
+        assert!(text_rule.supports.is_none(), "trailing top-level rule is NOT supports-gated");
+    }
+
+    #[test]
+    fn supports_block_invalid_color_loc_points_at_value() {
+        // The error loc must point at the #zzz line (inside the @supports
+        // block), NOT at the @supports line. Guards offset correctness through
+        // the depth-aware brace scan + recursion.
+        let css = "@supports (truecolor){\n Button {\n  background: #zzz;\n }\n}";
+        let err = Stylesheet::parse(css).unwrap_err();
+        let loc = err.loc.expect("error has a location");
+        assert_eq!(
+            loc.line, 3,
+            "loc must point at the #zzz line (line 3), got line {}",
+            loc.line
+        );
+        assert!(matches!(err.kind, CssErrorKind::InvalidColor(_)));
+    }
+
+    #[test]
+    fn supports_nested_inside_media_tags_both() {
+        // @media (min-width: 80) { @supports (truecolor) { Button { … } } }
+        // → Button rule carries BOTH a media and a supports tag.
+        let css = "@media (min-width: 80) { @supports (truecolor) { Button { color: red; } } }";
+        let sheet = Stylesheet::parse(css).unwrap();
+        let button_rules: Vec<_> =
+            sheet.rules().iter().filter(|r| r.selector.type_name.as_deref() == Some("Button")).collect();
+        assert_eq!(button_rules.len(), 1, "exactly one Button rule");
+        let r = &button_rules[0];
+        let media = r.media.as_ref().expect("rule is media-gated");
+        assert_eq!(
+            media.alternatives,
+            vec![crate::media::MediaAlternative {
+                terms: vec![crate::media::MediaTerm {
+                    negated: false,
+                    cond: crate::media::MediaCondition::MinWidth(80),
+                }],
+            }]
+        );
+        let supports = r.supports.as_ref().expect("rule is supports-gated");
+        assert_eq!(
+            supports.alternatives,
+            vec![crate::supports::SupportsAlternative {
+                terms: vec![crate::supports::SupportsTerm {
+                    negated: false,
+                    cond: crate::supports::SupportsCondition::Truecolor,
+                }],
+            }]
+        );
+    }
+
+    #[test]
+    fn media_nested_inside_supports_tags_both() {
+        // @supports (truecolor) { @media (min-width: 80) { Button { … } } }
+        // → Button rule carries BOTH a supports and a media tag.
+        let css = "@supports (truecolor) { @media (min-width: 80) { Button { color: red; } } }";
+        let sheet = Stylesheet::parse(css).unwrap();
+        let button_rules: Vec<_> =
+            sheet.rules().iter().filter(|r| r.selector.type_name.as_deref() == Some("Button")).collect();
+        assert_eq!(button_rules.len(), 1);
+        let r = &button_rules[0];
+        assert!(r.media.is_some(), "rule carries media tag");
+        assert!(r.supports.is_some(), "rule carries supports tag");
+        let supports = r.supports.as_ref().unwrap();
+        assert_eq!(
+            supports.alternatives[0].terms[0].cond,
+            crate::supports::SupportsCondition::Truecolor
+        );
+    }
+
+    #[test]
+    fn supports_query_error_propagates() {
+        // A malformed query structure surfaces as an error (not silently
+        // skipped). Unbalanced parens.
+        assert!(Stylesheet::parse("@supports (truecolor { Button { color: red; } }").is_err());
+    }
+
+    #[test]
+    fn supports_property_condition_tagged() {
+        // A property-support condition tags the rule.
+        let sheet =
+            Stylesheet::parse("@supports (border-style) { .x { border-style: rounded; } }").unwrap();
+        let x_rules: Vec<_> =
+            sheet.rules().iter().filter(|r| r.selector.classes.iter().any(|c| c == "x")).collect();
+        assert_eq!(x_rules.len(), 1);
+        let supports = x_rules[0].supports.as_ref().expect("supports-gated");
+        assert_eq!(
+            supports.alternatives[0].terms[0].cond,
+            crate::supports::SupportsCondition::Property("border-style".into())
+        );
+    }
+
+    #[test]
+    fn supports_case_insensitive_keyword() {
+        // @SUPPORTS should parse case-insensitively.
+        let sheet = Stylesheet::parse("@SUPPORTS (truecolor) { Button { color: red; } }").unwrap();
+        let button = sheet
+            .rules()
+            .iter()
+            .find(|r| r.selector.type_name.as_deref() == Some("Button"))
+            .unwrap();
+        assert!(button.supports.is_some());
+    }
+
+    // ---------------------------------------------------------------------
+    // var() in padding / margin / border-style (P6-4)
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn parse_padding_var_reference() {
+        // `padding: var(--pad)` parses into a BoxEdgesValue::Var that survives
+        // until cascade resolution.
+        let sheet = Stylesheet::parse(":root{--pad:1} .x { padding: var(--pad); }").unwrap();
+        let rule = sheet
+            .rules()
+            .iter()
+            .find(|r| r.selector.classes.iter().any(|c| c == "x"))
+            .unwrap();
+        assert_eq!(
+            rule.style.padding,
+            Some(crate::box_model::BoxEdgesValue::var("pad"))
+        );
+    }
+
+    #[test]
+    fn parse_border_style_var_reference() {
+        let sheet = Stylesheet::parse(":root{--bs:rounded} .x { border-style: var(--bs); }").unwrap();
+        let rule = sheet
+            .rules()
+            .iter()
+            .find(|r| r.selector.classes.iter().any(|c| c == "x"))
+            .unwrap();
+        let border = rule.style.border.as_ref().expect("border present");
+        assert_eq!(border.style, crate::box_model::BorderStyleValue::var("bs"));
+    }
+
+    #[test]
+    fn parse_border_shorthand_with_var_style() {
+        // `border: var(--bs) #f00` — var is the style, #f00 the color.
+        let sheet = Stylesheet::parse(":root{--bs:rounded} .x { border: var(--bs) #f00; }").unwrap();
+        let rule = sheet
+            .rules()
+            .iter()
+            .find(|r| r.selector.classes.iter().any(|c| c == "x"))
+            .unwrap();
+        let border = rule.style.border.as_ref().expect("border present");
+        assert_eq!(border.style, crate::box_model::BorderStyleValue::var("bs"));
+        assert_eq!(border.color, Some(Color::literal(RColor::Rgb(0xff, 0, 0))));
+    }
+
+    #[test]
+    fn strict_undefined_padding_var_errors() {
+        let err = Stylesheet::parse_strict(".x { padding: var(--nope); }").unwrap_err();
+        assert!(matches!(err.kind, CssErrorKind::UndefinedVariable(ref n) if n == "nope"));
+    }
+
+    #[test]
+    fn strict_padding_var_with_fallback_ok() {
+        Stylesheet::parse_strict(".x { padding: var(--nope, 3); }")
+            .expect("padding var with fallback is OK in strict mode");
+    }
+
+    #[test]
+    fn strict_undefined_border_style_var_errors() {
+        let err = Stylesheet::parse_strict(".x { border-style: var(--nope); }").unwrap_err();
+        assert!(matches!(err.kind, CssErrorKind::UndefinedVariable(ref n) if n == "nope"));
+    }
+
+    #[test]
+    fn strict_defined_box_edges_var_ok() {
+        Stylesheet::parse_strict(":root{--pad:1} .x { padding: var(--pad); }")
+            .expect("defined box-edges var is fine in strict mode");
+    }
+
+    #[test]
+    fn strict_defined_border_style_var_ok() {
+        Stylesheet::parse_strict(":root{--bs:rounded} .x { border-style: var(--bs); }")
+            .expect("defined border-style var is fine in strict mode");
     }
 }

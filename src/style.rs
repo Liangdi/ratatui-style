@@ -14,7 +14,9 @@ use ratatui::{
     widgets::Block,
 };
 
-use crate::box_model::{BorderSpec, BorderStyle, BoxEdges, IntoBorderSpec, IntoBoxEdges, Length};
+use crate::box_model::{
+    BorderSpec, BorderStyle, BorderStyleValue, BoxEdgesValue, IntoBorderSpec, IntoBoxEdges, Length,
+};
 use crate::color::Color;
 use crate::error::{CssError, Result};
 
@@ -190,8 +192,8 @@ pub struct CssStyle {
     pub underline_color: Option<Color>,
 
     // — box model → Block / Rect —
-    pub padding: Option<BoxEdges>,
-    pub margin: Option<BoxEdges>,
+    pub padding: Option<BoxEdgesValue>,
+    pub margin: Option<BoxEdgesValue>,
     pub border: Option<BorderSpec>,
 
     // — sizing → Constraint / Alignment —
@@ -254,7 +256,7 @@ impl CssStyle {
     /// like `.rounded` and `.border-slate-700` compose into one declaration.
     pub fn border_style(mut self, style: BorderStyle) -> Self {
         let mut spec = self.border.unwrap_or_default();
-        spec.style = style;
+        spec.style = BorderStyleValue::Fixed(style);
         self.border = Some(spec);
         self
     }
@@ -377,6 +379,10 @@ impl CssStyle {
     ///
     /// `border` sets borders/type/border-color; `padding` sets inner padding;
     /// `background` sets the block's fill style.
+    ///
+    /// A `BoxEdgesValue::Var` padding that survived the cascade degrades to no
+    /// padding (mirroring how an unresolved color `Var` is dropped). Likewise a
+    /// `BorderStyleValue::Var` border style degrades to `BorderStyle::None`.
     pub fn to_block(&self) -> Block<'_> {
         let mut block = Block::default();
         if let Some(b) = &self.border {
@@ -385,7 +391,7 @@ impl CssStyle {
                 block = block.border_style(RStyle::default().fg(c));
             }
         }
-        if let Some(pad) = self.padding {
+        if let Some(BoxEdgesValue::Edges(pad)) = self.padding {
             block = block.padding(pad.to_padding());
         }
         if let Some(c) = self.background.as_ref().and_then(Self::paint) {
@@ -395,10 +401,13 @@ impl CssStyle {
     }
 
     /// Shrink `area` by the `margin` edges, if any.
+    ///
+    /// An unresolved `BoxEdgesValue::Var` margin degrades to zero (the area is
+    /// returned unchanged), mirroring `to_block`'s padding degradation.
     pub fn apply_margin(&self, area: Rect) -> Rect {
         match self.margin {
-            Some(e) => e.shrink(area),
-            None => area,
+            Some(BoxEdgesValue::Edges(e)) => e.shrink(area),
+            _ => area,
         }
     }
 
@@ -445,7 +454,7 @@ impl From<ratatui::style::Color> for Color {
 
 #[cfg(feature = "serde")]
 mod serde_impl {
-    use super::{Align, BorderStyle, CssStyle, FontStyle, TextDecoration, Weight};
+    use super::{Align, BorderStyleValue, CssStyle, FontStyle, TextDecoration, Weight};
     use crate::color::Color;
     use serde::de::{self, MapAccess, Visitor};
     use serde::ser::SerializeMap;
@@ -628,7 +637,7 @@ mod serde_impl {
                                 s.border = map.next_value()?;
                             }
                             "border-style" => {
-                                let v: Option<BorderStyle> = map.next_value()?;
+                                let v: Option<BorderStyleValue> = map.next_value()?;
                                 s.border_mut().style = v.unwrap_or_default();
                             }
                             "border-color" => {
@@ -700,11 +709,11 @@ mod serde_impl {
             if let Some(v) = self.underline_color.as_ref() {
                 map.serialize_entry("underline-color", v)?;
             }
-            if let Some(v) = self.padding {
-                map.serialize_entry("padding", &v)?;
+            if let Some(v) = self.padding.as_ref() {
+                map.serialize_entry("padding", v)?;
             }
-            if let Some(v) = self.margin {
-                map.serialize_entry("margin", &v)?;
+            if let Some(v) = self.margin.as_ref() {
+                map.serialize_entry("margin", v)?;
             }
             if let Some(v) = self.border.as_ref() {
                 map.serialize_entry("border", v)?;
@@ -726,6 +735,7 @@ mod serde_impl {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::box_model::{BorderStyle, BorderStyleValue, BoxEdges, BoxEdgesValue};
     use ratatui::style::Color as RC;
 
     #[test]
@@ -776,35 +786,43 @@ mod tests {
         let b = CssStyle::new().border_color(RC::Blue);
         a.overlay(&b);
         let border = a.border.as_ref().expect("border present");
-        assert_eq!(border.style, BorderStyle::Rounded); // survived
+        assert_eq!(border.style, BorderStyleValue::Fixed(BorderStyle::Rounded)); // survived
         assert_eq!(border.color, Some(Color::literal(RC::Blue))); // applied
 
         // A later full shorthand still wins on the sub-fields it sets.
         let c = CssStyle::new().border("single red");
         a.overlay(&c);
         let border = a.border.as_ref().expect("border present");
-        assert_eq!(border.style, BorderStyle::Single);
+        assert_eq!(border.style, BorderStyleValue::Fixed(BorderStyle::Single));
         assert_eq!(border.color, Some(Color::literal(RC::Red)));
     }
 
     #[test]
     fn padding_typed_uniform() {
         let s = CssStyle::new().padding(1u16);
-        assert_eq!(s.padding, Some(BoxEdges::uniform(1)));
+        assert_eq!(s.padding, Some(BoxEdgesValue::Edges(BoxEdges::uniform(1))));
     }
 
     #[test]
     fn padding_typed_pair() {
         let s = CssStyle::new().padding((0u16, 2u16));
-        let e = s.padding.expect("padding");
-        assert_eq!((e.top, e.right, e.bottom, e.left), (0, 2, 0, 2));
+        match s.padding.expect("padding") {
+            BoxEdgesValue::Edges(e) => {
+                assert_eq!((e.top, e.right, e.bottom, e.left), (0, 2, 0, 2));
+            }
+            other => panic!("expected Edges, got {other:?}"),
+        }
     }
 
     #[test]
     fn padding_typed_quad() {
         let s = CssStyle::new().padding((1u16, 2u16, 3u16, 4u16));
-        let e = s.padding.expect("padding");
-        assert_eq!((e.top, e.right, e.bottom, e.left), (1, 2, 3, 4));
+        match s.padding.expect("padding") {
+            BoxEdgesValue::Edges(e) => {
+                assert_eq!((e.top, e.right, e.bottom, e.left), (1, 2, 3, 4));
+            }
+            other => panic!("expected Edges, got {other:?}"),
+        }
     }
 
     #[test]
@@ -819,7 +837,7 @@ mod tests {
     fn border_typed_style_only() {
         let s = CssStyle::new().border(BorderStyle::Rounded);
         let b = s.border.expect("border");
-        assert_eq!(b.style, BorderStyle::Rounded);
+        assert_eq!(b.style, BorderStyleValue::Fixed(BorderStyle::Rounded));
         assert_eq!(b.color, None);
     }
 
@@ -827,7 +845,7 @@ mod tests {
     fn border_typed_with_color() {
         let s = CssStyle::new().border((BorderStyle::Double, "#ff0000"));
         let b = s.border.expect("border");
-        assert_eq!(b.style, BorderStyle::Double);
+        assert_eq!(b.style, BorderStyleValue::Fixed(BorderStyle::Double));
         assert_eq!(b.color, Some(Color::literal(RC::Rgb(255, 0, 0))));
     }
 
@@ -836,8 +854,8 @@ mod tests {
         let typed = CssStyle::new().border(BorderStyle::Single).border;
         let from_str = CssStyle::new().border("single").border;
         assert_eq!(
-            typed.map(|b| (b.style, b.color)),
-            from_str.map(|b| (b.style, b.color))
+            typed.map(|b| (b.style.clone(), b.color)),
+            from_str.map(|b| (b.style.clone(), b.color))
         );
     }
 
@@ -850,7 +868,7 @@ mod tests {
         let json = r##"{ "border-style": "rounded", "border-color": "#334155" }"##;
         let s: CssStyle = serde_json::from_str(json).unwrap();
         let border = s.border.expect("border present");
-        assert_eq!(border.style, BorderStyle::Rounded);
+        assert_eq!(border.style, BorderStyleValue::Fixed(BorderStyle::Rounded));
         assert_eq!(
             border.color,
             Some(Color::literal(ratatui::style::Color::Rgb(0x33, 0x41, 0x55)))
@@ -865,7 +883,7 @@ mod tests {
         // An explicit edges set serializes to a readable keyword and round-trips
         // back through the object form.
         let original = CssStyle::new().border(crate::box_model::BorderSpec {
-            style: BorderStyle::Rounded,
+            style: BorderStyleValue::Fixed(BorderStyle::Rounded),
             color: None,
             edges: Some(ratatui::widgets::Borders::BOTTOM),
         });
@@ -890,6 +908,69 @@ mod tests {
         assert_eq!(spec.edges, None);
         assert_eq!(spec.borders(), ratatui::widgets::Borders::ALL);
     }
+
+    #[test]
+    fn to_block_resolved_edges_produce_padding() {
+        let s = CssStyle::new().padding((1u16, 2u16, 3u16, 4u16));
+        let block = s.to_block();
+        // BoxEdges{top:1,right:2,bottom:3,left:4} shrinks a 10x10 area to
+        // (x=4, y=1, width=4, height=6).
+        let area = Rect::new(0, 0, 10, 10);
+        assert_eq!(block.inner(area), Rect::new(4, 1, 4, 6));
+    }
+
+    #[test]
+    fn to_block_unresolved_var_padding_is_noop() {
+        // A BoxEdgesValue::Var that survived the cascade (shouldn't happen
+        // post-resolution, but guarded) produces no padding.
+        let mut s = CssStyle::new();
+        s.padding = Some(BoxEdgesValue::var("pad"));
+        let block = s.to_block();
+        let area = Rect::new(0, 0, 10, 10);
+        assert_eq!(block.inner(area), area);
+    }
+
+    #[test]
+    fn apply_margin_unresolved_var_is_noop() {
+        let mut s = CssStyle::new();
+        s.margin = Some(BoxEdgesValue::var("m"));
+        let area = Rect::new(0, 0, 10, 10);
+        // An unresolved Var margin returns the area unchanged.
+        assert_eq!(s.apply_margin(area), area);
+    }
+
+    #[test]
+    fn overlay_merges_padding_margin_value_enums() {
+        let mut a = CssStyle::new().padding(1u16);
+        let b = CssStyle::new().padding(2u16).margin(3u16);
+        a.overlay(&b);
+        assert_eq!(
+            a.padding,
+            Some(BoxEdgesValue::Edges(BoxEdges::uniform(2)))
+        );
+        assert_eq!(
+            a.margin,
+            Some(BoxEdgesValue::Edges(BoxEdges::uniform(3)))
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "serde")]
+    fn serde_cssstyle_with_padding_margin_border_style() {
+        // A fully-populated box-model CssStyle round-trips through serde,
+        // including a var() border-style.
+        let mut original = CssStyle::new()
+            .padding((1u16, 2u16))
+            .margin(3u16)
+            .border(BorderStyle::Rounded);
+        // Override the border style with a var (proves the value-enum survives).
+        if let Some(spec) = original.border.as_mut() {
+            spec.style = BorderStyleValue::var("bs");
+        }
+        let json = serde_json::to_string(&original).unwrap();
+        let back: CssStyle = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, original, "serde round-trip mismatch\n{json}");
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -903,7 +984,7 @@ mod tests {
 #[cfg(all(test, feature = "serde"))]
 mod cross_format_tests {
     use super::*;
-    use crate::box_model::{BorderSpec, BorderStyle, Length};
+    use crate::box_model::{BorderSpec, BorderStyle, BorderStyleValue, Length};
     use ratatui::style::Color as RC;
 
     /// A CssStyle exercising every leaf type that has a custom Deserialize:
@@ -916,7 +997,7 @@ mod cross_format_tests {
             .bold()
             .padding((1u16, 2u16, 3u16, 4u16))
             .border(BorderSpec {
-                style: BorderStyle::Rounded,
+                style: BorderStyleValue::Fixed(BorderStyle::Rounded),
                 color: Some(Color::literal(RC::Blue)),
                 edges: Some(ratatui::widgets::Borders::BOTTOM),
             });
@@ -1006,6 +1087,11 @@ padding = 4
 "#;
         let parsed: CssStyle = toml::from_str(doc).expect("deserialize TOML doc");
         assert_eq!(parsed.width, Some(Length::Cells(10)));
-        assert_eq!(parsed.padding, Some(crate::box_model::BoxEdges::uniform(4)));
+        assert_eq!(
+            parsed.padding,
+            Some(crate::box_model::BoxEdgesValue::Edges(
+                crate::box_model::BoxEdges::uniform(4)
+            ))
+        );
     }
 }

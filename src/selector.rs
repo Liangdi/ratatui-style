@@ -163,17 +163,28 @@ fn parse_bare_int(s: &str) -> Result<i32> {
 
 /// A (possibly parameterized) pseudo-class.
 ///
-/// # Same-type sibling pseudos and the forward-sibling limitation
+/// # Same-type sibling pseudos: host-supplied vs. previous-sibling counting
 ///
-/// `NthOfType` and `FirstOfType` count only among previous siblings of the SAME
-/// element type. They are fully computable from the previous-sibling identities
-/// threaded in by [`CascadeContext`](crate::CascadeContext).
+/// Two flavors of of-type pseudo-class are supported:
 ///
-/// `:last-of-type`, `:nth-last-of-type`, and `:only-of-type` are deliberately
-/// **not** supported: they require the total same-type sibling count, which in
-/// turn requires knowledge of siblings that come AFTER the subject. The cascade
-/// walk only tracks PREVIOUS siblings, so these variants are not determinable at
-/// match time. Parsing them yields an "unsupported pseudo-class" error.
+/// - **Previous-sibling counting** (`:nth-of-type`, `:first-of-type`): these
+///   only need the count of same-type siblings *before* the subject, which the
+///   cascade walk derives from the threaded previous-sibling identities. They
+///   work without host-supplied of-type position info. When the host *does*
+///   populate [`Position::of_type_count`] (`> 0`), that host data is preferred
+///   over the previous-sibling count (it is more precise — it knows about
+///   siblings after the subject too).
+///
+/// - **Total-count dependent** (`:last-of-type`, `:only-of-type`,
+///   `:nth-last-of-type`): these require the *total* same-type sibling count,
+///   which the cascade walk cannot know at match time (it only tracks previous
+///   siblings). They are sourced from the host via
+///   [`Position::of_type_count`] / [`Position::of_type_index`]. They require
+///   `of_type_count > 0` to match; with the default `Position` (count 0) they
+///   never match — the host must opt in.
+///
+/// [`Position::of_type_count`]: crate::node::Position::of_type_count
+/// [`Position::of_type_index`]: crate::node::Position::of_type_index
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Pseudo {
     /// A simple state flag: :focus, :hover, :disabled, :checked, :active.
@@ -185,15 +196,36 @@ pub enum Pseudo {
     NthChild(NthExpr),
     /// :nth-last-child(an+b)
     NthLastChild(NthExpr),
-    /// :nth-of-type(an+b) — among same-type previous siblings, the node is the
+    /// :nth-of-type(an+b) — among same-type siblings, the node is the
     /// (an+b)-th of its type. Requires sibling identities (matched through
     /// [`matches_chain`](Selector::matches_chain)); the one-shot
     /// [`matches_values`](Selector::matches_values) path has no siblings, so
-    /// `:nth-of-type` does not match there.
+    /// `:nth-of-type` does not match there. When the host supplies
+    /// [`Position::of_type_count`] (`> 0`) that data is preferred; otherwise the
+    /// previous-sibling count is used.
     NthOfType(NthExpr),
     /// :first-of-type — no previous sibling shares this element type. Same
-    /// sibling-identity requirement as [`NthOfType`](Self::NthOfType).
+    /// sibling-identity requirement as [`NthOfType`](Self::NthOfType); prefers
+    /// host-supplied `of_type_count` when present.
     FirstOfType,
+    /// :last-of-type — the last same-type sibling. Requires
+    /// [`Position::of_type_count`] `> 0` (host-supplied); never matches with the
+    /// default `Position`.
+    ///
+    /// [`Position::of_type_count`]: crate::node::Position::of_type_count
+    LastOfType,
+    /// :only-of-type — the only same-type sibling. Requires
+    /// [`Position::of_type_count`] `== 1` (host-supplied); never matches with
+    /// the default `Position`.
+    ///
+    /// [`Position::of_type_count`]: crate::node::Position::of_type_count
+    OnlyOfType,
+    /// :nth-last-of-type(an+b) — counted from the end among same-type siblings
+    /// (1-based: last = 1). Requires [`Position::of_type_count`] `> 0`
+    /// (host-supplied); never matches with the default `Position`.
+    ///
+    /// [`Position::of_type_count`]: crate::node::Position::of_type_count
+    NthLastOfType(NthExpr),
 }
 
 impl Pseudo {
@@ -216,7 +248,7 @@ impl Pseudo {
                 "nth-child" => Ok(Self::NthChild(parse_nth(inner)?)),
                 "nth-last-child" => Ok(Self::NthLastChild(parse_nth(inner)?)),
                 "nth-of-type" => Ok(Self::NthOfType(parse_nth(inner)?)),
-                // nth-last-of-type needs forward-sibling knowledge — unsupported.
+                "nth-last-of-type" => Ok(Self::NthLastOfType(parse_nth(inner)?)),
                 other => Err(CssError::invalid_selector(format!(
                     "unsupported pseudo-class `:{other}`"
                 ))),
@@ -229,9 +261,8 @@ impl Pseudo {
             "last-child" => Ok(Self::LastChild),
             "only-child" => Ok(Self::OnlyChild),
             "first-of-type" => Ok(Self::FirstOfType),
-            // last-of-type / only-of-type need forward-sibling knowledge —
-            // unsupported. Fall through to the generic error below by treating
-            // them as unknown names (they have no PseudoClass equivalent).
+            "last-of-type" => Ok(Self::LastOfType),
+            "only-of-type" => Ok(Self::OnlyOfType),
             other => match PseudoClass::parse(other) {
                 Some(p) => Ok(Self::State(p)),
                 None => Err(CssError::invalid_selector(format!(
@@ -727,7 +758,16 @@ impl Selector {
 
     /// Evaluate all [`pseudos`](Self::pseudos) against `state`, `position`, and
     /// `same_type_before` (the count of previous siblings sharing the subject's
-    /// element type-name — used by `:nth-of-type` / `:first-of-type`).
+    /// element type-name — used by `:nth-of-type` / `:first-of-type` when the
+    /// host has not supplied of-type position info).
+    ///
+    /// **Host-wins rule for of-type pseudos:** when `position.of_type_count > 0`
+    /// the host-supplied of-type data is authoritative and `same_type_before` is
+    /// ignored. When `of_type_count == 0` (the default — host did not supply
+    /// of-type info), `:nth-of-type` / `:first-of-type` fall back to
+    /// `same_type_before` (previous-sibling counting), while `:last-of-type`,
+    /// `:only-of-type`, and `:nth-last-of-type` (which need the total count)
+    /// never match.
     fn pseudos_satisfied(&self, state: State, position: &Position, same_type_before: i32) -> bool {
         for p in &self.pseudos {
             let on = match p {
@@ -748,10 +788,34 @@ impl Selector {
                     position.sibling_count > 0
                         && expr.matches(position.sibling_count as i32 - position.index as i32)
                 }
-                // of_type_index = 1 + (count of previous same-type siblings).
-                Pseudo::NthOfType(expr) => expr.matches(same_type_before + 1),
-                // No previous sibling shares this type.
-                Pseudo::FirstOfType => same_type_before == 0,
+                // :nth-of-type / :first-of-type: host data wins when supplied,
+                // else fall back to previous-sibling counting.
+                Pseudo::NthOfType(expr) => {
+                    if position.of_type_count > 0 {
+                        // 1-based of-type index from the host's 0-based field.
+                        expr.matches(position.of_type_index as i32 + 1)
+                    } else {
+                        expr.matches(same_type_before + 1)
+                    }
+                }
+                Pseudo::FirstOfType => {
+                    if position.of_type_count > 0 {
+                        position.of_type_index == 0
+                    } else {
+                        same_type_before == 0
+                    }
+                }
+                // The total-count-dependent variants: host MUST supply
+                // of_type_count > 0, else no match.
+                Pseudo::LastOfType => {
+                    position.of_type_count > 0
+                        && position.of_type_index == position.of_type_count - 1
+                }
+                Pseudo::OnlyOfType => position.of_type_count == 1,
+                Pseudo::NthLastOfType(expr) => {
+                    position.of_type_count > 0
+                        && expr.matches(position.of_type_count as i32 - position.of_type_index as i32)
+                }
             };
             if !on {
                 return false;
@@ -1103,10 +1167,9 @@ mod tests {
     #[test]
     fn unknown_pseudo_errors() {
         assert!(Selector::parse_compound("a:visited").is_err());
-        // The forward-sibling-dependent of-type variants are unsupported.
-        assert!(Selector::parse_compound("a:last-of-type").is_err());
-        assert!(Selector::parse_compound("a:only-of-type").is_err());
-        assert!(Selector::parse_compound("a:nth-last-of-type(2)").is_err());
+        // Genuinely-unsupported pseudo names still error.
+        assert!(Selector::parse_compound("a:nth-of-foo(2)").is_err());
+        assert!(Selector::parse_compound("a:empty").is_err());
     }
 
     #[test]
@@ -1609,5 +1672,166 @@ mod tests {
         assert!(first.matches_values("Item", None, &classes, State::empty(), &pos(0, 3)));
         let nth1 = Selector::parse_compound("Item:nth-of-type(1)").unwrap();
         assert!(nth1.matches_values("Item", None, &classes, State::empty(), &pos(0, 3)));
+    }
+
+    // ---------------------------------------------------------------------
+    // P6-1: :last-of-type, :only-of-type, :nth-last-of-type
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn parse_last_of_type() {
+        let s = Selector::parse_compound("Item:last-of-type").unwrap();
+        assert_eq!(s.type_name.as_deref(), Some("Item"));
+        assert_eq!(s.pseudos, vec![Pseudo::LastOfType]);
+    }
+
+    #[test]
+    fn parse_only_of_type() {
+        let s = Selector::parse_compound("Item:only-of-type").unwrap();
+        assert_eq!(s.pseudos, vec![Pseudo::OnlyOfType]);
+    }
+
+    #[test]
+    fn parse_nth_last_of_type() {
+        let s = Selector::parse_compound("Item:nth-last-of-type(2n+1)").unwrap();
+        assert_eq!(s.type_name.as_deref(), Some("Item"));
+        assert_eq!(s.pseudos.len(), 1);
+        assert_eq!(s.pseudos[0], Pseudo::NthLastOfType(NthExpr { a: 2, b: 1 }));
+    }
+
+    #[test]
+    fn of_type_pseudos_specificity_counts_as_one() {
+        // Each new of-type variant is one entry in the class/pseudo bucket.
+        assert_eq!(Selector::parse_compound(":last-of-type").unwrap().specificity(), (0, 1, 0));
+        assert_eq!(Selector::parse_compound(":only-of-type").unwrap().specificity(), (0, 1, 0));
+        assert_eq!(
+            Selector::parse_compound(":nth-last-of-type(2n+1)").unwrap().specificity(),
+            (0, 1, 0)
+        );
+    }
+
+    /// Build a NodeIdentity with explicit of-type position info.
+    fn nid_of_type(type_name: &str, of_type_index: usize, of_type_count: usize) -> NodeIdentity {
+        NodeIdentity {
+            type_name: type_name.to_string(),
+            id: None,
+            classes: Vec::new(),
+            state: State::empty(),
+            position: Position::default().with_of_type(of_type_index, of_type_count),
+        }
+    }
+
+    #[test]
+    fn last_of_type_matches_last_same_type() {
+        let sel = Selector::parse_compound("Item:last-of-type").unwrap();
+        // 0-based of_type_index 2 of 3 → it IS the last same-type sibling.
+        let last = nid_of_type("Item", 2, 3);
+        assert!(sel.matches_chain(&last, &[], &[]));
+        // 0-based of_type_index 1 of 3 → NOT the last.
+        let middle = nid_of_type("Item", 1, 3);
+        assert!(!sel.matches_chain(&middle, &[], &[]));
+        // of_type_index 0 of 1 (the only one) is also the last.
+        let sole = nid_of_type("Item", 0, 1);
+        assert!(sel.matches_chain(&sole, &[], &[]));
+    }
+
+    #[test]
+    fn only_of_type_matches_when_count_is_one() {
+        let sel = Selector::parse_compound("Item:only-of-type").unwrap();
+        assert!(sel.matches_chain(&nid_of_type("Item", 0, 1), &[], &[]));
+        assert!(!sel.matches_chain(&nid_of_type("Item", 1, 3), &[], &[]));
+        assert!(!sel.matches_chain(&nid_of_type("Item", 0, 3), &[], &[]));
+    }
+
+    #[test]
+    fn nth_last_of_type_counts_from_end() {
+        // nth-last (1-based from end) = of_type_count - of_type_index.
+        // of_type_index 0 of 3 → nth-last = 3.
+        let first_of_three = nid_of_type("Item", 0, 3);
+        let nl3 = Selector::parse_compound("Item:nth-last-of-type(3)").unwrap();
+        assert!(nl3.matches_chain(&first_of_three, &[], &[]));
+        let nl1 = Selector::parse_compound("Item:nth-last-of-type(1)").unwrap();
+        assert!(!nl1.matches_chain(&first_of_three, &[], &[]));
+
+        // of_type_index 2 of 3 → nth-last = 1 (the last one).
+        let last_of_three = nid_of_type("Item", 2, 3);
+        assert!(nl1.matches_chain(&last_of_three, &[], &[]));
+        assert!(!nl3.matches_chain(&last_of_three, &[], &[]));
+
+        // odd/even from the end: for count 4, indices 0..3 → nth-last 4,3,2,1.
+        // odd (2n+1 from end): 3 and 1 → of_type_index 1 (nth-last 3) and 3 (nth-last 1).
+        let nl_odd = Selector::parse_compound("Item:nth-last-of-type(odd)").unwrap();
+        // of_type_index 1 of 4 → nth-last = 3 (odd) → match.
+        assert!(nl_odd.matches_chain(&nid_of_type("Item", 1, 4), &[], &[]));
+        // of_type_index 0 of 4 → nth-last = 4 (even) → no match.
+        assert!(!nl_odd.matches_chain(&nid_of_type("Item", 0, 4), &[], &[]));
+    }
+
+    #[test]
+    fn last_of_type_unknown_count_does_not_match() {
+        // Default Position (of_type_count 0) — no host info, so the
+        // total-count-dependent variants never match, even when the node happens
+        // to be an only child.
+        let default = nid("Item"); // Position::default()
+        assert_eq!(default.position.of_type_count, 0);
+
+        let last = Selector::parse_compound("Item:last-of-type").unwrap();
+        assert!(!last.matches_chain(&default, &[], &[]));
+
+        let only = Selector::parse_compound("Item:only-of-type").unwrap();
+        assert!(!only.matches_chain(&default, &[], &[]));
+
+        let nl1 = Selector::parse_compound("Item:nth-last-of-type(1)").unwrap();
+        assert!(!nl1.matches_chain(&default, &[], &[]));
+    }
+
+    #[test]
+    fn nth_of_type_prefers_host_of_type_info() {
+        // When of_type_count > 0, :nth-of-type uses the host's of_type_index and
+        // IGNORES the previous-sibling count. Construct a case where the two
+        // disagree: host says of_type_index 1 (→ 1-based 2), but there are zero
+        // previous same-type siblings threaded in (same_type_before = 0).
+
+        // Host data: of_type_index 1 of 2 → :nth-of-type(2) should match,
+        // :nth-of-type(1) should NOT (host wins over the 0 prev-siblings).
+        let host_wins = nid_of_type("Item", 1, 2);
+        let nth2 = Selector::parse_compound("Item:nth-of-type(2)").unwrap();
+        let nth1 = Selector::parse_compound("Item:nth-of-type(1)").unwrap();
+        assert!(nth2.matches_chain(&host_wins, &[], &[]));
+        assert!(!nth1.matches_chain(&host_wins, &[], &[]));
+
+        // :first-of-type likewise prefers host data: of_type_index 1 → not first.
+        let first = Selector::parse_compound("Item:first-of-type").unwrap();
+        assert!(!first.matches_chain(&host_wins, &[], &[]));
+        // of_type_index 0 → first.
+        let host_first = nid_of_type("Item", 0, 3);
+        assert!(first.matches_chain(&host_first, &[], &[]));
+
+        // Consistency: host of_type_index 0 of 1 agrees with 0 prev-siblings →
+        // both :nth-of-type(1) and :first-of-type match.
+        let consistent = nid_of_type("Item", 0, 1);
+        assert!(nth1.matches_chain(&consistent, &[], &[]));
+        assert!(first.matches_chain(&consistent, &[], &[]));
+    }
+
+    #[test]
+    fn nth_of_type_still_uses_prev_siblings_when_no_host_info() {
+        // Regression for P5-5: when of_type_count == 0 (host didn't supply of-type
+        // info), :nth-of-type / :first-of-type fall back to previous-sibling
+        // counting. Re-verify with a sibling list (default Position → of_type_count 0).
+        let div = nid("Div");
+        let item = nid("Item");
+        let second_item = nid("Item");
+        let siblings = [div.clone(), item.clone(), div.clone()];
+
+        let nth2 = Selector::parse_compound("Item:nth-of-type(2)").unwrap();
+        assert!(nth2.matches_chain(&second_item, &[], &siblings));
+        let nth1 = Selector::parse_compound("Item:nth-of-type(1)").unwrap();
+        assert!(!nth1.matches_chain(&second_item, &[], &siblings));
+
+        let first = Selector::parse_compound("Item:first-of-type").unwrap();
+        assert!(!first.matches_chain(&second_item, &[], &siblings));
+        // The first Item (no previous same-type) matches :first-of-type.
+        assert!(first.matches_chain(&item, &[], std::slice::from_ref(&div)));
     }
 }

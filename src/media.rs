@@ -9,20 +9,25 @@
 //! # Matching model
 //!
 //! A query is a comma-separated list (logical OR) of [`MediaAlternative`]s. Each
-//! alternative is an optional `not` prefix applied to a conjunction (logical AND)
-//! of [`MediaCondition`]s. Precedence, tightest first:
+//! alternative is a conjunction (logical AND) of [`MediaTerm`]s, where each term
+//! is a [`MediaCondition`] optionally prefixed by `not` (per-term negation,
+//! following CSS4 feature negation). Precedence, tightest first:
 //!
-//! `not` (whole-alternative) > `and` (conditions) > `,` (alternatives / OR)
+//! `not` (per-term) > `and` (terms within an alternative) > `,` (alternatives / OR)
 //!
-//! So `(min-width: 80), not (color) and (max-height: 40)` parses as two
-//! alternatives: `(min-width: 80)` OR `not ((color) and (max-height: 40))`.
+//! So `not (min-width: 80) and (color)` is ONE alternative with TWO terms:
+//! `[¬(min-width: 80), (color)]` — it matches iff `cols < 80` AND color is on.
+//! A leading `not` binds to the immediately following feature only, not to the
+//! whole alternative.
 //!
 //! A query with **no alternatives** (e.g. a bare `@media {}` with no query text)
 //! matches anything — a no-op gate — preserving the historically lenient behavior.
 //!
 //! Media types (`screen`, `all`, `print`, `only`) are accepted syntactically and
 //! **ignored**: terminal apps are always "screen". A bare `@media print { }` is
-//! treated like `@media all { }` (matches everything).
+//! treated like `@media all { }` (matches everything). Because types are ignored,
+//! a `not <type>` (e.g. `not screen`) negates nothing meaningful and the `not`
+//! is dropped along with the type.
 //!
 //! Default-context caution: [`MediaContext::default()`] is all-zero / all-false,
 //! which means "no terminal info". A media-gated rule with any condition will
@@ -60,15 +65,35 @@ pub struct MediaQuery {
     pub alternatives: Vec<MediaAlternative>,
 }
 
-/// One `and`-conjunction of [`MediaCondition`]s, optionally negated as a whole.
+/// One condition in a media alternative, optionally negated (`not (feat)`).
 ///
-/// `matches` is true iff `(all conditions hold) XOR negated`.
+/// Following CSS4 feature negation, `not` applies to the immediately following
+/// feature only — it is per-term, not per-alternative. A term matches `ctx` iff
+/// `cond.matches(ctx) != negated`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MediaTerm {
+    /// A leading `not` negates this single condition.
+    pub negated: bool,
+    /// The underlying feature condition.
+    pub cond: MediaCondition,
+}
+
+impl MediaTerm {
+    /// True iff `cond` holds against `ctx`, XOR `negated`.
+    pub fn matches(&self, ctx: &MediaContext) -> bool {
+        self.cond.matches(ctx) != self.negated
+    }
+}
+
+/// One `and`-conjunction of [`MediaTerm`]s (no whole-alternative negation).
+///
+/// `matches` is true iff **every** term holds (each term already accounts for its
+/// own per-term `not`). Negation lives on individual terms, not on the
+/// alternative, so `(¬a) ∧ b` is represented precisely as `[¬a, b]`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct MediaAlternative {
-    /// A `not` prefix negates the whole alternative.
-    pub negated: bool,
-    /// Conditions joined by `and`; all must hold (before negation).
-    pub conditions: Vec<MediaCondition>,
+    /// `and`-joined terms; ALL must hold (each term: condition XOR `negated`).
+    pub terms: Vec<MediaTerm>,
 }
 
 /// A single media feature condition.
@@ -113,32 +138,23 @@ impl MediaQuery {
     /// # Semantics
     ///
     /// A query is an OR of [`MediaAlternative`]s, and each alternative is an AND
-    /// of [`MediaCondition`]s. To form `self ∧ other` we take the **cross
-    /// product** of the two alternatives lists: for each `a1` in `self` and each
-    /// `a2` in `other`, the combined alternative has
-    /// `conditions = a1.conditions ++ a2.conditions`. So `(a),(b)` AND-ed with
-    /// `(c)` yields two alternatives `(a,c)` and `(b,c)` — each must be fully
-    /// satisfied for the OR to match, which is exactly AND-of-OR semantics.
+    /// of [`MediaTerm`]s. To form `self ∧ other` we take the **cross product**
+    /// of the two alternatives lists: for each `a1` in `self` and each `a2` in
+    /// `other`, the combined alternative has `terms = a1.terms ++ a2.terms`. So
+    /// `(a),(b)` AND-ed with `(c)` yields two alternatives `(a,c)` and `(b,c)` —
+    /// each must be fully satisfied for the OR to match, which is exactly
+    /// AND-of-OR semantics.
     ///
     /// Match-all short-circuits: if either side has **zero alternatives** (the
     /// match-all gate) the other side is returned unchanged (cloned). If both
     /// are empty the result is empty (still match-all).
     ///
-    /// # Negation limitation (approximate for `not`)
+    /// # Negation (exact)
     ///
-    /// A [`MediaAlternative`] carries a single `negated` flag for the *whole*
-    /// conjunction, so a precise `(¬a1) ∧ a2` (one side negated, the other not)
-    /// cannot be represented as one alternative. For the cross product:
-    ///
-    /// - If **neither** side is negated, the combined alternative is exact:
-    ///   `{ negated: false, conditions: a1.conditions ++ a2.conditions }`.
-    /// - If **either** side is negated, the precise AND-semantics cannot be
-    ///   represented, so the combined alternative is an **approximation**:
-    ///   `negated = a1.negated || a2.negated` with the concatenated conditions.
-    ///
-    /// The common case (no `not` inside nested `@media`) is exact. If you need
-    /// a `not` in a nested context, prefer writing it as a single flat
-    /// `@media` with the conditions spelled out rather than nesting.
+    /// Because negation is per-term (CSS4 feature negation), there is no
+    /// approximation: a `(¬a) ∧ b` combination is represented precisely as a
+    /// single alternative `[¬a, b]`. The cross product simply concatenates the
+    /// term lists, preserving each term's `negated` flag.
     pub fn and(&self, other: &MediaQuery) -> MediaQuery {
         // Match-all short-circuits: an empty alternatives list means "matches
         // everything", so X AND all == X.
@@ -152,28 +168,24 @@ impl MediaQuery {
         let mut combined = Vec::with_capacity(self.alternatives.len() * other.alternatives.len());
         for a1 in &self.alternatives {
             for a2 in &other.alternatives {
-                // Concatenate conditions. The negation handling is the
-                // documented approximation for the negated case.
-                let mut conditions = Vec::with_capacity(a1.conditions.len() + a2.conditions.len());
-                conditions.extend(a1.conditions.iter().cloned());
-                conditions.extend(a2.conditions.iter().cloned());
-                combined.push(MediaAlternative {
-                    negated: a1.negated || a2.negated,
-                    conditions,
-                });
+                // Concatenate terms; each term carries its own negation flag, so
+                // the combined alternative is exact (no approximation).
+                let mut terms = Vec::with_capacity(a1.terms.len() + a2.terms.len());
+                terms.extend(a1.terms.iter().cloned());
+                terms.extend(a2.terms.iter().cloned());
+                combined.push(MediaAlternative { terms });
             }
         }
         MediaQuery { alternatives: combined }
     }
 
-    /// The specificity of `self` against `media`: the maximum condition-count
-    /// among the alternatives that **match** under `media`. Returns `None` if
-    /// the query does not match `media` at all.
+    /// The specificity of `self` against `media`: the maximum term-count among
+    /// the alternatives that **match** under `media`. Returns `None` if the
+    /// query does not match `media` at all.
     ///
     /// A match-all query (zero alternatives) has specificity `0`. Used by the
     /// media-token resolution scan to rank competing overrides: the override
-    /// backed by the most-conditioned matching query wins (ties broken by source
-    /// order).
+    /// backed by the most-term matching query wins (ties broken by source order).
     pub(crate) fn matching_specificity(&self, media: &MediaContext) -> Option<usize> {
         if self.alternatives.is_empty() {
             // Matches everything (specificity 0).
@@ -182,7 +194,7 @@ impl MediaQuery {
         let mut best: Option<usize> = None;
         for a in &self.alternatives {
             if a.matches(media) {
-                let n = a.conditions.len();
+                let n = a.terms.len();
                 best = Some(match best {
                     Some(b) if b >= n => b,
                     _ => n,
@@ -196,16 +208,21 @@ impl MediaQuery {
     ///
     /// Grammar (case-insensitive), precedence tightest first:
     ///
-    /// `not` (whole-alternative) > `and` (conditions) > `,` (alternatives / OR)
+    /// `not` (per-term) > `and` (terms within an alternative) > `,` (alternatives / OR)
     ///
     /// - The text is split on top-level commas into one [`MediaAlternative`]
     ///   per part (OR).
-    /// - Each part may begin with an optional leading `not` (negates the whole
-    ///   alternative) and an optional media-type keyword sequence (`only`,
-    ///   `screen`, `all`, `print`, possibly `only screen`) which is accepted and
-    ///   **ignored** — terminal apps are always "screen". If a media type is
-    ///   present it may be followed by `and`, which is also consumed.
-    /// - The remainder is zero or more `(condition)` clauses joined by `and`.
+    /// - Each part may begin with an optional media-type keyword sequence
+    ///   (`only`, `screen`, `all`, `print`, possibly `only screen`) which is
+    ///   accepted and **ignored** — terminal apps are always "screen". If a media
+    ///   type is present it may be followed by `and`, which is also consumed. A
+    ///   leading `not` immediately before a media type (e.g. `not screen`)
+    ///   negates nothing meaningful (types are ignored) and is dropped along
+    ///   with the type.
+    /// - The remainder is zero or more terms joined by `and`. Each term is an
+    ///   optional leading `not` (per-term negation, CSS4 feature negation)
+    ///   followed by a `(condition)` clause. So `not (a) and (b)` → two terms
+    ///   `[¬a, b]`.
     ///
     /// Unknown / malformed features surface as a [`CssError`] so strict stays
     /// honest; the stylesheet parser propagates it.
@@ -241,42 +258,62 @@ impl MediaQuery {
 }
 
 impl MediaAlternative {
-    /// True iff `(all conditions hold against ctx) XOR negated`.
+    /// True iff **every** term holds against `ctx`. Each term already accounts
+    /// for its own per-term `not`, so there is no alternative-level negation.
     pub fn matches(&self, ctx: &MediaContext) -> bool {
-        let all_hold = self.conditions.iter().all(|c| c.matches(ctx));
-        all_hold != self.negated
+        self.terms.iter().all(|t| t.matches(ctx))
     }
 }
 
 /// Parse one comma-separated alternative (already trimmed, lowercased).
 ///
-/// Handles the optional leading `not` and media-type keywords, then splits the
-/// remainder on `and` into conditions.
+/// Handles the optional media-type keyword sequence, then parses the remainder
+/// as `and`-joined terms — each term being an optional leading `not` (per-term
+/// negation) followed by a `(condition)`.
 fn parse_alternative(part: &str) -> Result<MediaAlternative> {
     let bytes = part.as_bytes();
     let mut i = 0usize;
-    let mut negated = false;
 
     // Skip leading whitespace.
     while i < bytes.len() && bytes[i].is_ascii_whitespace() {
         i += 1;
     }
 
-    // Optional leading `not` (whole word). CSS media queries put `not` at the
-    // alternative level (it negates the whole comma-separated part), so this is
-    // distinct from the (unsupported) per-condition `not`.
+    // A leading `not` before a media TYPE (e.g. `not screen`) negates the type.
+    // Since types are ignored, that `not` applies to nothing — drop it along
+    // with the type. We only treat `not` as a per-term prefix when it is
+    // immediately followed by a `(` (a feature). So: if `not` appears here and
+    // the next non-space token is a media-type keyword, consume both and drop
+    // them; if the next token is `(`, leave the `not` for the per-term loop.
     if let Some(consumed) = consume_keyword(bytes, i, "not") {
-        i = consumed;
-        negated = true;
-        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
-            i += 1;
+        // Peek: skip whitespace, check whether a media type follows.
+        let mut j = consumed;
+        while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+            j += 1;
         }
+        let mut is_type = false;
+        for kw in ["only", "screen", "all", "print"] {
+            if consume_keyword(bytes, j, kw).is_some() {
+                is_type = true;
+                break;
+            }
+        }
+        if is_type {
+            // Drop the leading `not <type>`: consume the `not` and fall through
+            // to the media-type consumption loop below.
+            i = consumed;
+            while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+                i += 1;
+            }
+        }
+        // Otherwise (next is `(` or end): leave `i` untouched so the per-term
+        // loop sees the `not` and binds it to the following feature.
     }
 
     // Consume an optional media-type keyword sequence: `only`, `screen`, `all`,
     // `print`, possibly `only screen`. These are IGNORED (terminal apps are
     // always "screen"). Also consume a trailing `and` if present so the
-    // remainder is the condition list.
+    // remainder is the term list.
     loop {
         let prev_i = i;
         for kw in ["only", "screen", "all", "print"] {
@@ -294,7 +331,7 @@ fn parse_alternative(part: &str) -> Result<MediaAlternative> {
     }
     // After consuming media types, consume a single following `and` if present
     // (e.g. `screen and (...)`). This `and` separates the media type from the
-    // feature conditions, not conditions from each other.
+    // feature terms, not terms from each other.
     if let Some(consumed) = consume_keyword(bytes, i, "and") {
         i = consumed;
         while i < bytes.len() && bytes[i].is_ascii_whitespace() {
@@ -302,17 +339,33 @@ fn parse_alternative(part: &str) -> Result<MediaAlternative> {
         }
     }
 
-    // The remainder is the condition list: zero or more `(cond)` joined by
+    // The remainder is the term list: zero or more `[not] (cond)` joined by
     // `and`. If nothing remains (e.g. bare `screen` or `not screen`), the
-    // alternative has zero conditions → matches everything (before negation).
-    let mut conditions = Vec::new();
-    let mut seen_any = false;
+    // alternative has zero terms → matches everything.
+    let mut terms = Vec::new();
     loop {
         while i < bytes.len() && bytes[i].is_ascii_whitespace() {
             i += 1;
         }
         if i >= bytes.len() {
             break;
+        }
+
+        // Per-term `not` (CSS4 feature negation): a `not` immediately before a
+        // `(feature)` negates that single feature. It is NOT whole-alternative.
+        let mut negated = false;
+        if let Some(consumed) = consume_keyword(bytes, i, "not") {
+            negated = true;
+            i = consumed;
+            while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+                i += 1;
+            }
+        }
+
+        if i >= bytes.len() {
+            return Err(CssError::invalid_selector(
+                "media query: `not` at end of alternative (nothing to negate)",
+            ));
         }
         if bytes[i] != b'(' {
             return Err(CssError::invalid_selector(format!(
@@ -330,11 +383,11 @@ fn parse_alternative(part: &str) -> Result<MediaAlternative> {
             }
         };
         let inner = &part[i + 1..close];
-        conditions.push(parse_condition(inner)?);
+        let cond = parse_condition(inner)?;
+        terms.push(MediaTerm { negated, cond });
         i = close + 1;
-        seen_any = true;
 
-        // After a condition, expect either end-of-string or ` and `.
+        // After a term, expect either end-of-string or ` and `.
         while i < bytes.len() && bytes[i].is_ascii_whitespace() {
             i += 1;
         }
@@ -346,13 +399,12 @@ fn parse_alternative(part: &str) -> Result<MediaAlternative> {
             continue;
         }
         return Err(CssError::invalid_selector(format!(
-            "media query: expected `and` between conditions near `{}`",
+            "media query: expected `and` between terms near `{}`",
             &part[i..]
         )));
     }
 
-    let _ = seen_any;
-    Ok(MediaAlternative { negated, conditions })
+    Ok(MediaAlternative { terms })
 }
 
 /// If `bytes[i..]` begins with `kw` as a whole word (followed by whitespace, a
@@ -554,16 +606,22 @@ impl std::fmt::Display for MediaQuery {
 
 impl std::fmt::Display for MediaAlternative {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        if self.negated {
-            write!(f, "not ")?;
-        }
-        for (i, c) in self.conditions.iter().enumerate() {
+        for (i, t) in self.terms.iter().enumerate() {
             if i > 0 {
                 write!(f, " and ")?;
             }
-            std::fmt::Display::fmt(c, f)?;
+            std::fmt::Display::fmt(t, f)?;
         }
         Ok(())
+    }
+}
+
+impl std::fmt::Display for MediaTerm {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.negated {
+            write!(f, "not ")?;
+        }
+        std::fmt::Display::fmt(&self.cond, f)
     }
 }
 
@@ -596,9 +654,35 @@ mod tests {
         }
     }
 
-    /// Build a `MediaAlternative` from a `negated` flag + a list of conditions.
-    fn alt<I: IntoIterator<Item = MediaCondition>>(negated: bool, conds: I) -> MediaAlternative {
-        MediaAlternative { negated, conditions: conds.into_iter().collect() }
+    /// Build a `MediaAlternative` from a list of conditions (none negated).
+    fn alt<I: IntoIterator<Item = MediaCondition>>(conds: I) -> MediaAlternative {
+        MediaAlternative {
+            terms: conds
+                .into_iter()
+                .map(|c| MediaTerm { negated: false, cond: c })
+                .collect(),
+        }
+    }
+
+    /// Build a single negated `MediaTerm` for a condition.
+    fn not_term(c: MediaCondition) -> MediaTerm {
+        MediaTerm { negated: true, cond: c }
+    }
+
+    /// Build a single (non-negated) `MediaTerm` for a condition.
+    fn term(c: MediaCondition) -> MediaTerm {
+        MediaTerm { negated: false, cond: c }
+    }
+
+    /// Build a `MediaAlternative` from a single negated term.
+    fn alt_neg(c: MediaCondition) -> MediaAlternative {
+        MediaAlternative { terms: vec![not_term(c)] }
+    }
+
+    /// Build a `MediaAlternative` from a list of `MediaTerm`s (for mixed
+    /// negation within one alternative).
+    fn alt_terms<I: IntoIterator<Item = MediaTerm>>(terms: I) -> MediaAlternative {
+        MediaAlternative { terms: terms.into_iter().collect() }
     }
 
     fn no_color_ctx() -> MediaContext {
@@ -610,7 +694,7 @@ mod tests {
     #[test]
     fn parse_min_width() {
         let q = MediaQuery::parse("(min-width: 80)").unwrap();
-        assert_eq!(q.alternatives, vec![alt(false, [MediaCondition::MinWidth(80)])]);
+        assert_eq!(q.alternatives, vec![alt([MediaCondition::MinWidth(80)])]);
     }
 
     #[test]
@@ -618,41 +702,41 @@ mod tests {
         let q = MediaQuery::parse("(max-width: 120) and (min-height: 24)").unwrap();
         assert_eq!(
             q.alternatives,
-            vec![alt(false, [MediaCondition::MaxWidth(120), MediaCondition::MinHeight(24)])]
+            vec![alt([MediaCondition::MaxWidth(120), MediaCondition::MinHeight(24)])]
         );
     }
 
     #[test]
     fn parse_width_exact() {
         let q = MediaQuery::parse("(width: 80)").unwrap();
-        assert_eq!(q.alternatives, vec![alt(false, [MediaCondition::Width(80)])]);
+        assert_eq!(q.alternatives, vec![alt([MediaCondition::Width(80)])]);
     }
 
     #[test]
     fn parse_color_bare() {
         let q = MediaQuery::parse("(color)").unwrap();
-        assert_eq!(q.alternatives, vec![alt(false, [MediaCondition::Color])]);
+        assert_eq!(q.alternatives, vec![alt([MediaCondition::Color])]);
     }
 
     #[test]
     fn parse_monochrome_bare() {
         let q = MediaQuery::parse("(monochrome)").unwrap();
-        assert_eq!(q.alternatives, vec![alt(false, [MediaCondition::Monochrome])]);
+        assert_eq!(q.alternatives, vec![alt([MediaCondition::Monochrome])]);
     }
 
     #[test]
     fn parse_truecolor_bare() {
         let q = MediaQuery::parse("(truecolor)").unwrap();
-        assert_eq!(q.alternatives, vec![alt(false, [MediaCondition::Truecolor])]);
+        assert_eq!(q.alternatives, vec![alt([MediaCondition::Truecolor])]);
     }
 
     #[test]
     fn parse_leading_media_type_ignored() {
         let q = MediaQuery::parse("screen and (min-width: 80)").unwrap();
-        assert_eq!(q.alternatives, vec![alt(false, [MediaCondition::MinWidth(80)])]);
+        assert_eq!(q.alternatives, vec![alt([MediaCondition::MinWidth(80)])]);
 
         let q2 = MediaQuery::parse("all and (max-height: 40)").unwrap();
-        assert_eq!(q2.alternatives, vec![alt(false, [MediaCondition::MaxHeight(40)])]);
+        assert_eq!(q2.alternatives, vec![alt([MediaCondition::MaxHeight(40)])]);
     }
 
     #[test]
@@ -666,7 +750,7 @@ mod tests {
     fn parse_uppercase_features() {
         // Case-insensitive: features get lowercased internally.
         let q = MediaQuery::parse("(MIN-WIDTH: 80)").unwrap();
-        assert_eq!(q.alternatives, vec![alt(false, [MediaCondition::MinWidth(80)])]);
+        assert_eq!(q.alternatives, vec![alt([MediaCondition::MinWidth(80)])]);
     }
 
     // --- parse: not / comma / and --------------------------------------------
@@ -677,16 +761,18 @@ mod tests {
         assert_eq!(
             q.alternatives,
             vec![
-                alt(false, [MediaCondition::MinWidth(80)]),
-                alt(false, [MediaCondition::MaxWidth(120)]),
+                alt([MediaCondition::MinWidth(80)]),
+                alt([MediaCondition::MaxWidth(120)]),
             ]
         );
     }
 
     #[test]
     fn parse_not_prefix_single() {
+        // Per-term negation: `not (min-width: 80)` → one alternative with one
+        // negated term.
         let q = MediaQuery::parse("not (min-width: 80)").unwrap();
-        assert_eq!(q.alternatives, vec![alt(true, [MediaCondition::MinWidth(80)])]);
+        assert_eq!(q.alternatives, vec![alt_neg(MediaCondition::MinWidth(80))]);
     }
 
     #[test]
@@ -695,18 +781,20 @@ mod tests {
         assert_eq!(
             q.alternatives,
             vec![
-                alt(false, [MediaCondition::MinWidth(80)]),
-                alt(false, [MediaCondition::MaxWidth(120)]),
-                alt(false, [MediaCondition::Color]),
+                alt([MediaCondition::MinWidth(80)]),
+                alt([MediaCondition::MaxWidth(120)]),
+                alt([MediaCondition::Color]),
             ]
         );
     }
 
     #[test]
     fn parse_not_screen_media_type_ignored() {
-        // `not` negates the alternative; media type `screen` is ignored.
+        // `not screen` negates the media TYPE, which is ignored → the `not` is
+        // dropped along with the type. The remaining `(min-width: 80)` is a
+        // single non-negated term.
         let q = MediaQuery::parse("not screen and (min-width: 80)").unwrap();
-        assert_eq!(q.alternatives, vec![alt(true, [MediaCondition::MinWidth(80)])]);
+        assert_eq!(q.alternatives, vec![alt([MediaCondition::MinWidth(80)])]);
     }
 
     #[test]
@@ -715,8 +803,8 @@ mod tests {
         assert_eq!(
             q.alternatives,
             vec![
-                alt(false, [MediaCondition::MinWidth(80)]),
-                alt(true, [MediaCondition::Color]),
+                alt([MediaCondition::MinWidth(80)]),
+                alt_neg(MediaCondition::Color),
             ]
         );
     }
@@ -727,10 +815,7 @@ mod tests {
         let q = MediaQuery::parse("(min-width: 80) and (max-height: 40)").unwrap();
         assert_eq!(
             q.alternatives,
-            vec![alt(
-                false,
-                [MediaCondition::MinWidth(80), MediaCondition::MaxHeight(40)]
-            )]
+            vec![alt([MediaCondition::MinWidth(80), MediaCondition::MaxHeight(40)])]
         );
     }
 
@@ -742,10 +827,10 @@ mod tests {
 
     #[test]
     fn parse_bare_media_type_matches_all() {
-        // Bare media type, no conditions → one alternative with zero conditions
-        // (matches everything before negation).
+        // Bare media type, no terms → one alternative with zero terms (matches
+        // everything).
         let q = MediaQuery::parse("screen").unwrap();
-        assert_eq!(q.alternatives, vec![MediaAlternative { negated: false, conditions: vec![] }]);
+        assert_eq!(q.alternatives, vec![MediaAlternative { terms: vec![] }]);
         assert!(q.matches(&MediaContext::default()));
     }
 
@@ -885,14 +970,29 @@ mod tests {
 
     #[test]
     fn not_all_conditions_in_one_alternative() {
-        // not ((min-width: 80) and (color)): negates the whole conjunction.
+        // Per-term negation: `not (min-width: 80) and (color)` is ONE alternative
+        // with TWO terms `[¬(min-width:80), (color)]`. It matches iff
+        // (cols < 80) AND (color on). This is DIFFERENT from whole-alternative
+        // negation `not ((min-width:80) and (color))`.
         let q = MediaQuery::parse("not (min-width: 80) and (color)").unwrap();
-        // cols=100 + color → conjunction true → negated false.
-        assert!(!q.matches(&ctx(100, 24)));
-        // cols=60 + color → conjunction false → negated true.
+        // Structure: one alternative, two terms — first negated, second not.
+        assert_eq!(
+            q.alternatives,
+            vec![alt_terms([
+                not_term(MediaCondition::MinWidth(80)),
+                term(MediaCondition::Color),
+            ])]
+        );
+        // cols=60 + color → ¬min-width true (60<80) AND color true → matches.
         assert!(q.matches(&ctx(60, 24)));
-        // no_color: (color) false → conjunction false → negated true.
-        assert!(q.matches(&no_color_ctx()));
+        // cols=100 + color → ¬min-width false (100>=80) → no match (per-term).
+        assert!(!q.matches(&ctx(100, 24)));
+        // cols=60 + no_color → ¬min-width true BUT color false → no match.
+        let small_mono = MediaContext { cols: 60, no_color: true, ..Default::default() };
+        assert!(!q.matches(&small_mono));
+        // cols=100 + no_color → both fail → no match.
+        let large_mono = MediaContext { cols: 100, no_color: true, ..Default::default() };
+        assert!(!q.matches(&large_mono));
     }
 
     // --- Display -------------------------------------------------------------
@@ -920,7 +1020,7 @@ mod tests {
         let combined = q1.and(&q2);
         assert_eq!(
             combined.alternatives,
-            vec![alt(false, [MediaCondition::MinWidth(80), MediaCondition::Color])],
+            vec![alt([MediaCondition::MinWidth(80), MediaCondition::Color])],
             "AND of two single-condition queries concatenates conditions"
         );
         // Matches only when both hold.
@@ -943,8 +1043,8 @@ mod tests {
         assert_eq!(
             combined.alternatives,
             vec![
-                alt(false, [MediaCondition::MinWidth(80), MediaCondition::Color]),
-                alt(false, [MediaCondition::MaxWidth(40), MediaCondition::Color]),
+                alt([MediaCondition::MinWidth(80), MediaCondition::Color]),
+                alt([MediaCondition::MaxWidth(40), MediaCondition::Color]),
             ],
             "OR cross-product with AND concatenates per-alternative"
         );
@@ -975,36 +1075,34 @@ mod tests {
     }
 
     #[test]
-    fn media_query_and_negation_is_approximate() {
-        // (not (min-width: 80)).and((color)): the documented v1 approximation
-        // propagates negation onto the combined alternative. So the combined
-        // alternative is `not ((min-width: 80) and (color))`.
-        //
-        // This is NOT the precise semantics of `(¬min-width:80) ∧ (color)` —
-        // that would require a per-condition negation model we don't have. The
-        // test pins the documented approximation so a future change is caught.
+    fn media_query_and_is_now_exact_with_negation() {
+        // (not (min-width: 80)).and((color)): with per-term negation the AND is
+        // EXACT. The combined alternative is `[¬(min-width:80), (color)]` — one
+        // alternative, two terms (first negated). It matches iff
+        // (cols < 80) AND (color on). This replaces the old
+        // `media_query_and_negation_is_approximate` test, which pinned the
+        // whole-alternative-negation approximation.
         let not_q = MediaQuery::parse("not (min-width: 80)").unwrap();
         let color_q = MediaQuery::parse("(color)").unwrap();
         let combined = not_q.and(&color_q);
-        // One alternative, negated, with both conditions.
+        // One alternative, two terms — first negated, second not.
         assert_eq!(
             combined.alternatives,
-            vec![alt(true, [MediaCondition::MinWidth(80), MediaCondition::Color])],
-            "negation propagates to the combined alternative (approximation)"
+            vec![alt_terms([
+                not_term(MediaCondition::MinWidth(80)),
+                term(MediaCondition::Color),
+            ])],
+            "AND is exact: per-term negation preserved, no whole-alt negation"
         );
-        // Under the approximation: `not ((min-width: 80) and (color))`.
-        // cols:100, color → both hold → negated → no match.
-        let large_color = MediaContext { cols: 100, no_color: false, ..Default::default() };
-        assert!(
-            !combined.matches(&large_color),
-            "approximation: both hold → negated → no match"
-        );
-        // cols:60, color → min-width fails → conjunction false → negated true.
+        // cols:60, color → ¬min-width true AND color true → matches.
         let small_color = MediaContext { cols: 60, no_color: false, ..Default::default() };
-        assert!(
-            combined.matches(&small_color),
-            "approximation: one fails → negated → matches"
-        );
+        assert!(combined.matches(&small_color), "exact: ¬width AND color → matches");
+        // cols:100, color → ¬min-width false (100>=80) → no match.
+        let large_color = MediaContext { cols: 100, no_color: false, ..Default::default() };
+        assert!(!combined.matches(&large_color), "exact: width holds so ¬width false → no match");
+        // cols:60, no_color → ¬min-width true BUT color false → no match.
+        let small_mono = MediaContext { cols: 60, no_color: true, ..Default::default() };
+        assert!(!combined.matches(&small_mono), "exact: color missing → no match");
     }
 
     #[test]
@@ -1032,5 +1130,100 @@ mod tests {
     fn matching_specificity_zero_for_match_all() {
         let empty = MediaQuery::default();
         assert_eq!(empty.matching_specificity(&MediaContext::default()), Some(0));
+    }
+
+    #[test]
+    fn matching_specificity_counts_terms() {
+        // Specificity is now the term count of the matching alternative. A
+        // 2-term alternative has specificity 2.
+        let q = MediaQuery::parse("(min-width: 80) and (color)").unwrap();
+        let large_color = MediaContext { cols: 100, no_color: false, ..Default::default() };
+        assert_eq!(q.matching_specificity(&large_color), Some(2));
+    }
+
+    #[test]
+    fn matching_specificity_counts_negated_terms() {
+        // Negated terms count toward specificity too. `not (min-width: 80)` is
+        // one term (negated) → specificity 1 when it matches.
+        let q = MediaQuery::parse("not (min-width: 80)").unwrap();
+        let small = MediaContext { cols: 60, ..Default::default() };
+        assert_eq!(q.matching_specificity(&small), Some(1));
+        // And a 2-term negated alternative `not (min-width:80) and (color)`.
+        let q2 = MediaQuery::parse("not (min-width: 80) and (color)").unwrap();
+        // cols:60, no_color:true → ¬min-width true BUT (color) false → no match.
+        let small_mono = MediaContext { cols: 60, no_color: true, ..Default::default() };
+        assert_eq!(q2.matching_specificity(&small_mono), None, "color missing → no match");
+        // cols:60, color on → both terms satisfied → 2-term specificity.
+        let small_color = MediaContext { cols: 60, no_color: false, ..Default::default() };
+        assert_eq!(
+            q2.matching_specificity(&small_color),
+            Some(2),
+            "both terms satisfied → 2-term specificity"
+        );
+    }
+
+    // --- per-term negation (P6-2) -------------------------------------------
+
+    #[test]
+    fn not_is_per_term() {
+        // `not (min-width:80) and (color)` parses to ONE alternative with TWO
+        // terms `[¬min-width:80, color]` — NOT two alternatives, NOT whole-alt
+        // negation.
+        let q = MediaQuery::parse("not (min-width: 80) and (color)").unwrap();
+        assert_eq!(q.alternatives.len(), 1, "one alternative, not two");
+        let alt0 = &q.alternatives[0];
+        assert_eq!(alt0.terms.len(), 2, "two terms in the alternative");
+        assert_eq!(alt0.terms[0], not_term(MediaCondition::MinWidth(80)));
+        assert_eq!(alt0.terms[1], term(MediaCondition::Color));
+    }
+
+    #[test]
+    fn per_term_negation_matches() {
+        // `not (min-width:80)` matches ctx{cols:60} (¬true=true), not {cols:100}.
+        let q = MediaQuery::parse("not (min-width: 80)").unwrap();
+        assert!(q.matches(&ctx(60, 24)));
+        assert!(!q.matches(&ctx(100, 24)));
+
+        // `not (min-width:80) and (color)` matches {cols:60,color}, not
+        // {cols:60,no_color}, not {cols:100,color}.
+        let q2 = MediaQuery::parse("not (min-width: 80) and (color)").unwrap();
+        let small_color = MediaContext { cols: 60, no_color: false, ..Default::default() };
+        let small_mono = MediaContext { cols: 60, no_color: true, ..Default::default() };
+        let large_color = MediaContext { cols: 100, no_color: false, ..Default::default() };
+        assert!(q2.matches(&small_color), "cols<80 AND color → matches");
+        assert!(!q2.matches(&small_mono), "cols<80 but no color → no match");
+        assert!(!q2.matches(&large_color), "cols>=80 → ¬min-width false → no match");
+    }
+
+    #[test]
+    fn comma_with_not_terms() {
+        // `(min-width:200), not (color)` → two alternatives; matches no_color ctx
+        // via the second (negated-term) alternative.
+        let q = MediaQuery::parse("(min-width: 200), not (color)").unwrap();
+        assert_eq!(q.alternatives.len(), 2);
+        // Structure: second alt is one negated term.
+        assert_eq!(q.alternatives[1], alt_neg(MediaCondition::Color));
+        // no_color ctx → (color) false → ¬(color) true → matches via second alt.
+        assert!(q.matches(&no_color_ctx()));
+        // color ctx, cols<200 → first alt fails, second alt (¬color) false → no match.
+        assert!(!q.matches(&ctx(100, 24)));
+        // color ctx, cols>=200 → first alt matches.
+        assert!(q.matches(&ctx(200, 24)));
+    }
+
+    #[test]
+    fn display_roundtrip_negated_term() {
+        // A negated term round-trips through Display.
+        let q = MediaQuery::parse("not (min-width: 80) and (color)").unwrap();
+        assert_eq!(q.to_string(), "not (min-width: 80) and (color)");
+        // Re-parse and confirm structural equality (round-trip stable).
+        let q2 = MediaQuery::parse(&q.to_string()).unwrap();
+        assert_eq!(q, q2);
+    }
+
+    #[test]
+    fn not_at_end_of_alternative_errors() {
+        // A trailing `not` with nothing to negate is a structural error.
+        assert!(MediaQuery::parse("(min-width: 80) and not").is_err());
     }
 }

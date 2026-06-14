@@ -39,8 +39,9 @@ impl State {
     }
 }
 
-/// Where an element sits among its siblings. Used by future `:nth-child`
-/// matching (P3); returned by [`StyledNode::position`] for forward-compat.
+/// Where an element sits among its siblings. Used by structural pseudo-class
+/// matching (`:nth-child`, `:first-of-type`, etc.); returned by
+/// [`StyledNode::position`] for forward-compat.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Position {
     /// 0-based index among siblings.
@@ -49,6 +50,18 @@ pub struct Position {
     pub sibling_count: usize,
     /// The parent element's type name, if any.
     pub parent_type: Option<String>,
+    /// 0-based index of this element among its same-type siblings (those sharing
+    /// `type_name`). 0 means "unknown / not supplied" — of-type pseudo-classes
+    /// that need the total count (`:last/only/nth-last-of-type`) will NOT match
+    /// when this is 0. (0-based, like `index`.) Supply it via
+    /// [`with_of_type`](Self::with_of_type).
+    pub of_type_index: usize,
+    /// Total number of same-type siblings (including self). 0 means "unknown".
+    /// The forward-looking of-type pseudos (`:last/only/nth-last-of-type`)
+    /// require this to be `> 0` to match. `:nth-of-type` / `:first-of-type` will
+    /// *prefer* this when `> 0` but fall back to previous-sibling counting
+    /// otherwise. Supply it via [`with_of_type`](Self::with_of_type).
+    pub of_type_count: usize,
 }
 
 impl Position {
@@ -57,7 +70,21 @@ impl Position {
             index,
             sibling_count,
             parent_type: None,
+            of_type_index: 0,
+            of_type_count: 0,
         }
+    }
+
+    /// Consuming builder that sets the same-type-sibling position info.
+    ///
+    /// `of_type_index` is 0-based among same-type siblings; `of_type_count` is
+    /// the total same-type sibling count (including self). Both `0` (the
+    /// default) mean "unknown" — in that state `:last/only/nth-last-of-type`
+    /// never match.
+    pub fn with_of_type(mut self, of_type_index: usize, of_type_count: usize) -> Self {
+        self.of_type_index = of_type_index;
+        self.of_type_count = of_type_count;
+        self
     }
 }
 
@@ -345,5 +372,35 @@ mod tests {
         let c = Classes::from_slice(&[]);
         assert!(c.is_empty());
         assert_eq!(c.len(), 0);
+    }
+
+    #[test]
+    fn position_default_and_new_leave_of_type_zero() {
+        // Default and the two-arg constructor both leave the of-type fields at
+        // 0 (unknown) so the forward-looking of-type pseudos never match unless
+        // the host explicitly supplies them.
+        let d = Position::default();
+        assert_eq!(d.of_type_index, 0);
+        assert_eq!(d.of_type_count, 0);
+
+        let n = Position::new(2, 5);
+        assert_eq!(n.index, 2);
+        assert_eq!(n.sibling_count, 5);
+        assert_eq!(n.of_type_index, 0);
+        assert_eq!(n.of_type_count, 0);
+    }
+
+    #[test]
+    fn position_with_of_type_sets_fields() {
+        let p = Position::new(1, 4).with_of_type(2, 3);
+        assert_eq!(p.index, 1);
+        assert_eq!(p.sibling_count, 4);
+        assert_eq!(p.of_type_index, 2);
+        assert_eq!(p.of_type_count, 3);
+
+        // Explicitly setting to 0/0 means "unknown" again.
+        let cleared = p.with_of_type(0, 0);
+        assert_eq!(cleared.of_type_index, 0);
+        assert_eq!(cleared.of_type_count, 0);
     }
 }

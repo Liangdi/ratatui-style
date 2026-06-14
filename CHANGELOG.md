@@ -1,9 +1,11 @@
 ## [0.2.0] - 2026-06-15
 
-A breaking release: the P3 + P4 + P5 roadmaps land — structural pseudo-classes (incl.
-`:nth-of-type`), all four combinators (incl. nested sibling chains), `@media` queries with
-`not`/`or`/comma + nesting + media-scoped tokens with specificity cascade, an access-order
-`ComputedStyle` LRU cache — alongside a serde cross-format overhaul and cascade perf work.
+A breaking release: the P3 + P4 + P5 + P6 roadmaps land — structural pseudo-classes
+(incl. `:nth-of-type` and `:last/only/nth-last-of-type`), all four combinators (incl. nested
+sibling chains), `@media` queries with per-term `not` + nesting + media-scoped tokens with
+specificity cascade, `@supports` capability gating, `var()` for padding/margin/border-style, and
+an access-order `ComputedStyle` LRU cache — alongside a serde cross-format overhaul and cascade
+perf work.
 
 ### 🚀 Features
 
@@ -60,6 +62,21 @@ A breaking release: the P3 + P4 + P5 roadmaps land — structural pseudo-classes
 - *(token)* Media-token specificity cascade — when multiple media overrides
   match, the **most specific** (most conditions) wins; ties break by source
   order. Replaces the prior "last-matching-wins" rule.
+- *(selector)* `:last-of-type`, `:only-of-type`, `:nth-last-of-type` — sourced
+  from host-supplied `Position.of_type_count` (`:nth-of-type`/`:first-of-type`
+  keep their prev-sibling fallback). `Position` gained `of_type_index` /
+  `of_type_count` fields.
+- *(media)* Per-term negation — `not` now negates the immediately-following
+  condition (`MediaTerm { negated, cond }`), not the whole alternative.
+  `MediaQuery::and` is now EXACT for nested `@media` (no approximation).
+- *(supports)* `@supports` capability gating — `@supports (truecolor) { … }`,
+  `(color)`, `(monochrome)`, `(prop)` / `(prop: val)` (engine property
+  support). New `supports` module; reuses `MediaContext` (no new context type).
+  Composes with `@media` (a rule may carry both `media` + `supports` tags).
+- *(box-model)* `var()` for `padding` / `margin` (`BoxEdgesValue`) and
+  `border-style` (`BorderStyleValue`). New `Token::BoxEdges` / `Token::BorderStyle`;
+  resolved during the cascade (lenient → zero edges / `None` style). Builders
+  keep backward compat (`.padding(1)`, `.border(BorderStyle::Rounded)`, …).
 
 ### 🚜 Refactor
 
