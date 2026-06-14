@@ -537,6 +537,39 @@ cargo run -p ratatui-style-presets --example 02_gallery --all-features
 
 See [presets/README.md](crates/presets/README.md) for details.
 
+## Used in the wild
+
+### [disk-cleaner](https://github.com/Liangdi/disk-cleaner)
+
+A cross-platform terminal disk-usage analyzer and cleaner (WinDirStat-style
+directory tree + Kondo-style build-artifact cleanup). Its sci-fi HUD TUI — the
+directory tree, detail panel, progress bars, and histogram — is styled by
+`src/tui/theme.css`, embedded at compile time via the `css!` macro; reskin the
+app by editing CSS variables and selectors, with no Rust changes.
+
+<p align="center">
+  <a href="https://github.com/Liangdi/disk-cleaner">
+    <img src="https://raw.githubusercontent.com/Liangdi/disk-cleaner/master/screenshot/tui.png" alt="disk-cleaner TUI" width="580">
+  </a>
+</p>
+
+### [ra-killer](https://github.com/Liangdi/ra-killer)
+
+A TUI tool that automatically monitors and kills high-memory `rust-analyzer`
+processes. Its interactive terminal interface (`--tui` mode) — the live memory
+bar, the process list (PID / CPU / memory), and the threshold-warning color
+scheme — is all driven by a `ratatui-style` CSS stylesheet.
+
+<p align="center">
+  <a href="https://github.com/Liangdi/ra-killer">
+    <img src="https://raw.githubusercontent.com/Liangdi/ra-killer/master/screenshot/tui.png" alt="ra-killer TUI" width="580">
+  </a>
+</p>
+
+> Both ship with link-time-optimized, size-conscious release builds
+> (disk-cleaner uses `lto = "fat"`; ra-killer uses `opt-level = "z"` + `lto` +
+> `strip` + `panic = "abort"`). `ratatui-style` runs fine in these slim binaries.
+
 ## Position in the ecosystem
 
 | Crate | Role | `ratatui-style` |

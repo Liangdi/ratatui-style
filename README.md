@@ -502,6 +502,37 @@ cargo run -p ratatui-style-presets --example 02_gallery --all-features
 
 详见 [presets/README.md](crates/presets/README.md)。
 
+## 实际案例
+
+### [disk-cleaner](https://github.com/Liangdi/disk-cleaner)
+
+跨平台的终端磁盘占用分析与清理工具（WinDirStat 风格目录树 + Kondo 风格构建产物清理）。
+其科幻 HUD 风格 TUI —— 目录树、详情面板、进度条、直方图 —— 的样式来自
+`src/tui/theme.css`，在编译期通过 `css!` 宏加载；改 CSS 变量与选择器即可换肤，
+无需改动 Rust 代码。
+
+<p align="center">
+  <a href="https://github.com/Liangdi/disk-cleaner">
+    <img src="https://raw.githubusercontent.com/Liangdi/disk-cleaner/master/screenshot/tui.png" alt="disk-cleaner TUI" width="580">
+  </a>
+</p>
+
+### [ra-killer](https://github.com/Liangdi/ra-killer)
+
+自动监控并杀死高内存占用 `rust-analyzer` 进程的 TUI 工具。其交互式终端界面
+（`--tui` 模式）—— 实时内存进度条、进程列表（PID / CPU / 内存）、阈值告警配色 ——
+全部由 `ratatui-style` 的 CSS 样式表驱动。
+
+<p align="center">
+  <a href="https://github.com/Liangdi/ra-killer">
+    <img src="https://raw.githubusercontent.com/Liangdi/ra-killer/master/screenshot/tui.png" alt="ra-killer TUI" width="580">
+  </a>
+</p>
+
+> 两者均采用链接时优化等尺寸优化构建（disk-cleaner 用 `lto = "fat"`，ra-killer 用
+> `opt-level = "z"` + `lto` + `strip` + `panic = "abort"`），`ratatui-style` 在这些
+> 精简 release 二进制中运行良好。
+
 ## 生态定位
 
 | Crate | 定位 | `ratatui-style` |
