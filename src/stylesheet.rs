@@ -6,6 +6,7 @@
 use crate::box_model::Length;
 use crate::color::Color;
 use crate::error::{CssError, Loc, Result};
+use crate::media::MediaQuery;
 use crate::selector::Selector;
 use crate::style::{Align, CssStyle, FontStyle, TextDecoration, Weight};
 use crate::token::{ThemeTokens, Token};
@@ -33,6 +34,11 @@ pub struct RuleEntry {
     pub origin: Origin,
     /// Insertion order within the stylesheet — the CSS "source order" tiebreaker.
     pub order: usize,
+    /// The `@media` query gating this rule, if it came from inside an `@media`
+    /// block. `None` for top-level (unconditional) rules. The cascade skips a
+    /// rule whose query does not match the active
+    /// [`MediaContext`](crate::media::MediaContext).
+    pub media: Option<MediaQuery>,
 }
 
 /// A parsed stylesheet.
@@ -40,6 +46,11 @@ pub struct RuleEntry {
 pub struct Stylesheet {
     rules: Vec<RuleEntry>,
     tokens: ThemeTokens,
+    /// Whether any rule carries an [`Selector::ancestor`] chain. Set lazily in
+    /// `add`/`add_rule`/`extend`; gates whether the cascade maintains an
+    /// ancestor-identity stack. Stays `false` for the common (combinator-free)
+    /// case so that path pays zero added cost.
+    has_combinators: bool,
 }
 
 impl Stylesheet {
@@ -49,7 +60,7 @@ impl Stylesheet {
 
     /// Construct with a token table (CSS custom properties).
     pub fn with_tokens(tokens: ThemeTokens) -> Self {
-        Self { rules: Vec::new(), tokens }
+        Self { rules: Vec::new(), tokens, has_combinators: false }
     }
 
     pub fn tokens(&self) -> &ThemeTokens {
@@ -62,36 +73,90 @@ impl Stylesheet {
         &self.rules
     }
 
+    /// Whether this stylesheet contains any rule with a combinator (`A B` or
+    /// `A > B`). When `false`, the cascade skips the ancestor-identity stack
+    /// entirely — the combinator-free hot path stays allocation-free relative
+    /// to the pre-combinator baseline.
+    pub fn has_combinators(&self) -> bool {
+        self.has_combinators
+    }
+
     /// Add a rule from a selector string (may be a comma list) + style.
     pub fn add(&mut self, selectors: &str, style: CssStyle, origin: Origin) -> Result<&mut Self> {
         let order_base = self.rules.len();
         for sel in Selector::parse_list(selectors)? {
-            self.rules.push(RuleEntry { selector: sel, style: style.clone(), origin, order: order_base });
+            if sel.ancestor.is_some() {
+                self.has_combinators = true;
+            }
+            self.rules.push(RuleEntry {
+                selector: sel,
+                style: style.clone(),
+                origin,
+                order: order_base,
+                media: None,
+            });
         }
+        self.sort_rules();
         Ok(self)
     }
 
     /// Add a single pre-parsed rule.
     pub fn add_rule(&mut self, selector: Selector, style: CssStyle, origin: Origin) -> &mut Self {
+        if selector.ancestor.is_some() {
+            self.has_combinators = true;
+        }
         let order = self.rules.len();
-        self.rules.push(RuleEntry { selector, style, origin, order });
+        self.rules.push(RuleEntry { selector, style, origin, order, media: None });
+        self.sort_rules();
         self
     }
 
     /// Merge another stylesheet's rules and tokens into this one.
     pub fn extend(&mut self, other: &Stylesheet) {
         self.tokens.merge(&other.tokens);
+        self.has_combinators |= other.has_combinators;
         let offset = self.rules.len();
         for r in &other.rules {
             self.rules.push(RuleEntry { order: offset + r.order, ..r.clone() });
         }
+        self.sort_rules();
+    }
+
+    /// Sort the rules in place by the cascade key `(origin, specificity, order)`.
+    ///
+    /// The cascade folds declarations in ascending priority order (later =
+    /// higher priority), so keeping rules pre-sorted by that key lets
+    /// [`Stylesheet::compute_with`](crate::cascade::Stylesheet::compute_with)
+    /// iterate rules in priority order directly and skip the per-`compute`
+    /// sort. `order` is unique per rule (it's assigned at push time as
+    /// `self.rules.len()`), so the sort is deterministic even on (origin,
+    /// specificity) ties.
+    ///
+    /// This runs at the end of every mutation (`add`/`add_rule`/`extend`).
+    /// Mutations are rare (parse-time) relative to `compute` (per-frame), so
+    /// the sort cost is amortized away from the hot path.
+    fn sort_rules(&mut self) {
+        self.rules
+            .sort_unstable_by_key(|r| (r.origin, r.selector.specificity(), r.order));
     }
 
     /// Parse a CSS text document (lenient — the default).
     ///
     /// Supports `selector { prop: value; … }` blocks, comma selector lists,
-    /// the universal `*`, `:root { --name: color; }` for tokens, and `/* … */`
-    /// comments. Declarations use [`apply_decl`]'s property names.
+    /// the universal `*`, `:root { --name: color; }` for tokens, `/* … */`
+    /// comments, and `@media (query) { … }` conditional blocks. Declarations use
+    /// [`apply_decl`]'s property names.
+    ///
+    /// **`@media` support (v1):**
+    /// - Element rules inside an `@media` block are tagged with the parsed
+    ///   [`MediaQuery`] and only apply when the active
+    ///   [`MediaContext`](crate::media::MediaContext) matches. The block body is
+    ///   itself a CSS fragment parsed recursively.
+    /// - **`:root` inside `@media` is allowed but the tokens are inserted
+    ///   GLOBALLY** (not media-gated) — `ThemeTokens` is a flat map, so there is
+    ///   no per-query token namespace in v1.
+    /// - **Nested `@media` inside `@media` is rejected** with a structural error;
+    ///   combine conditions into one query instead.
     ///
     /// **Lenient behavior** (unchanged from earlier versions): unknown
     /// properties are silently ignored (forward-compat), and `var(--name)`
@@ -136,80 +201,8 @@ impl Stylesheet {
         // in the original `css`.
         let cleaned = strip_comments(css);
         let mut sheet = Stylesheet::new();
-        let mut rest = cleaned.as_str();
-        // Byte offset of `rest` within `cleaned` (and thus within the original).
-        let mut rest_off = 0usize;
-
-        while let Some(rel) = rest.find('{') {
-            let brace_off = rest_off + rel;
-            // selector_part occupies cleaned[..brace_off] up to this rule; its
-            // trim_start lands at the first non-whitespace char of the selector.
-            let selector_part = rest[..rel].trim();
-            rest = &rest[rel + 1..];
-            rest_off = brace_off + 1;
-
-            let close_rel = rest.find('}').ok_or_else(|| {
-                CssError::invalid_selector("missing closing `}`")
-                    .at(line_col(&cleaned, brace_off).line, 1)
-            })?;
-            let close_off = rest_off + close_rel;
-            let body = &rest[..close_rel];
-            let body_offset = rest_off;
-            rest = &rest[close_rel + 1..];
-            rest_off = close_off + 1;
-
-            if selector_part.is_empty() {
-                let loc = line_col(&cleaned, brace_off);
-                return Err(CssError::invalid_selector("rule with no selector").at(loc.line, loc.column));
-            }
-            // Offset of the selector's first non-whitespace char (for loc).
-            let sel_off = brace_off - selector_part.len();
-
-            // `:root { --x: … }` declares tokens.
-            let is_root = selector_part.split(',').all(|s| s.trim() == ":root");
-            if is_root {
-                for decl in split_declarations(body, body_offset) {
-                    if let Some(name) = decl.prop.strip_prefix("--") {
-                        let loc = line_col(&cleaned, decl.value_offset);
-                        let token = parse_token_value(decl.value)
-                            .map_err(|e| e.at(loc.line, loc.column))?;
-                        sheet.tokens.insert(name.trim(), token);
-                    }
-                }
-                continue;
-            }
-
-            let mut style = CssStyle::new();
-            for decl in split_declarations(body, body_offset) {
-                let prop = decl.prop.trim();
-                let value = decl.value.trim();
-                if prop.is_empty() {
-                    continue;
-                }
-                if let Some(name) = prop.strip_prefix("--") {
-                    let loc = line_col(&cleaned, decl.value_offset);
-                    let token = parse_token_value(value).map_err(|e| e.at(loc.line, loc.column))?;
-                    sheet.tokens.insert(name, token);
-                } else {
-                    if strict && !is_known_property(prop) {
-                        let loc = line_col(&cleaned, decl.prop_offset);
-                        return Err(CssError::unknown_property(prop).at(loc.line, loc.column));
-                    }
-                    let loc = line_col(&cleaned, decl.value_offset);
-                    apply_decl(&mut style, prop, value).map_err(|e| e.at(loc.line, loc.column))?;
-                }
-            }
-            // The selector string itself may be invalid (e.g. bad pseudo-class);
-            // Selector::parse_list surfaces that as InvalidSelector. Tag it with
-            // the selector's start offset if it does not already carry a loc.
-            if let Err(mut e) = sheet.add(selector_part, style, Origin::User) {
-                if e.loc.is_none() {
-                    let loc = line_col(&cleaned, sel_off);
-                    e = e.at(loc.line, loc.column);
-                }
-                return Err(e);
-            }
-        }
+        // Top-level rules carry no media query.
+        parse_rule_loop(&cleaned, cleaned.as_str(), 0, strict, None, &mut sheet)?;
 
         if strict {
             // Any `var(--name)` with no fallback whose name is not in the token
@@ -253,6 +246,210 @@ impl Stylesheet {
         }
         Ok(sheet)
     }
+}
+
+/// The per-rule parsing loop, extracted so an `@media` block body can be parsed
+/// by re-entering it with a `media` tag applied to every rule it adds.
+///
+/// - `cleaned` — the full comment-stripped source (used for `line_col` offsets).
+/// - `rest` — the slice of `cleaned` being parsed in this call.
+/// - `rest_off` — the byte offset of `rest` within `cleaned`.
+/// - `media` — when `Some`, every element rule parsed here is tagged with this
+///   query (it came from inside an `@media` block). Top-level calls pass `None`.
+///
+/// # Offset correctness (the key invariant)
+///
+/// The depth-aware close-brace scan returns a **relative** offset into `rest`.
+/// Because `rest_off` still tracks the absolute byte offset of `rest` within
+/// `cleaned`, `close_off = rest_off + close_rel` maps 1:1 through `line_col` to
+/// the correct line:column. The ONLY change from the old flat-`find('}')` logic
+/// is *how* `close_rel` is computed (depth scan vs first-`}`); the offset
+/// arithmetic is identical. For flat rules (no inner braces), the depth scan
+/// returns the same offset as the old `find('}')`, so every existing loc test
+/// reports the same line numbers.
+fn parse_rule_loop(
+    cleaned: &str,
+    rest_in: &str,
+    rest_off_in: usize,
+    strict: bool,
+    media: Option<&MediaQuery>,
+    sheet: &mut Stylesheet,
+) -> Result<()> {
+    let mut rest = rest_in;
+    let mut rest_off = rest_off_in;
+
+    while let Some(rel) = rest.find('{') {
+        let brace_off = rest_off + rel;
+        // selector_part occupies cleaned[..brace_off] up to this rule; its
+        // trim_start lands at the first non-whitespace char of the selector.
+        let selector_part = rest[..rel].trim();
+        rest = &rest[rel + 1..];
+        rest_off = brace_off + 1;
+
+        // Depth-aware close-brace scan: find the `}` that closes the `{` we just
+        // passed. For flat rules (no inner braces) this is the first `}` —
+        // identical to the old behavior. For `@media { … { … } … }` it skips
+        // inner balanced braces.
+        let close_rel = match find_matching_brace(rest) {
+            Some(off) => off,
+            None => {
+                return Err(
+                    CssError::invalid_selector("missing closing `}`")
+                        .at(line_col(cleaned, brace_off).line, 1),
+                );
+            }
+        };
+        let close_off = rest_off + close_rel;
+        let body = &rest[..close_rel];
+        let body_offset = rest_off;
+        rest = &rest[close_rel + 1..];
+        rest_off = close_off + 1;
+
+        if selector_part.is_empty() {
+            let loc = line_col(cleaned, brace_off);
+            return Err(
+                CssError::invalid_selector("rule with no selector").at(loc.line, loc.column),
+            );
+        }
+        // Offset of the selector's first non-whitespace char (for loc).
+        let sel_off = brace_off - selector_part.len();
+
+        // `@media (query) { … }` — parse the query and recurse on the body.
+        // Case-insensitive match on the leading `@media` keyword. The remainder
+        // (trimmed) is the query string.
+        let lowered_head = selector_part
+            .get(..5)
+            .map(|s| s.to_ascii_lowercase())
+            .unwrap_or_default();
+        let is_media_at =
+            lowered_head == "@medi" && selector_part.len() >= 6 && selector_part.as_bytes()[5] == b'a';
+        if is_media_at {
+            // Reject nested @media inside @media for v1 (clear semantics).
+            if media.is_some() {
+                let loc = line_col(cleaned, sel_off);
+                return Err(CssError::invalid_selector(
+                    "nested `@media` inside `@media` is not supported in v1 — combine conditions into one query",
+                )
+                .at(loc.line, loc.column));
+            }
+            let query_str = selector_part[6..].trim();
+            let query = MediaQuery::parse(query_str).map_err(|mut e| {
+                if e.loc.is_none() {
+                    let loc = line_col(cleaned, sel_off);
+                    e = e.at(loc.line, loc.column);
+                }
+                e
+            })?;
+            // Recurse: parse the body fragment with the query tagging its rules.
+            // The body lives in `cleaned[body_offset..body_offset + body.len()]`,
+            // so offsets stay correct.
+            parse_rule_loop(cleaned, body, body_offset, strict, Some(&query), sheet)?;
+            continue;
+        }
+
+        // `:root { --x: … }` declares tokens.
+        //
+        // v1 limitation: a `:root` INSIDE an `@media` block inserts its tokens
+        // GLOBALLY (not media-gated) — `ThemeTokens` is a flat map with no
+        // per-query namespace. We deliberately do NOT error here: tokens are
+        // environment-wide facts (a `--accent` color doesn't change with
+        // terminal width), and erroring would surprise users. The `media` tag
+        // is ignored on this path.
+        let is_root = selector_part.split(',').all(|s| s.trim() == ":root");
+        if is_root {
+            for decl in split_declarations(body, body_offset) {
+                if let Some(name) = decl.prop.strip_prefix("--") {
+                    let loc = line_col(cleaned, decl.value_offset);
+                    let token =
+                        parse_token_value(decl.value).map_err(|e| e.at(loc.line, loc.column))?;
+                    sheet.tokens.insert(name.trim(), token);
+                }
+            }
+            continue;
+        }
+
+        let mut style = CssStyle::new();
+        for decl in split_declarations(body, body_offset) {
+            let prop = decl.prop.trim();
+            let value = decl.value.trim();
+            if prop.is_empty() {
+                continue;
+            }
+            if let Some(name) = prop.strip_prefix("--") {
+                let loc = line_col(cleaned, decl.value_offset);
+                let token =
+                    parse_token_value(value).map_err(|e| e.at(loc.line, loc.column))?;
+                sheet.tokens.insert(name, token);
+            } else {
+                if strict && !is_known_property(prop) {
+                    let loc = line_col(cleaned, decl.prop_offset);
+                    return Err(CssError::unknown_property(prop).at(loc.line, loc.column));
+                }
+                let loc = line_col(cleaned, decl.value_offset);
+                apply_decl(&mut style, prop, value).map_err(|e| e.at(loc.line, loc.column))?;
+            }
+        }
+
+        // Parse the selector list and push each variant, tagging with the media
+        // query when present.
+        let sels = match Selector::parse_list(selector_part) {
+            Ok(v) => v,
+            Err(mut e) => {
+                if e.loc.is_none() {
+                    let loc = line_col(cleaned, sel_off);
+                    e = e.at(loc.line, loc.column);
+                }
+                return Err(e);
+            }
+        };
+        let order_base = sheet.rules.len();
+        for sel in sels {
+            if sel.ancestor.is_some() {
+                sheet.has_combinators = true;
+            }
+            sheet.rules.push(RuleEntry {
+                selector: sel,
+                style: style.clone(),
+                origin: Origin::User,
+                order: order_base,
+                media: media.cloned(),
+            });
+        }
+        sheet.sort_rules();
+    }
+
+    Ok(())
+}
+
+/// Find the matching `}` for the most recent `{`, scanning `rest` byte by byte
+/// with brace-depth tracking.
+///
+/// The caller has already consumed up to just past the opening `{`, so `rest`
+/// begins at the first byte of the rule body. We scan forward: every `{`
+/// increases depth, every `}` either (at depth 0) is the match we return, or
+/// (depth > 0) decreases depth. For flat rules with no inner braces, depth never
+/// rises above 0 and the first `}` is returned — identical to the old
+/// `rest.find('}')`. Returns `None` if the input runs out before the matching
+/// close brace.
+///
+/// This is byte-based and UTF-8-safe because `{` and `}` are single-byte ASCII
+/// and never appear as continuation bytes in a multi-byte sequence.
+fn find_matching_brace(rest: &str) -> Option<usize> {
+    let bytes = rest.as_bytes();
+    let mut depth: u32 = 0;
+    for (i, &b) in bytes.iter().enumerate() {
+        match b {
+            b'{' => depth += 1,
+            b'}' => {
+                if depth == 0 {
+                    return Some(i);
+                }
+                depth -= 1;
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 /// All `color`-carrying fields of a [`CssStyle`], for var scanning.
@@ -796,5 +993,119 @@ mod tests {
     fn strict_defined_length_var_ok() {
         Stylesheet::parse_strict(":root{--w:10}.x{width:var(--w)}")
             .expect("defined length var is fine in strict mode");
+    }
+
+    // -------------------------------------------------------------------------
+    // @media query blocks
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn media_block_tags_one_rule() {
+        let sheet =
+            Stylesheet::parse("@media (min-width: 80) { Button { color: red; } }").unwrap();
+        let button_rules: Vec<_> = sheet
+            .rules()
+            .iter()
+            .filter(|r| r.selector.type_name.as_deref() == Some("Button"))
+            .collect();
+        assert_eq!(button_rules.len(), 1, "exactly one Button rule");
+        let media = button_rules[0].media.as_ref().expect("rule is media-gated");
+        assert_eq!(
+            media.conditions,
+            vec![crate::media::MediaCondition::MinWidth(80)]
+        );
+    }
+
+    #[test]
+    fn media_block_depth_aware_two_rules_tagged() {
+        // TWO element rules inside one @media block. The depth-aware brace scan
+        // must find the OUTER `}` (after both rules), not the first inner `}`.
+        let sheet = Stylesheet::parse(
+            "@media (min-width: 80) { Button { color: red; } .x { padding: 1; } }",
+        )
+        .unwrap();
+        // Both inner rules are tagged with the query.
+        let tagged = sheet.rules().iter().filter(|r| r.media.is_some()).count();
+        assert_eq!(tagged, 2, "both inner rules carry the media query");
+        for r in sheet.rules() {
+            if let Some(m) = &r.media {
+                assert_eq!(m.conditions, vec![crate::media::MediaCondition::MinWidth(80)]);
+            }
+        }
+    }
+
+    #[test]
+    fn media_block_trailing_top_level_rule_untagged() {
+        // Regression: after the @media block, a trailing top-level rule must
+        // parse with media: None. This exercises that the depth-aware scan
+        // correctly resumes `rest` after the matching outer `}`.
+        let sheet = Stylesheet::parse(
+            "@media (min-width: 80) { Button { color: red; } } Text { color: blue; }",
+        )
+        .unwrap();
+        let text_rule = sheet
+            .rules()
+            .iter()
+            .find(|r| r.selector.type_name.as_deref() == Some("Text"))
+            .expect("trailing Text rule parsed");
+        assert!(text_rule.media.is_none(), "trailing top-level rule is NOT media-gated");
+    }
+
+    #[test]
+    fn media_block_invalid_color_loc_points_at_value() {
+        // The error loc must point at the #zzz line (inside the @media block),
+        // NOT at the @media line. This guards offset correctness through the
+        // depth-aware brace scan + recursion.
+        let css = "@media (min-width:1){\n Button {\n  background: #zzz;\n }\n}";
+        let err = Stylesheet::parse(css).unwrap_err();
+        let loc = err.loc.expect("error has a location");
+        assert_eq!(
+            loc.line, 3,
+            "loc must point at the #zzz line (line 3), got line {}",
+            loc.line
+        );
+        assert!(matches!(err.kind, CssErrorKind::InvalidColor(_)));
+    }
+
+    #[test]
+    fn root_inside_media_inserts_tokens_globally() {
+        // v1 limitation: :root inside @media inserts tokens GLOBALLY (not
+        // media-gated). `ThemeTokens` is a flat map; there is no per-query token
+        // namespace in v1.
+        let sheet = Stylesheet::parse("@media (min-width:1){ :root { --x: #fff; } }").unwrap();
+        assert_eq!(
+            sheet.tokens().get_color("x"),
+            Some(&Color::literal(RColor::Rgb(0xff, 0xff, 0xff))),
+            "tokens declared inside @media must be globally available (v1)"
+        );
+    }
+
+    #[test]
+    fn nested_media_errors() {
+        // Nested @media is a structural error in v1.
+        let css = "@media (min-width:1){ @media (max-width:2){ Button { color: red; } } }";
+        let err = Stylesheet::parse(css).unwrap_err();
+        assert!(matches!(err.kind, CssErrorKind::InvalidSelector(_)));
+    }
+
+    #[test]
+    fn media_query_error_propagates() {
+        // A malformed query surfaces as an error (not silently skipped).
+        assert!(Stylesheet::parse("@media (foo: 1) { Button { color: red; } }").is_err());
+    }
+
+    #[test]
+    fn existing_loc_tests_unchanged_by_depth_scan() {
+        // Re-run the two offset-correctness guard tests inline to prove the
+        // depth-aware brace change did not shift line numbers.
+        let css = "Button {\n    color: red;\n    background: #zzz;\n}\n";
+        let err = Stylesheet::parse(css).unwrap_err();
+        let loc = err.loc.expect("error has a location");
+        assert_eq!(loc.line, 3);
+
+        let css2 = "/* a\n   multi-line\n   comment */\nButton {\n    color: #nope;\n}\n";
+        let err2 = Stylesheet::parse(css2).unwrap_err();
+        let loc2 = err2.loc.expect("error has a location");
+        assert_eq!(loc2.line, 5);
     }
 }

@@ -17,13 +17,25 @@ pub struct State {
 
 impl State {
     pub const fn empty() -> Self {
-        Self { focus: false, hover: false, disabled: false, checked: false, active: false }
+        Self {
+            focus: false,
+            hover: false,
+            disabled: false,
+            checked: false,
+            active: false,
+        }
     }
     pub const fn focus() -> Self {
-        Self { focus: true, ..Self::empty() }
+        Self {
+            focus: true,
+            ..Self::empty()
+        }
     }
     pub const fn disabled() -> Self {
-        Self { disabled: true, ..Self::empty() }
+        Self {
+            disabled: true,
+            ..Self::empty()
+        }
     }
 }
 
@@ -41,7 +53,11 @@ pub struct Position {
 
 impl Position {
     pub fn new(index: usize, sibling_count: usize) -> Self {
-        Self { index, sibling_count, parent_type: None }
+        Self {
+            index,
+            sibling_count,
+            parent_type: None,
+        }
     }
 }
 
@@ -72,13 +88,17 @@ impl<'a> Classes<'a> {
     /// this — when `slice` is `&'static [&'static str]` no heap allocation
     /// occurs at any point.
     pub fn from_slice(slice: &'a [&'a str]) -> Self {
-        Self { repr: Repr::Slice(slice) }
+        Self {
+            repr: Repr::Slice(slice),
+        }
     }
 
     /// Owning view built from an existing `Vec<&str>`. Used by [`OwnedNode`]
     /// which stores `String`s and must materialize `&str` borrows per call.
     pub fn from_vec(v: Vec<&'a str>) -> Self {
-        Self { repr: Repr::Owned(v) }
+        Self {
+            repr: Repr::Owned(v),
+        }
     }
 
     /// Unified read-only access to the underlying class names, regardless of
@@ -182,6 +202,11 @@ impl OwnedNode {
         self.state = state;
         self
     }
+    /// Set the sibling position. Mirrors [`NodeRef::position`].
+    pub fn with_position(mut self, position: Position) -> Self {
+        self.position = position;
+        self
+    }
 }
 
 impl StyledNode for OwnedNode {
@@ -228,7 +253,13 @@ pub struct NodeRef<'a> {
 impl<'a> NodeRef<'a> {
     /// Borrow `type_name`. Zero-allocation.
     pub fn new(type_name: &'a str) -> Self {
-        Self { type_name, id: None, classes: &[], state: State::empty(), position: Position::default() }
+        Self {
+            type_name,
+            id: None,
+            classes: &[],
+            state: State::empty(),
+            position: Position::default(),
+        }
     }
 
     /// Set the id (borrowed). Zero-allocation.

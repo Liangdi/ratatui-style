@@ -25,11 +25,14 @@
 //! let _ratatui_style = computed.to_style();
 //! ```
 
+#![forbid(unsafe_code)]
+
 pub mod box_model;
 pub mod cascade;
 pub mod color;
 pub mod css_macro;
 pub mod error;
+pub mod media;
 pub mod node;
 pub mod runtime;
 pub mod selector;
@@ -53,9 +56,10 @@ pub use box_model::{BorderSpec, BorderStyle, BoxEdges, IntoBorderSpec, IntoBoxEd
 pub use cascade::{render_computed, CascadeContext, ComputedStyle, ComputeScratch};
 pub use color::Color;
 pub use error::{CssError, CssErrorKind, Loc, Result};
+pub use media::{MediaCondition, MediaContext, MediaQuery};
 pub use node::{Classes, NodeRef, OwnedNode, Position, State, StyledNode};
 pub use runtime::RuntimeStyle;
-pub use selector::{PseudoClass, Selector};
+pub use selector::{Combinator, NthExpr, Pseudo, PseudoClass, Selector};
 pub use style::{Align, CssStyle, FontStyle, TextDecoration, Weight};
 pub use stylesheet::{apply_decl, Origin, RuleEntry, Stylesheet};
 pub use token::ThemeTokens;
@@ -80,9 +84,10 @@ pub mod prelude {
     pub use crate::cascade::{render_computed, CascadeContext, ComputedStyle, ComputeScratch};
     pub use crate::color::Color;
     pub use crate::error::{CssError, CssErrorKind, Loc, Result};
+    pub use crate::media::{MediaCondition, MediaContext, MediaQuery};
     pub use crate::node::{Classes, NodeRef, OwnedNode, Position, State, StyledNode};
     pub use crate::runtime::RuntimeStyle;
-    pub use crate::selector::{PseudoClass, Selector};
+    pub use crate::selector::{Combinator, NthExpr, Pseudo, PseudoClass, Selector};
     pub use crate::style::{Align, CssStyle, FontStyle, TextDecoration, Weight};
     pub use crate::stylesheet::{Origin, RuleEntry, Stylesheet};
     pub use crate::token::ThemeTokens;

@@ -2,8 +2,8 @@
 
 | | |
 |---|---|
-| **Status** | Implemented through P2 (inheritance + `var()` tokens + themekit interop) |
-| **Version** | 0.1.0 |
+| **Status** | Implemented through P3 (combinators + structural pseudo-classes + `@media`) |
+| **Version** | 0.2.0 |
 | **Authors** | Liangdi `<wu@liangdi.me>` |
 | **Depends on** | `ratatui` 0.30 (core types: `Style` / `Color` / `Modifier` / `Rect` / `Block`) |
 
@@ -191,15 +191,18 @@ palettes drive the cascade unchanged. Gated behind the `themekit` feature.
 |---|---|---|
 | `color` | `Style::fg` | |
 | `background-color` | `Style::bg` | |
-| `font-weight: bold` | `add_modifier(BOLD)` | numeric ≥ 700 also bold |
+| `font-weight: bold` | `add_modifier(BOLD)` | numeric ≥ 600 also bold |
 | `font-style: italic` | `ITALIC` | |
 | `text-decoration: underline` | `UNDERLINED` | `line-through` → `CROSSED_OUT` |
-| `border` | `Block::borders` + `border_type` + `border_style` | `border-radius`→`Rounded` |
+| `border` | `Block::borders` + `border_type` + `border_style` | rounded via `border-style: rounded` (or `border: rounded`) |
 | `padding` | `Block::padding` | units = cells |
 | `margin` | `Rect` shrink | |
 | `text-align` | `Alignment` | |
 | `width` / `height` | `Constraint` | `Length` / `Percentage` / `Min` / `Max` |
-| `opacity` | `DIM` | on/off only |
+
+> **Not yet implemented (P3):** `opacity` → `DIM` (on/off only) is a planned mapping.
+> There is currently no `opacity` property — it is not in `is_known_property`, has no
+> handler in `apply_decl`, and no field on `CssStyle`.
 
 ## 7. Adoption Levels
 
@@ -246,13 +249,20 @@ Hard dependency: `ratatui` 0.30. Optional: `serde` (default), `serde_json` (`jso
 | **P0** | `CssStyle` + `Color` parser + serde + `to_style/to_block/apply_margin/constraints` | ✅ Done |
 | **P1** | `Stylesheet` + selectors (type/class/id/compound) + specificity cascade + `:focus`/`:disabled`/`:checked`/`:hover`/`:active` + `StyledNode` | ✅ Done |
 | **P2** | inheritance + `var()` tokens + themekit interop | ✅ Done |
-| **P3** | descendant/child combinators, `:nth-child`, `@media` (terminal size + color capability), `ComputedStyle` cache | ☐ Future |
+| **P3** | descendant/child combinators, `:nth-child`, `@media` (terminal size + color capability) | ✅ Done |
+| **P4** | `ComputedStyle` LRU cache; adjacent `+` / general sibling `~` combinators; `@media` `not`/`or`/comma; media-scoped `:root` tokens | ☐ Future |
 
-## 11. Open Questions (P3+)
+## 11. Resolved Design Questions
 
-- Should `@media` queries key off terminal cell size, `$COLUMNS`/`$LINES`, or color capability
-  (`NO_COLOR`, truecolor detection)? Likely all three.
-- Descendant combinators require an ancestor stack threaded through the tree walk — decide the
-  host-facing API (explicit `compute(node, parent)` vs. an engine that owns the walk).
-- Whether to ship a `css!{ … }` compile-time DSL (prefer `macro_rules!` to avoid a proc-macro
-  dependency).
+- **`@media` triggers** — all three: terminal cell size (`min/max-width/height`, `width`,
+  `height`) **and** color capability (`color`, `monochrome`, plus a `truecolor` extension for
+  24-bit detection). Driven by a host-supplied `MediaContext` via `compute_with_media`,
+  `CascadeContext::with_media`, or `RuntimeStyle::with_media`.
+- **Descendant-combinator host API** — the engine owns the walk: `CascadeContext` maintains an
+  ancestor-identity stack (parallel to its style stack). Combinator selectors resolve through
+  `CascadeContext::enter`; the one-shot `compute(node, parent)` path has no ancestor identity and
+  does not match combinator selectors (documented).
+- **Structural pseudo-classes** consume the already-plumbed `StyledNode::position()`; a default
+  `Position` (`sibling_count == 0`) is treated as "no sibling info" and does not match.
+- **`css!{ … }` compile-time DSL** — shipped as a `macro_rules!` (`css!` / `scss!`), no
+  proc-macro dependency. Binds to a `LazyLock<Stylesheet>` tagged `Origin::Theme`.

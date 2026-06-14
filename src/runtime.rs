@@ -21,6 +21,7 @@ use std::sync::Arc;
 
 use crate::cascade::{ComputedStyle, ComputeScratch};
 use crate::error::{CssError, Result};
+use crate::media::MediaContext;
 use crate::node::StyledNode;
 use crate::stylesheet::{Origin, Stylesheet};
 
@@ -61,6 +62,11 @@ pub struct RuntimeStyle {
     /// The mtime recorded for the override `path` the last time it was loaded.
     /// Used by [`Self::reload_if_changed`] to skip unchanged files.
     last_mtime: Option<std::time::SystemTime>,
+    /// The active terminal context used to gate `@media` rules during
+    /// [`compute`](Self::compute). Defaults to all-zero / no media info, in
+    /// which case media-gated rules with any condition do NOT match. Set per
+    /// frame via [`set_media`](Self::set_media) / [`with_media`](Self::with_media).
+    media: MediaContext,
 }
 
 impl RuntimeStyle {
@@ -73,6 +79,7 @@ impl RuntimeStyle {
             runtime: None,
             sheet: embedded.clone(),
             last_mtime: None,
+            media: MediaContext::default(),
         }
     }
 
@@ -97,6 +104,7 @@ impl RuntimeStyle {
             runtime: None,
             last_mtime: None,
             sheet,
+            media: MediaContext::default(),
         }
     }
 
@@ -209,24 +217,53 @@ impl RuntimeStyle {
         }
     }
 
+    /// Set the active [`MediaContext`] used to gate `@media` rules during
+    /// [`compute`](Self::compute) / [`compute_with`](Self::compute_with).
+    /// Returns `&mut Self` for chaining. Call this once per frame (e.g. after
+    /// reading the terminal size) before computing node styles, so width-/
+    /// color-conditional rules apply.
+    pub fn set_media(&mut self, media: MediaContext) -> &mut Self {
+        self.media = media;
+        self
+    }
+
+    /// Consuming builder form of [`set_media`](Self::set_media).
+    pub fn with_media(mut self, media: MediaContext) -> Self {
+        self.media = media;
+        self
+    }
+
+    /// The currently active [`MediaContext`].
+    pub fn media(&self) -> &MediaContext {
+        &self.media
+    }
+
     /// Compute the resolved style for `node`, optionally inheriting from
     /// `parent`. Delegates to the pre-merged sheet, so this is allocation-free.
+    ///
+    /// `@media` rules are gated against [`media`](Self::media); set it via
+    /// [`set_media`](Self::set_media) / [`with_media`](Self::with_media) so
+    /// width-/color-conditional rules apply.
     pub fn compute(&self, node: &dyn StyledNode, parent: Option<&ComputedStyle>) -> ComputedStyle {
-        self.sheet.compute(node, parent)
+        // Drive compute through the media-aware path so stored media context
+        // takes effect. Falls back to the no-scratch one-shot internally.
+        let mut scratch = ComputeScratch::new();
+        self.sheet.compute_with_media(node, parent, &mut scratch, &self.media)
     }
 
     /// Compute using a caller-provided [`ComputeScratch`], reused across calls.
     ///
-    /// Delegates to [`Stylesheet::compute_with`] on the pre-merged sheet. Use
-    /// this in the draw loop alongside [`NodeRef`](crate::node::NodeRef) for a
-    /// fully allocation-free per-frame path.
+    /// Delegates to [`Stylesheet::compute_with_media`] on the pre-merged sheet,
+    /// gating `@media` rules against [`media`](Self::media). Use this in the
+    /// draw loop alongside [`NodeRef`](crate::node::NodeRef) for a fully
+    /// allocation-free per-frame path.
     pub fn compute_with(
         &self,
         node: &dyn StyledNode,
         parent: Option<&ComputedStyle>,
         scratch: &mut ComputeScratch,
     ) -> ComputedStyle {
-        self.sheet.compute_with(node, parent, scratch)
+        self.sheet.compute_with_media(node, parent, scratch, &self.media)
     }
 
     /// The base (compile-time or owned) stylesheet.
@@ -386,5 +423,67 @@ mod tests {
         let reloaded = style.reload_if_changed(&path).unwrap();
         assert!(reloaded, "override file disappearing should clear the override");
         assert!(!style.has_override());
+    }
+
+    // ---------------------------------------------------------------------
+    // @media queries
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn runtime_media_gated_rule_applies_when_context_matches() {
+        let base = Arc::new(
+            Stylesheet::parse("@media (min-width: 80) { Button { color: red; } }").unwrap(),
+        );
+        let style = RuntimeStyle::from_owned(base).with_media(crate::media::MediaContext {
+            cols: 100,
+            rows: 24,
+            ..Default::default()
+        });
+
+        let node = NodeRef::new("Button");
+        let computed = style.compute(&node, None);
+        assert_eq!(
+            computed.style.color,
+            Some(crate::color::Color::literal(ratatui::style::Color::Red))
+        );
+    }
+
+    #[test]
+    fn runtime_media_gated_rule_skipped_when_context_misses() {
+        let base = Arc::new(
+            Stylesheet::parse("@media (min-width: 80) { Button { color: red; } }").unwrap(),
+        );
+        // cols = 60 < 80 → rule does not apply.
+        let style = RuntimeStyle::from_owned(base).with_media(crate::media::MediaContext {
+            cols: 60,
+            ..Default::default()
+        });
+
+        let node = NodeRef::new("Button");
+        let computed = style.compute(&node, None);
+        assert_eq!(computed.style.color, None);
+    }
+
+    #[test]
+    fn runtime_set_media_updates_live() {
+        // set_media per "frame" should flip the gated rule on and off.
+        let base = Arc::new(
+            Stylesheet::parse("@media (min-width: 80) { Button { color: red; } }").unwrap(),
+        );
+        let mut style = RuntimeStyle::from_owned(base);
+
+        style.set_media(crate::media::MediaContext {
+            cols: 120,
+            ..Default::default()
+        });
+        let on = style.compute(&NodeRef::new("Button"), None);
+        assert!(on.style.color.is_some());
+
+        style.set_media(crate::media::MediaContext {
+            cols: 40,
+            ..Default::default()
+        });
+        let off = style.compute(&NodeRef::new("Button"), None);
+        assert!(off.style.color.is_none());
     }
 }

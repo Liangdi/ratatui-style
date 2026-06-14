@@ -15,7 +15,7 @@ readme = "README.md"
 [dependencies]
 # Path for local workspace dev; the version constraint is what crates.io
 # resolves when this crate is published.
-ratatui-style = { version = "0.1", path = "../.." }
+ratatui-style = { version = "0.2", path = "../.." }
 
 [features]
 # Every preset is opt-in except the always-available default theme + base

@@ -1,6 +1,6 @@
 [package]
 name = "ratatui-style"
-version = "0.1.2"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.85"
 authors = ["Liangdi <wu@liangdi.me>"]
@@ -36,6 +36,22 @@ scss = ["dep:grass"]
 
 [dev-dependencies]
 crossterm = "0.29"
+# Test-only: verify the serde impls round-trip through non-JSON formats
+# (the crate advertises JSON / TOML / YAML support — see design.md §1/§2).
+toml = "0.8"
+serde_yaml = "0.9"
+# Benchmark suite for the cascade hot path (see benches/cascade.rs).
+criterion = "0.5"
+
+# Examples that use serde must declare the feature, or
+# `cargo build --no-default-features` fails to compile them.
+[[example]]
+name = "01_values"
+required-features = ["serde"]
+
+[[example]]
+name = "14_data_driven"
+required-features = ["serde"]
 
 [[example]]
 name = "11_themekit_bridge"
@@ -44,6 +60,11 @@ required-features = ["themekit"]
 [[example]]
 name = "10_scss_embed"
 required-features = ["scss"]
+
+# Criterion benchmark suite — custom harness, so set `harness = false`.
+[[bench]]
+name = "cascade"
+harness = false
 
 # --- workspace -------------------------------------------------------------
 # The presets crate ships ready-to-use CSS themes/utilities built on this

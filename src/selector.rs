@@ -1,12 +1,20 @@
 //! CSS selectors — the pragmatic subset: compound selectors of the form
 //! `Type.class#id:pseudo…` (plus comma lists and the `*` universal).
 //!
-//! Descendant/child/sibling combinators (`A B`, `A > B`, `A + B`) are P3.
+//! Structural pseudo-classes (`:nth-child`, `:first-child`, etc.) are supported
+//! and match against the node's [`Position`](crate::node::Position).
+//!
+//! Descendant (`A B`) and child (`A > B`) combinators are supported; they only
+//! match when evaluated through a [`CascadeContext`](crate::CascadeContext)
+//! (which threads an ancestor-identity stack). The one-shot
+//! [`Stylesheet::compute`](crate::Stylesheet::compute) path has no ancestor
+//! information, so a selector with an [`Selector::ancestor`] chain simply does
+//! not match there.
 
 use crate::error::{CssError, Result};
-use crate::node::{Classes, State, StyledNode};
+use crate::node::{Classes, Position, State, StyledNode};
 
-/// A single pseudo-class.
+/// A single pseudo-class state flag.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PseudoClass {
     Focus,
@@ -29,13 +37,229 @@ impl PseudoClass {
     }
 }
 
+/// An `an + b` expression for `:nth-child` / `:nth-last-child`.
+///
+/// Matches a 1-based index `i` when there exists a non-negative integer `n`
+/// with `i == a * n + b`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct NthExpr {
+    pub a: i32,
+    pub b: i32,
+}
+
+impl NthExpr {
+    /// Does 1-based index `i` satisfy `an + b` (for some n >= 0)?
+    pub fn matches(self, i: i32) -> bool {
+        if self.a == 0 {
+            i == self.b
+        } else {
+            let d = i - self.b;
+            d % self.a == 0 && d / self.a >= 0
+        }
+    }
+
+    /// Parse a CSS `An+B` expression (case-insensitive).
+    ///
+    /// Accepted forms: `odd` → (2, 1); `even` → (2, 0); a bare integer `N` →
+    /// (0, N); `an` / `-an` / `2n` / `-3n` forms (a = coefficient, b = 0);
+    /// `an+b` / `2n+1` / `-n+3` / `2n-1` / `n` forms. Optional leading sign and
+    /// surrounding spaces are tolerated. Returns an [`CssError::invalid_selector`]
+    /// on garbage.
+    pub fn parse(s: &str) -> Result<Self> {
+        parse_nth(s)
+    }
+}
+
+/// Parse a CSS `An+B` expression.
+///
+/// See [`NthExpr::parse`] for the accepted forms.
+fn parse_nth(input: &str) -> Result<NthExpr> {
+    // Normalize: trim and lowercase the ASCII form. We keep the raw bytes for
+    // numeric parsing but compare the lowered variant for `odd`/`even`/`n`.
+    let raw = input.trim();
+    if raw.is_empty() {
+        return Err(CssError::invalid_selector("empty nth expression"));
+    }
+    let lower = raw.to_ascii_lowercase();
+
+    if lower == "odd" {
+        return Ok(NthExpr { a: 2, b: 1 });
+    }
+    if lower == "even" {
+        return Ok(NthExpr { a: 2, b: 0 });
+    }
+
+    // Split on the coefficient marker `n`. If absent, this is a bare integer.
+    // Accept a single `n` only.
+    let Some(n_pos) = lower.find('n') else {
+        // No `n` — must be a bare integer (optional sign + digits). Reject any
+        // trailing junk like `3x`.
+        return parse_bare_int(raw).map(|b| NthExpr { a: 0, b });
+    };
+
+    // Ensure `n` is the only alphabetic character — reject `nx`, `an+bx`, etc.
+    let rest_after_n = &lower[n_pos + 1..];
+    if rest_after_n.chars().any(|c| c.is_ascii_alphabetic()) {
+        return Err(CssError::invalid_selector(format!(
+            "invalid nth expression `{input}`"
+        )));
+    }
+
+    // Coefficient is the substring before `n`.
+    let coef_part = raw[..n_pos].trim();
+    let a = match coef_part {
+        "" | "+" => 1,
+        "-" => -1,
+        _ => parse_bare_int(coef_part)?,
+    };
+
+    // Constant is the substring after `n` — optional sign + integer. An empty
+    // constant means `b == 0`. We tolerate interior whitespace but the optional
+    // sign must be followed by digits.
+    let const_part = raw[n_pos + 1..].trim();
+    let b = if const_part.is_empty() {
+        0
+    } else {
+        parse_bare_int(const_part)?
+    };
+
+    Ok(NthExpr { a, b })
+}
+
+/// Parse a signed decimal integer from `s`. Tolerates interior whitespace
+/// between an optional sign and the digits (CSS `An+B` permits forms like
+/// `+ 1` and `- 2`). Rejects anything that isn't an optional `+`/`-` (with
+/// optional following spaces) and one or more ASCII digits.
+fn parse_bare_int(s: &str) -> Result<i32> {
+    let s = s.trim();
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    let sign = match bytes.first() {
+        Some(b'+') => {
+            i += 1;
+            "+"
+        }
+        Some(b'-') => {
+            i += 1;
+            "-"
+        }
+        _ => "",
+    };
+    // Allow whitespace between sign and digits, e.g. `+ 1`.
+    while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    if i >= bytes.len() || !bytes[i..].iter().all(|b| b.is_ascii_digit()) {
+        return Err(CssError::invalid_selector(format!(
+            "invalid integer `{s}` in nth expression"
+        )));
+    }
+    let digits = &s[i..];
+    let cleaned: String = sign.chars().chain(digits.chars()).collect();
+    cleaned
+        .parse::<i32>()
+        .map_err(|_| CssError::invalid_selector(format!("nth integer out of range: `{s}`")))
+}
+
+/// A (possibly parameterized) pseudo-class.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Pseudo {
+    /// A simple state flag: :focus, :hover, :disabled, :checked, :active.
+    State(PseudoClass),
+    FirstChild,
+    LastChild,
+    OnlyChild,
+    /// :nth-child(an+b)
+    NthChild(NthExpr),
+    /// :nth-last-child(an+b)
+    NthLastChild(NthExpr),
+}
+
+impl Pseudo {
+    /// Parse a single pseudo-class token (the part after `:` in a selector).
+    ///
+    /// `token` is the bare name for unparameterized pseudos (`focus`,
+    /// `first-child`); for parameterized pseudos (`nth-child(2n+1)`) the caller
+    /// passes the full `name(args)` form here.
+    fn parse(token: &str) -> Result<Self> {
+        // Parameterized form: name(args).
+        if let Some(open) = token.find('(') {
+            let name = token[..open].trim();
+            if !token.ends_with(')') {
+                return Err(CssError::invalid_selector(format!(
+                    "unterminated pseudo-class `{token}`"
+                )));
+            }
+            let inner = &token[open + 1..token.len() - 1];
+            return match name.to_ascii_lowercase().as_str() {
+                "nth-child" => Ok(Self::NthChild(parse_nth(inner)?)),
+                "nth-last-child" => Ok(Self::NthLastChild(parse_nth(inner)?)),
+                other => Err(CssError::invalid_selector(format!(
+                    "unsupported pseudo-class `:{other}`"
+                ))),
+            };
+        }
+
+        // Unparameterized: state flag or structural keyword.
+        match token.to_ascii_lowercase().as_str() {
+            "first-child" => Ok(Self::FirstChild),
+            "last-child" => Ok(Self::LastChild),
+            "only-child" => Ok(Self::OnlyChild),
+            other => match PseudoClass::parse(other) {
+                Some(p) => Ok(Self::State(p)),
+                None => Err(CssError::invalid_selector(format!(
+                    "unsupported pseudo-class `:{other}`"
+                ))),
+            },
+        }
+    }
+}
+
+/// A combinator joining a compound selector to an ancestor compound.
+///
+/// Produced by the [`Selector`](crate::Selector) parser for descendant (`A B`)
+/// and child (`A > B`) combinators. Only reachable through
+/// [`Selector::ancestor`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Combinator {
+    /// `A B` — the subject is a descendant of `A` (any depth).
+    Descendant,
+    /// `A > B` — the subject is a direct child of `A`.
+    Child,
+}
+
 /// A compound selector: an optional type, plus class/id/pseudo qualifiers.
+///
+/// Compound fields (`type_name`, `classes`, `id`, `pseudos`) describe the
+/// **subject** — the element this rule applies to. The optional [`ancestor`]
+/// chain extends the match leftward: `Panel > Button` parses to a `Selector`
+/// whose subject is `Button` and whose `ancestor` is
+/// `Some((Child, Selector{ type_name: "Panel", .. }))`.
+///
+/// Combinator chains only match when evaluated through a
+/// [`CascadeContext`](crate::CascadeContext) (the one path that supplies
+/// ancestor identities). The one-shot
+/// [`Stylesheet::compute`](crate::Stylesheet::compute) API has no ancestor
+/// information, so a selector with an `ancestor` chain returns `false` from
+/// [`matches`](Self::matches) there — it does not panic.
+///
+/// [`ancestor`]: Self::ancestor
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Selector {
+    /// Subject compound's type name (`Button` in `Panel > Button`).
     pub type_name: Option<String>,
+    /// Subject compound's class list.
     pub classes: Vec<String>,
+    /// Subject compound's id.
     pub id: Option<String>,
-    pub pseudos: Vec<PseudoClass>,
+    /// Subject compound's pseudo-classes.
+    pub pseudos: Vec<Pseudo>,
+    /// Optional ancestor compound + the combinator joining it to this selector.
+    ///
+    /// `Panel > Button` parses to
+    /// `Selector{ type_name: "Button", ancestor: Some((Child, Selector{ type_name: "Panel", ancestor: None })) }`.
+    /// `None` for a plain compound (the overwhelmingly common case).
+    pub ancestor: Option<(Combinator, Box<Selector>)>,
 }
 
 impl Default for Selector {
@@ -44,66 +268,194 @@ impl Default for Selector {
     }
 }
 
+/// A snapshot of a node's selector-relevant data, used for combinator matching.
+///
+/// Built once per node on the combinator-aware cascade path
+/// ([`CascadeContext`](crate::CascadeContext) when the stylesheet
+/// `has_combinators()`). It is `pub(crate)` because it is an internal
+/// threading detail of the cascade, not part of the public surface.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct NodeIdentity {
+    pub type_name: String,
+    pub id: Option<String>,
+    pub classes: Vec<String>,
+    pub state: State,
+    pub position: Position,
+}
+
+impl NodeIdentity {
+    /// Snapshot a [`StyledNode`]'s selector-relevant fields.
+    pub(crate) fn from_node(node: &dyn StyledNode) -> Self {
+        Self {
+            type_name: node.type_name().to_string(),
+            id: node.id().map(str::to_string),
+            classes: node.classes().as_slice().iter().map(|s| (*s).to_string()).collect(),
+            state: node.state(),
+            position: node.position(),
+        }
+    }
+}
+
 impl Selector {
     /// The universal selector `*` — matches every element.
     pub fn universal() -> Self {
-        Self { type_name: None, classes: Vec::new(), id: None, pseudos: Vec::new() }
+        Self {
+            type_name: None,
+            classes: Vec::new(),
+            id: None,
+            pseudos: Vec::new(),
+            ancestor: None,
+        }
     }
 
     /// Parse one or more comma-separated selectors.
+    ///
+    /// Each comma-separated part may itself contain descendant (` `) and child
+    /// (`>`) combinators, e.g. `"Panel Button, .modal > Button"`.
     pub fn parse_list(s: &str) -> Result<Vec<Self>> {
-        s.split(',')
-            .map(|part| Self::parse_compound(part.trim()))
-            .collect()
+        s.split(',').map(|part| Self::parse_chain(part.trim())).collect()
     }
 
-    /// Parse a single compound selector.
+    /// Parse a single compound selector with no combinator.
+    ///
+    /// For a selector that may contain combinators use [`parse_chain`](Self::parse_chain)
+    /// (or [`parse_list`](Self::parse_list), which splits on `,` first then calls
+    /// `parse_chain` per part).
     pub fn parse_compound(s: &str) -> Result<Self> {
+        Self::parse_compound_into(s)
+    }
+
+    /// Parse a selector chain — one or more compounds joined by descendant
+    /// (` `) or child (`>`) combinators. Sibling combinators (`+`, `~`) are not
+    /// supported and produce an error.
+    ///
+    /// Parentheses are tracked so spaces and `+` inside `:nth-child(2n + 1)`
+    /// are not mistaken for combinators.
+    pub fn parse_chain(s: &str) -> Result<Self> {
+        let s = s.trim();
+        if s.is_empty() {
+            return Err(CssError::invalid_selector("empty selector"));
+        }
+
+        // Tokenize into an ordered list of [compound, combinator, compound, …].
+        let tokens = tokenize_chain(s)?;
+
+        // Fold left-to-right: the running `subject` is the rightmost compound
+        // parsed so far; each (combinator, compound) pair makes `compound` the
+        // new subject and the previous subject its ancestor joined by
+        // `combinator`. For `[Panel, Descendant, Button]` this yields
+        // `Selector{ subject: Button, ancestor: Some((Descendant, Panel)) }`.
+        let mut iter = tokens.into_iter();
+        // The first element must be a Compound.
+        let first_compound = match iter.next() {
+            Some(ChainToken::Compound(c)) => c,
+            Some(ChainToken::Combinator(_)) => {
+                return Err(CssError::invalid_selector(format!(
+                    "selector `{s}` begins with a combinator"
+                )));
+            }
+            None => return Err(CssError::invalid_selector("empty selector")),
+        };
+        let mut subject = Self::parse_compound_into(&first_compound)?;
+
+        // Walk the remaining tokens as (combinator, compound) pairs.
+        while let Some(comb) = iter.next() {
+            let combinator = match comb {
+                ChainToken::Combinator(c) => c,
+                ChainToken::Compound(_) => unreachable!("non-first compound without combinator"),
+            };
+            let Some(ChainToken::Compound(c)) = iter.next() else {
+                return Err(CssError::invalid_selector(format!(
+                    "selector `{s}` ends with a combinator"
+                )));
+            };
+            // The new compound becomes the subject; the previous subject is its
+            // ancestor, joined by `combinator`.
+            let new_subject = Self::parse_compound_into(&c)?;
+            subject = Self {
+                type_name: new_subject.type_name,
+                classes: new_subject.classes,
+                id: new_subject.id,
+                pseudos: new_subject.pseudos,
+                ancestor: Some((combinator, Box::new(subject))),
+            };
+        }
+
+        Ok(subject)
+    }
+
+    /// Parse a single compound selector (no combinators) into a `Selector`
+    /// with `ancestor: None`. This is the body of the historical
+    /// `parse_compound`; `parse_compound` and `parse_chain` both delegate here.
+    fn parse_compound_into(s: &str) -> Result<Self> {
         let s = s.trim();
         if s.is_empty() {
             return Err(CssError::invalid_selector("empty selector"));
         }
 
         let mut sel = Self::universal();
-        let mut chars = s.char_indices().peekable();
+        let bytes = s.as_bytes();
         let len = s.len();
+        let mut idx = 0usize;
 
         // Optional leading type name or `*`.
-        if let Some(&(_, c)) = chars.peek() {
-            if c == '*' {
-                chars.next();
-            } else if !matches!(c, '.' | '#' | ':') {
-                let start = 0usize;
-                let mut end = 0usize;
-                while let Some(&(i, c)) = chars.peek() {
-                    if matches!(c, '.' | '#' | ':') {
+        if let Some(&c) = bytes.first() {
+            if c == b'*' {
+                idx += 1;
+            } else if !matches!(c, b'.' | b'#' | b':') {
+                let start = idx;
+                while idx < len {
+                    let c = bytes[idx];
+                    if matches!(c, b'.' | b'#' | b':') {
                         break;
                     }
-                    end = i + c.len_utf8();
-                    chars.next();
+                    idx += 1;
                 }
-                sel.type_name = Some(s[start..end].to_string());
+                sel.type_name = Some(s[start..idx].to_string());
             }
         }
 
-        while let Some(&(i, c)) = chars.peek() {
-            chars.next(); // consume delimiter
-            let start = i + c.len_utf8();
-            let mut end = start;
-            while let Some(&(j, ch)) = chars.peek() {
-                if matches!(ch, '.' | '#' | ':') {
-                    break;
+        while idx < len {
+            let delim = bytes[idx] as char;
+            idx += 1;
+            let start = idx;
+            // Read a token. For `:` we allow a parenthesized argument group that
+            // may itself contain delimiters we'd otherwise stop on (none today,
+            // but the closing `)` is the terminator). For `.`/`#` we stop at the
+            // next delimiter.
+            if delim == ':' {
+                // Read the name, then — if a `(` follows — consume through the
+                // matching `)`.
+                while idx < len && !matches!(bytes[idx], b'.' | b'#' | b':' | b'(') {
+                    idx += 1;
                 }
-                end = j + ch.len_utf8();
-                chars.next();
+                if idx < len && bytes[idx] == b'(' {
+                    // Consume up to and including the closing `)`. We do not
+                    // support nested parens in nth expressions; the first `)`
+                    // terminates.
+                    idx += 1; // consume `(`
+                    while idx < len && bytes[idx] != b')' {
+                        idx += 1;
+                    }
+                    if idx >= len {
+                        return Err(CssError::invalid_selector(format!(
+                            "unterminated pseudo-class in `{s}`"
+                        )));
+                    }
+                    idx += 1; // consume `)`
+                }
+            } else {
+                while idx < len && !matches!(bytes[idx], b'.' | b'#' | b':') {
+                    idx += 1;
+                }
             }
-            if end == start {
+            if idx == start {
                 return Err(CssError::invalid_selector(format!(
-                    "selector `{s}` has a dangling `{c}`"
+                    "selector `{s}` has a dangling `{delim}`"
                 )));
             }
-            let token = &s[start..end];
-            match c {
+            let token = &s[start..idx];
+            match delim {
                 '.' => sel.classes.push(token.to_string()),
                 '#' => {
                     if sel.id.is_some() {
@@ -113,50 +465,96 @@ impl Selector {
                     }
                     sel.id = Some(token.to_string());
                 }
-                ':' => match PseudoClass::parse(token) {
-                    Some(p) => sel.pseudos.push(p),
-                    None => {
-                        return Err(CssError::invalid_selector(format!(
-                            "unsupported pseudo-class `:{token}`"
-                        )))
-                    }
-                },
+                ':' => sel.pseudos.push(Pseudo::parse(token)?),
                 _ => unreachable!("delimiter handled above"),
             }
         }
 
-        let _ = len;
         Ok(sel)
     }
 
     /// Specificity as `(ids, classes_and_pseudos, type)`, comparable as a tuple.
+    ///
+    /// Sums across the subject compound AND every ancestor compound in the
+    /// chain: `Panel > Button.primary` has specificity `(0, 1, 2)`.
     pub fn specificity(&self) -> (u32, u32, u32) {
         let ids = if self.id.is_some() { 1 } else { 0 };
         let cp = (self.classes.len() + self.pseudos.len()) as u32;
         let ty = if self.type_name.is_some() { 1 } else { 0 };
-        (ids, cp, ty)
+        let (a_ids, a_cp, a_ty) = match &self.ancestor {
+            None => (0u32, 0u32, 0u32),
+            Some((_, anc)) => anc.specificity(),
+        };
+        (ids + a_ids, cp + a_cp, ty + a_ty)
     }
 
-    /// Whether this selector matches a given node (including pseudo-state).
+    /// Whether this selector matches a given node (subject compound only).
     ///
-    /// Thin wrapper over [`matches_values`](Self::matches_values) — the two
-    /// share a single implementation so behavior can never diverge.
+    /// **Combinator limitation**: a selector with an [`ancestor`](Self::ancestor)
+    /// chain carries ancestor requirements that this method cannot evaluate
+    /// (it has no ancestor context), so it returns `false` for any combinator
+    /// selector. Use a [`CascadeContext`](crate::CascadeContext) to match
+    /// combinator selectors against a real ancestor stack.
     pub fn matches(&self, node: &dyn StyledNode) -> bool {
-        self.matches_values(node.type_name(), node.id(), &node.classes(), node.state())
+        let position = node.position();
+        self.matches_values(
+            node.type_name(),
+            node.id(),
+            &node.classes(),
+            node.state(),
+            &position,
+        )
     }
 
-    /// Core match against raw values, without going through `&dyn StyledNode`.
+    /// Core match against raw values — **subject compound only**.
     ///
-    /// This is what the cascade hoists out of the per-rule loop: callers fetch
-    /// `classes` once per node and pass the [`Classes`] view in repeatedly.
-    /// [`Selector::matches`] delegates here, guaranteeing a single source of
-    /// truth for the match semantics.
+    /// This is what the one-shot cascade path hoists out of the per-rule loop:
+    /// callers fetch `classes` once per node and pass the [`Classes`] view in
+    /// repeatedly. [`Selector::matches`] delegates here, guaranteeing a single
+    /// source of truth for the match semantics.
+    ///
+    /// # Combinator limitation
+    ///
+    /// This path has no ancestor information, so a selector with an
+    /// [`ancestor`](Self::ancestor) chain does **not** match here (it returns
+    /// `false` after testing the subject compound, since the ancestor chain is
+    /// unsatisfiable without ancestor identities). Use
+    /// [`matches_chain`](Self::matches_chain) (via
+    /// [`CascadeContext`](crate::CascadeContext)) to match combinator selectors.
+    ///
+    /// # Structural pseudo-classes and the `sibling_count > 0` guard
+    ///
+    /// `:first-child`, `:last-child`, `:only-child`, `:nth-child`, and
+    /// `:nth-last-child` all require `position.sibling_count > 0`. A default
+    /// [`Position`] (count 0) carries no sibling information, so it is treated
+    /// as "does not match" rather than spuriously matching `:first-child`
+    /// (whose naive condition `index == 0` would be true for the default).
     pub(crate) fn matches_values(
         &self,
         type_name: &str,
         id: Option<&str>,
         classes: &Classes<'_>,
         state: State,
+        position: &Position,
+    ) -> bool {
+        if !self.matches_subject_raw(type_name, id, classes, state, position) {
+            return false;
+        }
+        // A combinator chain cannot be satisfied without ancestor identities.
+        self.ancestor.is_none()
+    }
+
+    /// Subject-compound match against raw values (the historical
+    /// `matches_values` body, factored out). Does NOT consult [`ancestor`].
+    ///
+    /// [`ancestor`]: Self::ancestor
+    fn matches_subject_raw(
+        &self,
+        type_name: &str,
+        id: Option<&str>,
+        classes: &Classes<'_>,
+        state: State,
+        position: &Position,
     ) -> bool {
         // Type: case-insensitive (convenience); universal matches anything.
         if let Some(t) = &self.type_name
@@ -176,14 +574,62 @@ impl Selector {
                 return false;
             }
         }
-        // Pseudo-classes: all must be reflected in the node's state.
+        // Pseudo-classes: all must be satisfied.
+        self.pseudos_satisfied(state, position)
+    }
+
+    /// Subject compound of this selector against one [`NodeIdentity`].
+    fn matches_subject(&self, id: &NodeIdentity) -> bool {
+        let class_strs: Vec<&str> = id.classes.iter().map(String::as_str).collect();
+        let classes = Classes::from_slice(&class_strs);
+        self.matches_subject_raw(&id.type_name, id.id.as_deref(), &classes, id.state, &id.position)
+    }
+
+    /// Subject matches `node_id`, and the ancestor chain matches `ancestors`
+    /// (closest ancestor = last element). Right-to-left CSS matching.
+    pub(crate) fn matches_chain(&self, node_id: &NodeIdentity, ancestors: &[NodeIdentity]) -> bool {
+        if !self.matches_subject(node_id) {
+            return false;
+        }
+        match &self.ancestor {
+            None => true,
+            Some((Combinator::Child, anc)) => match ancestors.last() {
+                None => false,
+                Some(parent) => anc.matches_chain(parent, &ancestors[..ancestors.len() - 1]),
+            },
+            Some((Combinator::Descendant, anc)) => {
+                // Search closest-first (last) backward through the ancestor stack.
+                for i in (0..ancestors.len()).rev() {
+                    if anc.matches_chain(&ancestors[i], &ancestors[..i]) {
+                        return true;
+                    }
+                }
+                false
+            }
+        }
+    }
+
+    /// Evaluate all [`pseudos`](Self::pseudos) against `state` and `position`.
+    fn pseudos_satisfied(&self, state: State, position: &Position) -> bool {
         for p in &self.pseudos {
             let on = match p {
-                PseudoClass::Focus => state.focus,
-                PseudoClass::Hover => state.hover,
-                PseudoClass::Disabled => state.disabled,
-                PseudoClass::Checked => state.checked,
-                PseudoClass::Active => state.active,
+                Pseudo::State(PseudoClass::Focus) => state.focus,
+                Pseudo::State(PseudoClass::Hover) => state.hover,
+                Pseudo::State(PseudoClass::Disabled) => state.disabled,
+                Pseudo::State(PseudoClass::Checked) => state.checked,
+                Pseudo::State(PseudoClass::Active) => state.active,
+                Pseudo::FirstChild => position.sibling_count > 0 && position.index == 0,
+                Pseudo::LastChild => {
+                    position.sibling_count > 0 && position.index == position.sibling_count - 1
+                }
+                Pseudo::OnlyChild => position.sibling_count == 1,
+                Pseudo::NthChild(expr) => {
+                    position.sibling_count > 0 && expr.matches(position.index as i32 + 1)
+                }
+                Pseudo::NthLastChild(expr) => {
+                    position.sibling_count > 0
+                        && expr.matches(position.sibling_count as i32 - position.index as i32)
+                }
             };
             if !on {
                 return false;
@@ -193,10 +639,135 @@ impl Selector {
     }
 }
 
+/// A token emitted by [`tokenize_chain`]: either a compound string or a
+/// combinator joining two compounds.
+enum ChainToken {
+    Compound(String),
+    Combinator(Combinator),
+}
+
+/// Split a (comma-already-split) selector string into an ordered list of
+/// compounds and combinators, respecting parenthesis depth so spaces/`+` inside
+/// `:nth-child(2n + 1)` are not mistaken for combinators.
+///
+/// Returns `[Compound, Combinator, Compound, …]`, always starting with a
+/// `Compound` (possibly empty for input like `> Button`).
+fn tokenize_chain(s: &str) -> Result<Vec<ChainToken>> {
+    let mut tokens: Vec<ChainToken> = Vec::new();
+    let mut cur = String::new();
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    let mut depth: u32 = 0;
+
+    // Helper to flush the accumulated compound, if any.
+    macro_rules! flush {
+        () => {{
+            if !cur.is_empty() {
+                tokens.push(ChainToken::Compound(std::mem::take(&mut cur)));
+            }
+        }};
+    }
+
+    while i < bytes.len() {
+        let b = bytes[i];
+        if depth == 0 {
+            match b {
+                b'(' => {
+                    depth += 1;
+                    cur.push('(');
+                }
+                b')' => {
+                    // Unbalanced `)` at depth 0 — accumulate it; the compound
+                    // parser will reject it downstream.
+                    cur.push(')');
+                }
+                b' ' | b'\t' | b'\n' | b'\r' => {
+                    // A run of whitespace: peek the next non-whitespace char.
+                    // If it is `>`, this whitespace is just spacing around an
+                    // explicit combinator — consume without emitting a
+                    // Descendant. Otherwise emit a Descendant combinator (if we
+                    // have an accumulated compound).
+                    let mut j = i;
+                    while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+                        j += 1;
+                    }
+                    i = j;
+                    if i >= bytes.len() {
+                        // trailing whitespace — nothing follows.
+                        break;
+                    }
+                    match bytes[i] {
+                        b'>' => {
+                            flush!();
+                            tokens.push(ChainToken::Combinator(Combinator::Child));
+                            i += 1; // consume `>`
+                            // Skip whitespace after the explicit combinator so it
+                            // does not re-trigger a spurious Descendant on the
+                            // next loop iteration.
+                            while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+                                i += 1;
+                            }
+                            continue;
+                        }
+                        b'+' | b'~' => {
+                            return Err(CssError::invalid_selector(
+                                "unsupported combinator `+`/`~`; use descendant (space) or child (>)",
+                            ));
+                        }
+                        _ => {
+                            flush!();
+                            tokens.push(ChainToken::Combinator(Combinator::Descendant));
+                            continue;
+                        }
+                    }
+                }
+                b'>' => {
+                    flush!();
+                    tokens.push(ChainToken::Combinator(Combinator::Child));
+                    // Skip whitespace after the explicit combinator (mirrors the
+                    // whitespace-peek branch above).
+                    i += 1;
+                    while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+                        i += 1;
+                    }
+                    continue;
+                }
+                b'+' | b'~' => {
+                    return Err(CssError::invalid_selector(
+                        "unsupported combinator `+`/`~`; use descendant (space) or child (>)",
+                    ));
+                }
+                _ => {
+                    // Regular char: append to the current compound. Copy the
+                    // whole UTF-8 char.
+                    let ch = s[i..].chars().next().expect("non-empty slice");
+                    cur.push(ch);
+                    i += ch.len_utf8();
+                    continue;
+                }
+            }
+        } else {
+            // Inside parentheses — accumulate verbatim, tracking depth.
+            match b {
+                b'(' => depth += 1,
+                b')' => depth -= 1,
+                _ => {}
+            }
+            let ch = s[i..].chars().next().expect("non-empty slice");
+            cur.push(ch);
+            i += ch.len_utf8();
+            continue;
+        }
+        i += 1;
+    }
+    flush!();
+    Ok(tokens)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::node::{OwnedNode, State};
+    use crate::node::{OwnedNode, Position, State};
 
     #[test]
     fn parse_compound() {
@@ -204,7 +775,7 @@ mod tests {
         assert_eq!(s.type_name.as_deref(), Some("Button"));
         assert_eq!(s.classes, vec!["primary"]);
         assert_eq!(s.id.as_deref(), Some("save"));
-        assert_eq!(s.pseudos, vec![PseudoClass::Focus]);
+        assert_eq!(s.pseudos, vec![Pseudo::State(PseudoClass::Focus)]);
         assert_eq!(s.specificity(), (1, 2, 1));
     }
 
@@ -239,5 +810,337 @@ mod tests {
     fn comma_list() {
         let list = Selector::parse_list("Text, .muted, #title").unwrap();
         assert_eq!(list.len(), 3);
+    }
+
+    // ---------------------------------------------------------------------
+    // NthExpr::matches
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn nth_matches_odd_even() {
+        let odd = NthExpr { a: 2, b: 1 };
+        let even = NthExpr { a: 2, b: 0 };
+        // 1-based indices 1..=6.
+        for i in 1..=6 {
+            assert_eq!(odd.matches(i), i % 2 == 1, "odd @ {i}");
+            assert_eq!(even.matches(i), i % 2 == 0, "even @ {i}");
+        }
+    }
+
+    #[test]
+    fn nth_matches_2n_plus_1() {
+        let e = NthExpr { a: 2, b: 1 };
+        // matches 1,3,5,...
+        for i in 1..=6 {
+            assert_eq!(e.matches(i), i % 2 == 1, "2n+1 @ {i}");
+        }
+    }
+
+    #[test]
+    fn nth_matches_minus_n_plus_2() {
+        // -n+2 => matches n=0 -> 2, n=1 -> 1; nothing else (n>=0, i>=1).
+        let e = NthExpr { a: -1, b: 2 };
+        assert!(e.matches(1));
+        assert!(e.matches(2));
+        for i in 3..=6 {
+            assert!(!e.matches(i), "-n+2 should not match {i}");
+        }
+    }
+
+    #[test]
+    fn nth_matches_bare_int() {
+        let e = NthExpr { a: 0, b: 3 };
+        assert!(e.matches(3));
+        assert!(!e.matches(1));
+        assert!(!e.matches(2));
+        assert!(!e.matches(4));
+    }
+
+    // ---------------------------------------------------------------------
+    // NthExpr parsing
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn nth_parse_keywords() {
+        assert_eq!(NthExpr::parse("odd").unwrap(), NthExpr { a: 2, b: 1 });
+        assert_eq!(NthExpr::parse("even").unwrap(), NthExpr { a: 2, b: 0 });
+        assert_eq!(NthExpr::parse("ODD").unwrap(), NthExpr { a: 2, b: 1 });
+        assert_eq!(NthExpr::parse("Even").unwrap(), NthExpr { a: 2, b: 0 });
+    }
+
+    #[test]
+    fn nth_parse_bare_int() {
+        assert_eq!(NthExpr::parse("3").unwrap(), NthExpr { a: 0, b: 3 });
+        assert_eq!(NthExpr::parse("+3").unwrap(), NthExpr { a: 0, b: 3 });
+        assert_eq!(NthExpr::parse("-3").unwrap(), NthExpr { a: 0, b: -3 });
+    }
+
+    #[test]
+    fn nth_parse_n_forms() {
+        assert_eq!(NthExpr::parse("n").unwrap(), NthExpr { a: 1, b: 0 });
+        assert_eq!(NthExpr::parse("2n").unwrap(), NthExpr { a: 2, b: 0 });
+        assert_eq!(NthExpr::parse("-3n").unwrap(), NthExpr { a: -3, b: 0 });
+        assert_eq!(NthExpr::parse("-n").unwrap(), NthExpr { a: -1, b: 0 });
+    }
+
+    #[test]
+    fn nth_parse_an_plus_b_forms() {
+        assert_eq!(NthExpr::parse("2n+1").unwrap(), NthExpr { a: 2, b: 1 });
+        assert_eq!(NthExpr::parse("2n-1").unwrap(), NthExpr { a: 2, b: -1 });
+        assert_eq!(NthExpr::parse("-n+2").unwrap(), NthExpr { a: -1, b: 2 });
+        assert_eq!(NthExpr::parse("-2n+3").unwrap(), NthExpr { a: -2, b: 3 });
+        // Tolerate interior spaces.
+        assert_eq!(NthExpr::parse("2n + 1").unwrap(), NthExpr { a: 2, b: 1 });
+        assert_eq!(NthExpr::parse(" -n + 2 ").unwrap(), NthExpr { a: -1, b: 2 });
+    }
+
+    #[test]
+    fn nth_parse_garbage_errors() {
+        assert!(NthExpr::parse("").is_err());
+        assert!(NthExpr::parse("abc").is_err());
+        assert!(NthExpr::parse("2x").is_err());
+        assert!(NthExpr::parse("n+").is_err());
+        assert!(NthExpr::parse("2n+").is_err());
+        assert!(NthExpr::parse("--").is_err());
+        assert!(NthExpr::parse("2n+1x").is_err());
+        assert!(NthExpr::parse("+").is_err());
+    }
+
+    // ---------------------------------------------------------------------
+    // Selector parsing — structural pseudos
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn parse_nth_child_selector() {
+        let s = Selector::parse_compound("Item:nth-child(2n+1)").unwrap();
+        assert_eq!(s.type_name.as_deref(), Some("Item"));
+        assert_eq!(s.pseudos.len(), 1);
+        assert_eq!(s.pseudos[0], Pseudo::NthChild(NthExpr { a: 2, b: 1 }));
+    }
+
+    #[test]
+    fn parse_first_child_selector() {
+        let s = Selector::parse_compound("tr:first-child").unwrap();
+        assert_eq!(s.pseudos, vec![Pseudo::FirstChild]);
+    }
+
+    #[test]
+    fn parse_last_child_selector() {
+        let s = Selector::parse_compound("li:last-child").unwrap();
+        assert_eq!(s.pseudos, vec![Pseudo::LastChild]);
+    }
+
+    #[test]
+    fn parse_only_child_selector() {
+        let s = Selector::parse_compound("td:only-child").unwrap();
+        assert_eq!(s.pseudos, vec![Pseudo::OnlyChild]);
+    }
+
+    #[test]
+    fn parse_nth_last_child_selector() {
+        let s = Selector::parse_compound("tr:nth-last-child(odd)").unwrap();
+        assert_eq!(
+            s.pseudos,
+            vec![Pseudo::NthLastChild(NthExpr { a: 2, b: 1 })]
+        );
+    }
+
+    #[test]
+    fn nth_child_specificity_counts_as_one() {
+        let s = Selector::parse_compound(":nth-child(2n+1)").unwrap();
+        // pseudo bucket counts as 1, no type, no id → (0,1,0).
+        assert_eq!(s.specificity(), (0, 1, 0));
+    }
+
+    #[test]
+    fn unknown_pseudo_errors() {
+        assert!(Selector::parse_compound("a:visited").is_err());
+        assert!(Selector::parse_compound("a:nth-of-type(2)").is_err());
+    }
+
+    #[test]
+    fn unterminated_pseudo_errors() {
+        assert!(Selector::parse_compound("Item:nth-child(2n+1").is_err());
+    }
+
+    // ---------------------------------------------------------------------
+    // Structural matching against Position
+    // ---------------------------------------------------------------------
+
+    fn pos(index: usize, count: usize) -> Position {
+        Position::new(index, count)
+    }
+
+    #[test]
+    fn first_child_matches() {
+        let sel = Selector::parse_compound("Item:first-child").unwrap();
+        let classes = Classes::from_slice(&[]);
+        // index 0 of 3 matches.
+        assert!(sel.matches_values("Item", None, &classes, State::empty(), &pos(0, 3)));
+        // index 1 of 3 does not.
+        assert!(!sel.matches_values("Item", None, &classes, State::empty(), &pos(1, 3)));
+    }
+
+    #[test]
+    fn last_child_matches() {
+        let sel = Selector::parse_compound("Item:last-child").unwrap();
+        let classes = Classes::from_slice(&[]);
+        assert!(sel.matches_values("Item", None, &classes, State::empty(), &pos(2, 3)));
+        assert!(!sel.matches_values("Item", None, &classes, State::empty(), &pos(1, 3)));
+    }
+
+    #[test]
+    fn only_child_matches() {
+        let sel = Selector::parse_compound("Item:only-child").unwrap();
+        let classes = Classes::from_slice(&[]);
+        assert!(sel.matches_values("Item", None, &classes, State::empty(), &pos(0, 1)));
+        assert!(!sel.matches_values("Item", None, &classes, State::empty(), &pos(0, 3)));
+    }
+
+    #[test]
+    fn nth_child_matches() {
+        let sel = Selector::parse_compound("Item:nth-child(odd)").unwrap();
+        let classes = Classes::from_slice(&[]);
+        // index 0 (1-based 1) odd → match; index 1 (1-based 2) even → no; index 2 (1-based 3) odd → yes.
+        assert!(sel.matches_values("Item", None, &classes, State::empty(), &pos(0, 3)));
+        assert!(!sel.matches_values("Item", None, &classes, State::empty(), &pos(1, 3)));
+        assert!(sel.matches_values("Item", None, &classes, State::empty(), &pos(2, 3)));
+    }
+
+    #[test]
+    fn nth_last_child_matches() {
+        let sel = Selector::parse_compound("Item:nth-last-child(1)").unwrap();
+        let classes = Classes::from_slice(&[]);
+        // 1-based-from-end = sibling_count - index. Last child (index 2 of 3) → 1.
+        assert!(sel.matches_values("Item", None, &classes, State::empty(), &pos(2, 3)));
+        assert!(!sel.matches_values("Item", None, &classes, State::empty(), &pos(1, 3)));
+    }
+
+    #[test]
+    fn default_position_does_not_match_structural() {
+        // sibling_count == 0 means "no position info" — must NOT match even
+        // though index defaults to 0 (which would otherwise satisfy
+        // :first-child naively).
+        let sel = Selector::parse_compound("Item:first-child").unwrap();
+        let classes = Classes::from_slice(&[]);
+        let default = Position::default();
+        assert_eq!(default.sibling_count, 0);
+        assert_eq!(default.index, 0);
+        assert!(!sel.matches_values("Item", None, &classes, State::empty(), &default));
+
+        let only = Selector::parse_compound("Item:only-child").unwrap();
+        assert!(!only.matches_values("Item", None, &classes, State::empty(), &default));
+
+        let nth = Selector::parse_compound("Item:nth-child(1)").unwrap();
+        assert!(!nth.matches_values("Item", None, &classes, State::empty(), &default));
+    }
+
+    #[test]
+    fn structural_matching_via_owned_node() {
+        // End-to-end through the public matches() wrapper using with_position.
+        let sel = Selector::parse_compound("Item:first-child").unwrap();
+        let first = OwnedNode::new("Item").with_position(Position::new(0, 3));
+        let second = OwnedNode::new("Item").with_position(Position::new(1, 3));
+        assert!(sel.matches(&first));
+        assert!(!sel.matches(&second));
+    }
+
+    // ---------------------------------------------------------------------
+    // Combinator parsing — descendant (`A B`) and child (`A > B`)
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn parse_descendant_chain() {
+        let s = Selector::parse_chain("Panel Button").unwrap();
+        // Subject is Button, ancestor is Panel joined by Descendant.
+        assert_eq!(s.type_name.as_deref(), Some("Button"));
+        assert!(s.classes.is_empty());
+        let (comb, anc) = s.ancestor.as_ref().expect("ancestor present");
+        assert_eq!(*comb, Combinator::Descendant);
+        assert_eq!(anc.type_name.as_deref(), Some("Panel"));
+        assert!(anc.ancestor.is_none());
+        // Specificity sums both type compounds: (0, 0, 2).
+        assert_eq!(s.specificity(), (0, 0, 2));
+    }
+
+    #[test]
+    fn parse_child_chain() {
+        let s = Selector::parse_chain("Panel > Button").unwrap();
+        assert_eq!(s.type_name.as_deref(), Some("Button"));
+        let (comb, anc) = s.ancestor.as_ref().expect("ancestor present");
+        assert_eq!(*comb, Combinator::Child);
+        assert_eq!(anc.type_name.as_deref(), Some("Panel"));
+    }
+
+    #[test]
+    fn parse_child_chain_with_rich_subject() {
+        let s = Selector::parse_chain("Panel > Button.primary#save:focus:nth-child(2n+1)").unwrap();
+        // Subject fields.
+        assert_eq!(s.type_name.as_deref(), Some("Button"));
+        assert_eq!(s.classes, vec!["primary"]);
+        assert_eq!(s.id.as_deref(), Some("save"));
+        assert_eq!(s.pseudos.len(), 2);
+        assert_eq!(s.pseudos[0], Pseudo::State(PseudoClass::Focus));
+        assert_eq!(s.pseudos[1], Pseudo::NthChild(NthExpr { a: 2, b: 1 }));
+        // Ancestor is Panel joined by Child.
+        let (comb, anc) = s.ancestor.as_ref().expect("ancestor present");
+        assert_eq!(*comb, Combinator::Child);
+        assert_eq!(anc.type_name.as_deref(), Some("Panel"));
+        // The rich subject keeps the `2n + 1` interior intact.
+    }
+
+    #[test]
+    fn parse_three_compound_chain() {
+        // A B C — two descendant combinators: subject C, ancestor B (Descendant),
+        // B's ancestor A (Descendant).
+        let s = Selector::parse_chain("A B C").unwrap();
+        assert_eq!(s.type_name.as_deref(), Some("C"));
+        let (comb_b, anc_b) = s.ancestor.as_ref().expect("ancestor B");
+        assert_eq!(*comb_b, Combinator::Descendant);
+        assert_eq!(anc_b.type_name.as_deref(), Some("B"));
+        let (comb_a, anc_a) = anc_b.ancestor.as_ref().expect("ancestor A");
+        assert_eq!(*comb_a, Combinator::Descendant);
+        assert_eq!(anc_a.type_name.as_deref(), Some("A"));
+        assert!(anc_a.ancestor.is_none());
+    }
+
+    #[test]
+    fn parse_combinator_preserves_nth_paren_spaces() {
+        // The spaces and `+` inside `:nth-child(2n + 1)` must NOT be treated
+        // as combinators. The whole thing is a single compound `Item:nth-child(2n + 1)`
+        // joined by Descendant to `List`.
+        let s = Selector::parse_chain("List Item:nth-child(2n + 1)").unwrap();
+        assert_eq!(s.type_name.as_deref(), Some("Item"));
+        assert_eq!(s.pseudos.len(), 1);
+        assert_eq!(s.pseudos[0], Pseudo::NthChild(NthExpr { a: 2, b: 1 }));
+        let (comb, anc) = s.ancestor.as_ref().expect("ancestor");
+        assert_eq!(*comb, Combinator::Descendant);
+        assert_eq!(anc.type_name.as_deref(), Some("List"));
+    }
+
+    #[test]
+    fn parse_sibling_combinators_error() {
+        assert!(Selector::parse_chain("A + B").is_err());
+        assert!(Selector::parse_chain("A ~ B").is_err());
+    }
+
+    #[test]
+    fn specificity_of_child_chain_sums() {
+        // Panel > Button.primary: ids 0, classes+pseudos 1, types 2 → (0,1,2).
+        let s = Selector::parse_chain("Panel > Button.primary").unwrap();
+        assert_eq!(s.specificity(), (0, 1, 2));
+    }
+
+    #[test]
+    fn comma_list_with_combinators() {
+        let list = Selector::parse_list("Panel Button, .modal > Button").unwrap();
+        assert_eq!(list.len(), 2);
+        assert_eq!(list[0].type_name.as_deref(), Some("Button"));
+        assert_eq!(list[1].type_name.as_deref(), Some("Button"));
+        // first is descendant, second is child.
+        let (c0, _) = list[0].ancestor.as_ref().expect("anc0");
+        assert_eq!(*c0, Combinator::Descendant);
+        let (c1, _) = list[1].ancestor.as_ref().expect("anc1");
+        assert_eq!(*c1, Combinator::Child);
     }
 }
