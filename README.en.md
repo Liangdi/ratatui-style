@@ -503,6 +503,24 @@ cargo run --example 14_data_driven
 
 # Strict mode — catch CSS property typos and undefined variables
 cargo run --example 15_strict
+
+# Responsive @media — size + color-capability breakpoints (P3–P6)
+cargo run --example 16_media
+
+# Combinators — descendant/child/adjacent/sibling via a tree walk (P3–P5)
+cargo run --example 17_combinators
+
+# Structural pseudo-classes — :nth-child / first/last/only / nth-of-type (P3/P5/P6)
+cargo run --example 18_structural
+
+# @supports — color-capability feature detection (P6)
+cargo run --example 19_supports
+
+# Compute cache — access-order LRU + mutation invalidation (P4/P5)
+cargo run --example 20_cache
+
+# var() for the box model — padding/border-style/border-color from tokens (P6)
+cargo run --example 21_box_var
 ```
 
 ## Preset library: `ratatui-style-presets`

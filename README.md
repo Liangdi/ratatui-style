@@ -471,6 +471,24 @@ cargo run --example 14_data_driven
 
 # 严格模式 —— 捕获 CSS 属性名拼写错误和未定义变量
 cargo run --example 15_strict
+
+# 响应式 @media —— 终端尺寸/色彩能力驱动的断点（P3–P6）
+cargo run --example 16_media
+
+# 组合选择器 —— 后代/子/相邻/兄弟，经 CascadeContext 树遍历（P3–P5）
+cargo run --example 17_combinators
+
+# 结构伪类 —— :nth-child / first/last/only / nth-of-type（P3/P5/P6）
+cargo run --example 18_structural
+
+# @supports —— 色彩能力特性检测（P6）
+cargo run --example 19_supports
+
+# 计算缓存 —— 访问序 LRU + 变更自动失效（P4/P5）
+cargo run --example 20_cache
+
+# var() 用于盒模型 —— padding/border-style/border-color 走 token（P6）
+cargo run --example 21_box_var
 ```
 
 ## 预设库：`ratatui-style-presets`
