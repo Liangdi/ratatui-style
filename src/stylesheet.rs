@@ -8,7 +8,7 @@ use crate::color::Color;
 use crate::error::{CssError, Loc, Result};
 use crate::media::MediaQuery;
 use crate::selector::Selector;
-use crate::style::{Align, CssStyle, FontStyle, TextDecoration, Weight};
+use crate::style::{Align, CssStyle, FontStyle, Opacity, TextDecoration, Weight};
 use crate::supports::SupportsQuery;
 use crate::token::{ThemeTokens, Token};
 use ratatui::widgets::Borders;
@@ -651,6 +651,7 @@ pub fn apply_decl(style: &mut CssStyle, prop: &str, value: &str) -> Result<()> {
         "font-style" => style.font_style = Some(FontStyle::parse(value)?),
         "text-decoration" => style.decoration = Some(TextDecoration::parse(value)?),
         "underline-color" => style.underline_color = Some(Color::parse(value)?),
+        "opacity" => style.opacity = Some(Opacity::parse(value)?),
         "padding" => style.padding = Some(crate::box_model::BoxEdgesValue::parse(value)?),
         "margin" => style.margin = Some(crate::box_model::BoxEdgesValue::parse(value)?),
         "border" => {
@@ -727,6 +728,7 @@ pub(crate) fn is_known_property(prop: &str) -> bool {
             | "font-style"
             | "text-decoration"
             | "underline-color"
+            | "opacity"
             | "padding"
             | "margin"
             | "border"
@@ -912,6 +914,36 @@ mod tests {
     fn parse_with_origin_sets_theme() {
         let sheet = Stylesheet::parse_with_origin("Button { color: red; }", Origin::Theme).unwrap();
         assert_eq!(sheet.rules()[0].origin, Origin::Theme);
+    }
+
+    #[test]
+    fn opacity_decl_dims_via_cascade() {
+        let sheet = Stylesheet::parse(".x { opacity: 0.5; }").unwrap();
+        let node = OwnedNode::new("Div").with_classes(["x"]);
+        let computed = sheet.compute(&node, None);
+        assert_eq!(computed.style.opacity, Some(crate::style::Opacity::Dim));
+        assert!(computed
+            .to_style()
+            .add_modifier
+            .contains(ratatui::style::Modifier::DIM));
+    }
+
+    #[test]
+    fn opacity_full_does_not_dim() {
+        let sheet = Stylesheet::parse(".x { opacity: 1; }").unwrap();
+        let node = OwnedNode::new("Div").with_classes(["x"]);
+        let computed = sheet.compute(&node, None);
+        assert_eq!(computed.style.opacity, Some(crate::style::Opacity::Full));
+        assert!(!computed
+            .to_style()
+            .add_modifier
+            .contains(ratatui::style::Modifier::DIM));
+    }
+
+    #[test]
+    fn opacity_is_a_known_property() {
+        assert!(is_known_property("opacity"));
+        assert!(is_known_property("Opacity")); // case-insensitive
     }
 
     #[test]

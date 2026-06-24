@@ -63,6 +63,92 @@ impl Weight {
     }
 }
 
+/// `opacity` — the terminal's coarse approximation of CSS alpha.
+///
+/// **Terminal limitation**: there is no real alpha channel, so CSS `opacity`
+/// collapses to a single [`Modifier::DIM`] bit. [`Opacity::parse`] maps any
+/// value below fully opaque to [`Dim`](Self::Dim): `0.5`, `50%`, and `0` all
+/// dim the cell; only `1` / `100%` / `normal` stay bright. This mirrors how
+/// [`Weight`] collapses the 100–900 gradient to a single bold bit — a property
+/// of the rendering target, not a parser shortcoming.
+///
+/// Unlike `color`/`font-weight`/etc., `opacity` is **not inherited**, so it is
+/// intentionally omitted from [`CssStyle::inherit_from`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Opacity {
+    /// Fully opaque — no modifier (`opacity: 1`, `100%`, or `normal`).
+    #[default]
+    Full,
+    /// Dimmed (`opacity < 1`, e.g. `0.5`, `50%`, `0`).
+    Dim,
+}
+
+impl Opacity {
+    /// Parse an `opacity` value: `normal`, or a number / percentage. Any value
+    /// below fully opaque (`< 1` or `< 100%`) becomes [`Dim`](Self::Dim);
+    /// `1`/`100%`/`normal` stay [`Full`](Self::Full). Shared by the text parser
+    /// and serde.
+    pub fn parse(s: &str) -> Result<Self> {
+        let s = s.trim().to_ascii_lowercase();
+        if s.is_empty() || s == "normal" {
+            return Ok(Self::Full);
+        }
+        let (num_str, percent) = match s.strip_suffix('%') {
+            Some(rest) => (rest, true),
+            None => (s.as_str(), false),
+        };
+        let v: f32 = num_str
+            .parse()
+            .map_err(|_| CssError::invalid_length(format!("opacity: {s}")))?;
+        let alpha = if percent { v / 100.0 } else { v };
+        Ok(if alpha >= 1.0 { Self::Full } else { Self::Dim })
+    }
+
+    /// `true` when this opacity dims the cell.
+    pub const fn is_dim(self) -> bool {
+        matches!(self, Self::Dim)
+    }
+
+    /// The CSS representation — `1` for full, `0.5` as a representative dimmed
+    /// value. Any `< 1` collapses to [`Dim`](Self::Dim), so the exact figure is
+    /// lost in a round trip; `0.5` is a conventional mid point, and [`parse`]
+    /// accepts it (or any other value) back.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Full => "1",
+            Self::Dim => "0.5",
+        }
+    }
+}
+
+impl From<f64> for Opacity {
+    /// `>= 1.0` → [`Full`](Self::Full); otherwise [`Dim`](Self::Dim).
+    fn from(alpha: f64) -> Self {
+        if alpha >= 1.0 {
+            Self::Full
+        } else {
+            Self::Dim
+        }
+    }
+}
+
+impl From<f32> for Opacity {
+    fn from(alpha: f32) -> Self {
+        Opacity::from(alpha as f64)
+    }
+}
+
+impl From<i32> for Opacity {
+    /// Lets `.opacity(1)` / `.opacity(0)` work directly (integer literals).
+    fn from(alpha: i32) -> Self {
+        if alpha >= 1 {
+            Self::Full
+        } else {
+            Self::Dim
+        }
+    }
+}
+
 /// `font-style`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum FontStyle {
@@ -190,6 +276,7 @@ pub struct CssStyle {
     pub font_style: Option<FontStyle>,
     pub decoration: Option<TextDecoration>,
     pub underline_color: Option<Color>,
+    pub opacity: Option<Opacity>,
 
     // — box model → Block / Rect —
     pub padding: Option<BoxEdgesValue>,
@@ -224,6 +311,13 @@ impl CssStyle {
     }
     pub fn italic(mut self) -> Self {
         self.font_style = Some(FontStyle::Italic);
+        self
+    }
+    /// Set `opacity`. A value below fully opaque (`< 1`, e.g. `0.5`) dims the
+    /// cell via `Modifier::DIM`; `1`/`100%`/`normal` does not. Accepts an
+    /// [`Opacity`] or any number (via `Into`): `.opacity(0.5)`, `.opacity(1)`.
+    pub fn opacity(mut self, opacity: impl Into<Opacity>) -> Self {
+        self.opacity = Some(opacity.into());
         self
     }
     pub fn underline(mut self) -> Self {
@@ -299,6 +393,7 @@ impl CssStyle {
         over!(font_style);
         over!(decoration);
         over!(underline_color);
+        over!(opacity);
         over!(padding);
         over!(margin);
         // `border` cascades at the sub-field level via [`BorderSpec::merge`]:
@@ -371,6 +466,9 @@ impl CssStyle {
         }
         if let Some(m) = self.decoration.and_then(|d| d.modifiers()) {
             s = s.add_modifier(m);
+        }
+        if self.opacity == Some(Opacity::Dim) {
+            s = s.add_modifier(Modifier::DIM);
         }
         s
     }
@@ -454,7 +552,7 @@ impl From<ratatui::style::Color> for Color {
 
 #[cfg(feature = "serde")]
 mod serde_impl {
-    use super::{Align, BorderStyleValue, CssStyle, FontStyle, TextDecoration, Weight};
+    use super::{Align, BorderStyleValue, CssStyle, FontStyle, Opacity, TextDecoration, Weight};
     use crate::color::Color;
     use serde::de::{self, MapAccess, Visitor};
     use serde::ser::SerializeMap;
@@ -583,6 +681,42 @@ mod serde_impl {
         }
     }
 
+    impl<'de> Deserialize<'de> for Opacity {
+        fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+            // An opacity may be a keyword ("normal"), a percentage ("50%"), or a
+            // number (0.5). `deserialize_any` accepts a TOML/YAML/JSON number or
+            // string with no intermediate Value.
+            struct OpacityVisitor;
+            impl<'de> Visitor<'de> for OpacityVisitor {
+                type Value = Opacity;
+                fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                    f.write_str("an opacity keyword, number, or percentage string")
+                }
+                fn visit_i64<E: de::Error>(self, v: i64) -> Result<Opacity, E> {
+                    Ok(if v >= 1 { Opacity::Full } else { Opacity::Dim })
+                }
+                fn visit_u64<E: de::Error>(self, v: u64) -> Result<Opacity, E> {
+                    Ok(if v >= 1 { Opacity::Full } else { Opacity::Dim })
+                }
+                fn visit_f64<E: de::Error>(self, v: f64) -> Result<Opacity, E> {
+                    Ok(if v >= 1.0 { Opacity::Full } else { Opacity::Dim })
+                }
+                fn visit_str<E: de::Error>(self, v: &str) -> Result<Opacity, E> {
+                    Opacity::parse(v).map_err(E::custom)
+                }
+                fn visit_string<E: de::Error>(self, v: String) -> Result<Opacity, E> {
+                    Opacity::parse(&v).map_err(E::custom)
+                }
+            }
+            d.deserialize_any(OpacityVisitor)
+        }
+    }
+    impl Serialize for Opacity {
+        fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+            s.serialize_str(self.as_str())
+        }
+    }
+
     // -------------------------------------------------------------------------
     // CssStyle — deserialize a property map keyed by CSS property names.
     //
@@ -626,6 +760,9 @@ mod serde_impl {
                             }
                             "underline-color" => {
                                 s.underline_color = map.next_value()?;
+                            }
+                            "opacity" => {
+                                s.opacity = map.next_value()?;
                             }
                             "padding" => {
                                 s.padding = map.next_value()?;
@@ -679,6 +816,7 @@ mod serde_impl {
                 self.font_style.is_some(),
                 self.decoration.is_some(),
                 self.underline_color.is_some(),
+                self.opacity.is_some(),
                 self.padding.is_some(),
                 self.margin.is_some(),
                 self.border.is_some(),
@@ -708,6 +846,9 @@ mod serde_impl {
             }
             if let Some(v) = self.underline_color.as_ref() {
                 map.serialize_entry("underline-color", v)?;
+            }
+            if let Some(v) = self.opacity {
+                map.serialize_entry("opacity", &v)?;
             }
             if let Some(v) = self.padding.as_ref() {
                 map.serialize_entry("padding", v)?;
@@ -750,6 +891,47 @@ mod tests {
         assert_eq!(rs.bg, Some(RC::Blue));
         assert!(rs.add_modifier.contains(Modifier::BOLD));
         assert!(rs.add_modifier.contains(Modifier::ITALIC));
+    }
+
+    #[test]
+    fn opacity_parse_collapses_to_dim_bit() {
+        // Fully opaque (and the keyword) stay Full; anything below 1 dims.
+        assert_eq!(Opacity::parse("1").unwrap(), Opacity::Full);
+        assert_eq!(Opacity::parse("100%").unwrap(), Opacity::Full);
+        assert_eq!(Opacity::parse("normal").unwrap(), Opacity::Full);
+        assert_eq!(Opacity::parse("0.5").unwrap(), Opacity::Dim);
+        assert_eq!(Opacity::parse("50%").unwrap(), Opacity::Dim);
+        assert_eq!(Opacity::parse("0").unwrap(), Opacity::Dim);
+        assert!(Opacity::parse("not-a-number").is_err());
+    }
+
+    #[test]
+    fn opacity_builder_maps_to_dim_modifier() {
+        let dim = CssStyle::new().opacity(0.5).to_style();
+        assert!(dim.add_modifier.contains(Modifier::DIM));
+
+        let full = CssStyle::new().opacity(1).to_style();
+        assert!(!full.add_modifier.contains(Modifier::DIM));
+
+        // Unset opacity never adds DIM.
+        assert!(!CssStyle::new().to_style().add_modifier.contains(Modifier::DIM));
+    }
+
+    #[test]
+    fn opacity_overlay_overrides() {
+        let mut a = CssStyle::new().opacity(1); // Full
+        a.overlay(&CssStyle::new().opacity(0.5)); // higher priority: Dim
+        assert_eq!(a.opacity, Some(Opacity::Dim));
+    }
+
+    #[test]
+    fn opacity_is_not_inherited() {
+        // opacity does NOT inherit — a child with no opacity stays unset even
+        // when the parent dims.
+        let parent = CssStyle::new().opacity(0.5);
+        let mut child = CssStyle::new().bold();
+        child.inherit_from(&parent);
+        assert_eq!(child.opacity, None);
     }
 
     #[test]

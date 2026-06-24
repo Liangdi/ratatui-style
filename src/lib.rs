@@ -66,7 +66,7 @@ pub use media::{MediaAlternative, MediaCondition, MediaContext, MediaQuery, Medi
 pub use node::{Classes, NodeRef, OwnedNode, Position, State, StyledNode};
 pub use runtime::RuntimeStyle;
 pub use selector::{Combinator, NthExpr, Pseudo, PseudoClass, Selector};
-pub use style::{Align, CssStyle, FontStyle, TextDecoration, Weight};
+pub use style::{Align, CssStyle, FontStyle, Opacity, TextDecoration, Weight};
 pub use stylesheet::{apply_decl, Origin, RuleEntry, Stylesheet};
 pub use supports::{SupportsAlternative, SupportsCondition, SupportsQuery, SupportsTerm};
 pub use token::ThemeTokens;
@@ -99,7 +99,7 @@ pub mod prelude {
     pub use crate::node::{Classes, NodeRef, OwnedNode, Position, State, StyledNode};
     pub use crate::runtime::RuntimeStyle;
     pub use crate::selector::{Combinator, NthExpr, Pseudo, PseudoClass, Selector};
-    pub use crate::style::{Align, CssStyle, FontStyle, TextDecoration, Weight};
+    pub use crate::style::{Align, CssStyle, FontStyle, Opacity, TextDecoration, Weight};
     pub use crate::stylesheet::{Origin, RuleEntry, Stylesheet};
     pub use crate::supports::{SupportsAlternative, SupportsCondition, SupportsQuery, SupportsTerm};
     pub use crate::token::ThemeTokens;

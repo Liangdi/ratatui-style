@@ -21,7 +21,8 @@ use std::sync::LazyLock;
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
 
 use ratatui_style::{
-    CascadeContext, ComputeScratch, NodeRef, Origin, OwnedNode, State, Stylesheet,
+    CascadeContext, ComputeCache, ComputeScratch, CssStyle, MediaContext, NodeRef, Origin,
+    OwnedNode, State, Stylesheet,
 };
 
 // ---------------------------------------------------------------------------
@@ -155,6 +156,37 @@ fn build_sheet() -> Stylesheet {
         .expect("inline rule adds");
 
     debug_assert!(sheet.rules().len() >= 60, "medium sheet has enough rules");
+    sheet
+}
+
+// ---------------------------------------------------------------------------
+// Large stylesheet — ~500 rules. Stress-tests the O(rules) match scan; on the
+// cached path it stresses the per-node signature fold (the inline FxHasher and
+// the allocation-free class fold land here).
+// ---------------------------------------------------------------------------
+
+static LARGE_SHEET: LazyLock<Stylesheet> = LazyLock::new(build_large_sheet);
+
+fn build_large_sheet() -> Stylesheet {
+    let mut sheet = Stylesheet::new();
+    // 200 type rules + 200 class rules + 100 compound rules ≈ 500 total.
+    for i in 0..200u32 {
+        sheet
+            .add(format!("T{i}").as_str(), CssStyle::new().color("#cdd6f4"), Origin::User)
+            .expect("large rule adds");
+    }
+    for i in 0..200u32 {
+        sheet
+            .add(format!(".u{i}").as_str(), CssStyle::new().bold(), Origin::User)
+            .expect("large rule adds");
+    }
+    for i in 0..100u32 {
+        let t = i % 50;
+        sheet
+            .add(format!("T{t}.accent").as_str(), CssStyle::new().italic(), Origin::User)
+            .expect("large rule adds");
+    }
+    debug_assert!(sheet.rules().len() >= 400, "large sheet has enough rules");
     sheet
 }
 
@@ -331,6 +363,66 @@ fn cascade_context_enter_leave(c: &mut Criterion) {
     g.finish();
 }
 
+fn large_stylesheet(c: &mut Criterion) {
+    let sheet = &*LARGE_SHEET;
+    let media = MediaContext::default();
+
+    let mut g = c.benchmark_group("large_stylesheet");
+    g.sample_size(60);
+
+    // Uncached: one node matched against ~500 rules — the O(rules) scan plus
+    // overlay. This is the baseline the cache exists to skip.
+    let node = OwnedNode::new("T7").with_classes(["u3", "accent"]);
+    let mut scratch = ComputeScratch::new();
+    g.bench_function("compute_with_media_uncached", |b| {
+        b.iter(|| {
+            black_box(sheet.compute_with_media(
+                black_box(&node),
+                None,
+                black_box(&mut scratch),
+                black_box(&media),
+            ))
+        })
+    });
+
+    // Cached, warm: the cache is pre-populated so every measured access is a
+    // HIT — isolating the cache hot path: signature fold (FxHash +
+    // allocation-free class fold) + LRU get + ComputedStyle clone, with NO
+    // cascade. This is where the cache-path optimizations show up.
+    let nodes: Vec<OwnedNode> = (0..64u32)
+        .map(|i| OwnedNode::new(format!("T{i}").as_str()).with_classes(["accent", "u3"]))
+        .collect();
+    let mut warm = ComputeCache::new(nodes.len() + 8);
+    {
+        let mut scratch = ComputeScratch::new();
+        let mut parent_sig = None;
+        for n in &nodes {
+            let (_, sig) = sheet.compute_cached(n, None, parent_sig, &media, &mut scratch, &mut warm);
+            parent_sig = Some(sig);
+        }
+    }
+    let mut scratch = ComputeScratch::new();
+    g.bench_function("compute_cached_hit", |b| {
+        b.iter(|| {
+            let mut parent_sig = None;
+            for n in &nodes {
+                let (computed, sig) = sheet.compute_cached(
+                    black_box(n),
+                    None,
+                    parent_sig,
+                    black_box(&media),
+                    black_box(&mut scratch),
+                    black_box(&mut warm),
+                );
+                parent_sig = Some(sig);
+                black_box(computed);
+            }
+        })
+    });
+
+    g.finish();
+}
+
 // ---------------------------------------------------------------------------
 // Custom Criterion config: larger sample size for fast-op stability.
 // ---------------------------------------------------------------------------
@@ -344,6 +436,7 @@ criterion_group! {
         with_parent_inheritance,
         var_resolution,
         cascade_context_enter_leave,
+        large_stylesheet,
 }
 
 criterion_main!(benches);

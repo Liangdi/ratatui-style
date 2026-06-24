@@ -42,7 +42,6 @@
 //! means a very large capacity would raise per-access cost. Capacity 0 disables
 //! storage entirely (`get` always misses, `insert` is a no-op).
 
-use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, VecDeque};
 use std::hash::{Hash, Hasher};
 
@@ -50,6 +49,79 @@ use crate::cascade::ComputedStyle;
 use crate::media::MediaContext;
 use crate::node::{Position, State};
 use crate::selector::NodeIdentity;
+
+/// A minimal, allocation-free FxHasher for cache keys.
+///
+/// Cache signatures are internal and non-adversarial, so the
+/// collision-resistant SipHash behind
+/// [`std::collections::hash_map::DefaultHasher`] is overkill here. FxHash is not
+/// cryptographic, but it is much faster and plenty good for a bounded
+/// `HashMap<u64, _>` keyed by short signatures. Implemented inline to avoid
+/// adding a dependency — the crate stays dependency-light.
+mod fxhash {
+    use std::hash::Hasher;
+
+    /// FxHash's mixing constant.
+    const K: u64 = 0x517c_c1b7_2722_0a95;
+
+    /// A fast, non-cryptographic 64-bit hasher (FxHash).
+    pub(super) struct FxHasher(u64);
+
+    impl FxHasher {
+        pub(super) fn new() -> Self {
+            Self(0)
+        }
+
+        /// Mix in a 64-bit word the FxHash way: rotate, XOR, multiply.
+        #[inline]
+        fn add(&mut self, i: u64) {
+            self.0 = (self.0.rotate_left(5) ^ i).wrapping_mul(K);
+        }
+    }
+
+    impl Hasher for FxHasher {
+        // The signed/`char`/`bool`/`isize` writers are left to the trait's
+        // default byte-delegating implementations; the integer and slice writes
+        // below cover everything [`node_signature`] folds in.
+        #[inline]
+        fn write(&mut self, bytes: &[u8]) {
+            // Fold byte-wise. Inputs here are small (a few short strings plus a
+            // handful of integers), so per-byte cost is negligible next to the
+            // SipHash baseline this replaces.
+            for &b in bytes {
+                self.add(b as u64);
+            }
+        }
+        #[inline]
+        fn write_u8(&mut self, i: u8) {
+            self.add(i as u64);
+        }
+        #[inline]
+        fn write_u16(&mut self, i: u16) {
+            self.add(i as u64);
+        }
+        #[inline]
+        fn write_u32(&mut self, i: u32) {
+            self.add(i as u64);
+        }
+        #[inline]
+        fn write_u64(&mut self, i: u64) {
+            self.add(i);
+        }
+        #[inline]
+        fn write_usize(&mut self, i: usize) {
+            self.add(i as u64);
+        }
+        #[inline]
+        fn write_i8(&mut self, i: i8) {
+            self.add(i as u8 as u64);
+        }
+        #[inline]
+        fn finish(&self) -> u64 {
+            self.0
+        }
+    }
+}
 
 /// An opt-in bounded cache for [`ComputedStyle`] results, keyed by an opaque
 /// signature that captures (node identity, ancestor-chain signature, media
@@ -197,16 +269,26 @@ impl Default for ComputeCache {
 /// identical signatures (deterministic hashing); differing in any folded field
 /// differs the signature with overwhelming probability.
 ///
-/// Uses [`DefaultHasher`] (no new dependency). The exact hash value is an
-/// implementation detail and MUST NOT be relied upon across builds — only
-/// equality within a single run.
+/// Uses an inline FxHasher (no new dependency; faster than SipHash for these
+/// internal, non-adversarial keys). The exact hash value is an implementation
+/// detail and MUST NOT be relied upon across builds — only equality within a
+/// single run.
+///
+/// Classes are folded **order-independently**: each class is hashed on its own
+/// and the per-class hashes are combined by wrapping addition (commutative +
+/// associative), so the signature never depends on class order — and no `Vec`
+/// is allocated per call. The count is folded separately, so multisets of
+/// different sizes always differ; for equal-size multisets the addition-fold's
+/// collision rate is on the same order as the underlying hash's (≈ 1/2⁶⁴ per
+/// pair), which is the same guarantee the rest of the signature already relies
+/// on.
 pub(crate) fn node_signature(
     node_id: &NodeIdentity,
     parent_sig: Option<u64>,
     siblings: &[NodeIdentity],
     media: &MediaContext,
 ) -> u64 {
-    let mut h = DefaultHasher::new();
+    let mut h = fxhash::FxHasher::new();
 
     // Marker so a re-ordering of fields never silently collides with an older
     // layout — bumped if the folded set ever changes.
@@ -219,13 +301,15 @@ pub(crate) fn node_signature(
     node_id.type_name.hash(&mut h);
     node_id.id.hash(&mut h);
 
-    // Classes are set-membership, so sort before hashing for order-independence.
-    let mut sorted: Vec<&str> = node_id.classes.iter().map(String::as_str).collect();
-    sorted.sort_unstable();
-    sorted.len().hash(&mut h);
-    for c in sorted {
-        c.hash(&mut h);
+    // Classes are set-membership, so fold them order-independently: hash each
+    // class alone and combine by wrapping addition (commutative + associative).
+    // This keeps the signature invariant to class order with no per-call Vec.
+    node_id.classes.len().hash(&mut h);
+    let mut class_sum: u64 = 0;
+    for c in &node_id.classes {
+        class_sum = class_sum.wrapping_add(hash_str(c));
     }
+    class_sum.hash(&mut h);
 
     hash_state(&mut h, node_id.state);
     hash_position(&mut h, &node_id.position);
@@ -237,12 +321,13 @@ pub(crate) fn node_signature(
     for sib in siblings {
         sib.type_name.hash(&mut h);
         sib.id.hash(&mut h);
-        let mut sib_classes: Vec<&str> = sib.classes.iter().map(String::as_str).collect();
-        sib_classes.sort_unstable();
-        sib_classes.len().hash(&mut h);
-        for c in sib_classes {
-            c.hash(&mut h);
+        // Sibling classes fold order-independently, same as the node above.
+        sib.classes.len().hash(&mut h);
+        let mut sib_sum: u64 = 0;
+        for c in &sib.classes {
+            sib_sum = sib_sum.wrapping_add(hash_str(c));
         }
+        sib_sum.hash(&mut h);
         hash_state(&mut h, sib.state);
         hash_position(&mut h, &sib.position);
     }
@@ -256,7 +341,7 @@ pub(crate) fn node_signature(
     h.finish()
 }
 
-fn hash_state(h: &mut DefaultHasher, state: State) {
+fn hash_state(h: &mut impl Hasher, state: State) {
     state.focus.hash(h);
     state.hover.hash(h);
     state.disabled.hash(h);
@@ -264,10 +349,20 @@ fn hash_state(h: &mut DefaultHasher, state: State) {
     state.active.hash(h);
 }
 
-fn hash_position(h: &mut DefaultHasher, pos: &Position) {
+fn hash_position(h: &mut impl Hasher, pos: &Position) {
     pos.index.hash(h);
     pos.sibling_count.hash(h);
     pos.parent_type.hash(h);
+}
+
+/// Hash a single string to a `u64` with the inline FxHasher. Used to fold
+/// classes into the signature order-independently; per-class hashes are then
+/// combined by wrapping addition in [`node_signature`].
+#[inline]
+fn hash_str(s: &str) -> u64 {
+    let mut h = fxhash::FxHasher::new();
+    s.hash(&mut h);
+    h.finish()
 }
 
 #[cfg(test)]

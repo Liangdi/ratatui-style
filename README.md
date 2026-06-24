@@ -129,6 +129,7 @@ let sheet = Stylesheet::parse(r#"
 | `font-style` | `italic` / `normal` | `Modifier::ITALIC` |
 | `text-decoration` | `underline` / `line-through` / 两者组合 | `Modifier::UNDERLINED` / `CROSSED_OUT` |
 | `underline-color` | 颜色 | `Style::underline_color` |
+| `opacity` | `1` / `0.5` / `50%` / `normal` | `Modifier::DIM`（`< 1` 时暗淡，**不继承**） |
 | `border` | `none` / `single` / `rounded` / `double` / `thick` [颜色] | `Block::borders` + `border_type` |
 | `border-top` / `border-right` / `border-bottom` / `border-left` / `border-x` / `border-y` | 同 `border` 简写（`<样式> [颜色]`），只作用于指定边 | `Block::borders`（按边组合） |
 | `padding` | `1` / `1 2` / `1 2 3` / `1 2 3 4` | `Block::padding` |
@@ -489,6 +490,9 @@ cargo run --example 20_cache
 
 # var() 用于盒模型 —— padding/border-style/border-color 走 token（P6）
 cargo run --example 21_box_var
+
+# opacity → DIM —— 终端无 alpha，< 1 即暗淡（不继承）
+cargo run --example 22_opacity
 ```
 
 ## 预设库：`ratatui-style-presets`

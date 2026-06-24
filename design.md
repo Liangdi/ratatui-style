@@ -200,9 +200,9 @@ palettes drive the cascade unchanged. Gated behind the `themekit` feature.
 | `text-align` | `Alignment` | |
 | `width` / `height` | `Constraint` | `Length` / `Percentage` / `Min` / `Max` |
 
-> **Not yet implemented (P3):** `opacity` → `DIM` (on/off only) is a planned mapping.
-> There is currently no `opacity` property — it is not in `is_known_property`, has no
-> handler in `apply_decl`, and no field on `CssStyle`.
+> `opacity` → `Modifier::DIM` (on/off only): terminals have no alpha channel, so
+> any value below fully opaque (`0.5`, `50%`, `0`) dims the cell, while
+> `1`/`100%`/`normal` does not. Like real CSS `opacity`, it does **not** inherit.
 
 ## 7. Adoption Levels
 

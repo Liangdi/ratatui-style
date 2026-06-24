@@ -627,8 +627,10 @@ pub enum Length {
     /// one does (e.g. an unresolved variable in lenient mode), it degrades to
     /// `Min(0)` (same as [`Length::Auto`]) rather than panicking.
     ///
-    /// Fallback (`var(--x, 10)`) is not yet supported: if a fallback is present
-    /// it is currently ignored and only the name is captured.
+    /// A fallback (`var(--x, 10)`) is supported: the expression after the first
+    /// top-level comma is parsed as a `Length` and used when the variable is
+    /// undefined — mirroring [`Color::Var`](crate::color::Color) and the CSS
+    /// `var()` spec.
     Var {
         name: String,
         fallback: Option<Box<Length>>,
